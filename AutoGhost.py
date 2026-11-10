@@ -3898,7 +3898,7 @@ def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid
                                 monsters=None):
     """Opponent for Auto PK list select.
 
-    Hostile = red/purple name color (ALT purple→red) only for list-select.
+    Hostile = red/purple name color (purple→red hostile state) only for list-select.
     War-scarf dual-list in get_monsters remains the khăn path when color is
     hidden. Job thief↔trader is NEVER enough alone and must not invent a
     job-flag enemy class for màu tên ẩn. Yellow/green/white stay skipped.
