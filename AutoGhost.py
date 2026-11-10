@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.40'
-# raw-main download stamp: 2026-11-10T22:50Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.41'
+# raw-main download stamp: 2026-11-10T23:10Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -39,6 +39,7 @@ AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.35
 AUTO_PK_CAST_RETRY_DELAY = 2.0
 AUTO_PK_SELECT_TIMEOUT = 1.5
 AUTO_PK_NATIVE_TIMEOUT = 0.75
+AUTO_PK_NATIVE_MISS_LIMIT = 2
 AUTO_PK_NATIVE_KEYS = {
     **{'F%d' % number: 0x6F + number for number in range(9, 13)},
     'HOME': 0x24, 'END': 0x23, 'INSERT': 0x2D, 'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
@@ -3907,16 +3908,57 @@ def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid
     # Color field missing ("màu tên ẩn"): dual-list (khăn/phe địch) is enough.
     if uid is not None and auto_pk_dual_listed(uid, monsters):
         return True
-    # Title-only job cues (e.g. "Cướp Chuyên Nghiệp") when self is bảo tiêu.
-    if auto_pk_job_flag_hostile(self_entity, view):
-        return True
     theirs = auto_pk_job_side(view)
     mine = auto_pk_job_side(self_entity)
     if theirs and mine and theirs != mine and {mine, theirs} == {'thief', 'escort'}:
         return True
+    # Color hidden + thief title alone (self job often missing on Stable).
+    if theirs == 'thief' and mine is None:
+        return True
     if require_color:
         return False
     return False
+
+
+def auto_pk_color_hidden(player, uid=None, monsters=None):
+    """True when name color is missing (màu tên ẩn), not explicit white/ally."""
+    view = auto_pk_player_view(player, uid, monsters)
+    return auto_pk_hostile_name_color(view) is None
+
+
+def auto_pk_best_hidden_soft_target(players, character, runtime, now, monsters, origin):
+    """Nearest in-range player with missing name color after Target Enemy fails.
+
+    Explicit white/non-hostile colors stay skipped. Used only as a 7045 inject
+    fallback so Auto PK does not wait forever on a silent native key.
+    """
+    best = None
+    player_id = character.get('player_id')
+    anchor = runtime['anchor']
+    for raw_uid, target in (players or {}).items():
+        try:
+            uid = int(raw_uid)
+        except (ValueError, TypeError):
+            continue
+        if (not 0 < uid <= 0xffffffff or uid == player_id
+                or not isinstance(target, dict)):
+            continue
+        if auto_pk_target_unavailable(runtime, uid, target, now):
+            continue
+        if not auto_pk_color_hidden(target, uid=uid, monsters=monsters):
+            continue
+        # Already-clear hostiles are handled by the main pass; soft path is for
+        # pure "màu tên ẩn" rows with no dual-list/job cue.
+        if auto_pk_is_hostile_opponent(target, character, require_color=True,
+                                       uid=uid, monsters=monsters):
+            continue
+        anchor_distance = auto_pk_target_distance(target, anchor, runtime)
+        if anchor_distance is None or anchor_distance > runtime['radius']:
+            continue
+        candidate = (auto_pk_target_distance(target, origin, runtime), uid)
+        if best is None or candidate < best:
+            best = candidate
+    return best
 
 
 def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
@@ -3940,7 +3982,9 @@ def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
     if theirs == 'escort' and mine == 'thief':
         return 'địch cờ nghề', True
     if theirs == 'thief':
-        return 'cướp/đạo tặc (thiếu cờ mình)', False
+        # Color hidden + thief title is enough to list-select even if self job
+        # is missing from get_character_data on Stable.
+        return 'cướp/đạo tặc', True
     if theirs == 'escort':
         return 'bảo tiêu (thiếu cờ mình)', False
     return 'màu tên ẩn', False
@@ -4237,17 +4281,28 @@ def auto_pk_select(character, runtime, now, from_event=False):
         if best is None or candidate < best:
             best = candidate
     if best is None:
-        # After Insert failed to yield 7045, do not only re-spam the key forever.
+        # After Target Enemy failed to yield 7045, do not re-spam the key forever.
         if native_expired:
             runtime['native_misses'] = runtime.get('native_misses', 0) + 1
-        if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
-                runtime, client, now, 'không thấy đối thủ thù địch trong Player list'):
+        misses = runtime.get('native_misses', 0)
+        # Silent Target Enemy + màu tên ẩn in attack range → inject 7045 for nearest.
+        if misses >= AUTO_PK_NATIVE_MISS_LIMIT or (
+                native_expired and not runtime.get('native_key')):
+            best = auto_pk_best_hidden_soft_target(
+                players, character, runtime, now, monsters, origin)
+            if best is not None:
+                runtime['soft_hidden_select'] = True
+        if best is None:
+            can_native = misses < AUTO_PK_NATIVE_MISS_LIMIT
+            if can_native and auto_pk_try_native_enemy_key(
+                    runtime, client, now, 'không thấy đối thủ thù địch trong Player list'):
+                return
+            if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
+                QtBind.setText(gui, auto_pk_status_label,
+                               'Đang canh %.0f m · chưa thấy chữ đỏ/tím, dual-list/khăn hoặc cờ nghề địch.' %
+                               runtime['radius'])
             return
-        if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
-            QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chưa thấy chữ đỏ/tím, dual-list/khăn hoặc cờ nghề địch.' %
-                           runtime['radius'])
-        return
+    soft_hidden = bool(runtime.pop('soft_hidden_select', False))
     runtime['native_misses'] = 0
     stop_auto_pk_patrol(runtime)
     distance, uid = best
@@ -4255,8 +4310,8 @@ def auto_pk_select(character, runtime, now, from_event=False):
     prefer_direct = (runtime.get('fast_scan') and auto_pk_in_background(client)
                      and failed_pid == client.get('pid') and now < until)
     # After Insert produced no 7045, prefer direct 7045 inject for the dual-list /
-    # job-hostile UID rather than waiting on another native key cycle.
-    if (native_expired or prefer_direct) and start_auto_pk_skill_probe(runtime, uid):
+    # job-hostile / soft hidden-color UID rather than waiting on another native key.
+    if (native_expired or prefer_direct or soft_hidden) and start_auto_pk_skill_probe(runtime, uid):
         return
     sent_at = monotonic()
     runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
@@ -4266,7 +4321,9 @@ def auto_pk_select(character, runtime, now, from_event=False):
     if auto_pk_runtime is not runtime or runtime['requested'] != uid:
         return  # A synchronous reply already handled this request.
     if accepted is not False:
-        QtBind.setText(gui, auto_pk_status_label, 'Thử chọn UID %d · cách nhân vật %.1f m.' % (uid, distance))
+        note = ' (màu tên ẩn)' if soft_hidden else ''
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Thử chọn UID %d%s · cách nhân vật %.1f m.' % (uid, note, distance))
         return
     runtime.update(requested=0, select_until=0.0)
     pvp_selection_request = direct_select_request = 0
