@@ -22,7 +22,7 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.33'
+VERSION = '1.8.34'
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -1321,7 +1321,7 @@ profile_fields['boss_exchange_player'] = boss_exchange_player_field
 pvp_stun_box = widget('presets', 'createCheckBox', 'stun_option_changed',
                       'Hiệu ứng ngoài lề · Nối sau choáng (PvP)', 15, 173)
 set_checked_silent(pvp_stun_box, True)
-widget('presets','createLabel','Bỏ trống = Solo Boss (ngắt SROPlus, không cần người canh). Có tên = Exchange acc hỗ trợ.',15,195)
+widget('presets','createLabel','Bỏ trống = Solo Boss (7081→UID Boss như SROPlus). Có tên = Exchange acc hỗ trợ.',15,195)
 widget('presets','createLabel','Nạp sẽ thay cấu hình acc hiện tại. Cùng tên: lưu cập nhật bộ cũ.',15,220)
 
 
@@ -3457,6 +3457,7 @@ def scan_auto_pk_evidence(runtime=None):
             scan_radius = runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS)
         players = auto_pk_players()
         character = get_character_data() or {}
+        monsters = get_monsters() if callable(get_monsters) else None
         player_id = character.get('player_id')
         now = monotonic()
         rows = []
@@ -3469,21 +3470,17 @@ def scan_auto_pk_evidence(runtime=None):
             attack_distance = auto_pk_target_distance(player, anchor, runtime)
             unavailable = (auto_pk_target_unavailable(runtime, int(uid), player, now)
                            if runtime is not None and str(uid).isdigit() else None)
-            job_hostile = auto_pk_job_flag_hostile(character, player)
-            color_hostile = auto_pk_hostile_name_color(player)
-            if job_hostile:
-                hostility = 'địch cờ nghề'
-            elif color_hostile is True:
-                hostility = 'chữ đỏ/tím'
-            elif color_hostile is False:
-                hostility = 'không thù địch'
-            else:
-                hostility = 'màu tên ẩn'
+            try:
+                uid_key = int(uid) if str(uid).isdigit() else uid
+            except (TypeError, ValueError):
+                uid_key = uid
+            hostility, is_opponent = auto_pk_hostility_label(
+                player, character, uid=uid_key, monsters=monsters)
             rows.append(dict(uid=str(uid), name=player.get('name','?'), distance_m=scan_distance,
                              dead=player.get('dead'), unavailable=unavailable,
                              in_attack_range=attack_distance is not None and attack_distance <= radius,
                              hostility=hostility,
-                             opponent=job_hostile or color_hostile is True))
+                             opponent=is_opponent))
         rows.sort(key=lambda row: (not row['opponent'], row['distance_m']))
         for i, field in enumerate(auto_pk_result_fields):
             row = rows[i] if i<len(rows) else None
@@ -3764,15 +3761,18 @@ def auto_pk_hostile_name_color(player):
 # Job-flag (mặc cờ nghề): đạo tặc vs bảo tiêu (trader/hunter) are always enemies.
 _JOB_FIELD_KEYS = (
     'job_type', 'jobtype', 'JobType', 'job', 'job_id', 'jobId', 'job_mode',
-    'jobMode', 'job_flag', 'jobflag', 'profession', 'role',
+    'jobMode', 'job_flag', 'jobflag', 'profession', 'role', 'title', 'job_name',
+    'jobName', 'job_title', 'jobTitle', 'nickname', 'desc', 'description',
 )
 _JOB_THIEF_WORDS = {
     'thief', 'bandit', 'robber', 'đạo tặc', 'dao tac', 'đạotặc', 'daotac', 'tặc',
+    'cướp', 'cuop', 'cướp chuyên nghiệp', 'cuop chuyen nghiep', 'cướpchuyênnghiệp',
 }
 _JOB_ESCORT_WORDS = {
     'trader', 'hunter', 'trade', 'merchant', 'caravan',
-    'bảo tiêu', 'bao tieu', 'bảotiêu', 'baotieu', 'tiêu',
+    'bảo tiêu', 'bao tieu', 'bảotiêu', 'baotieu',
     'thương nhân', 'thuong nhan', 'thợ săn', 'tho san',
+    'tiêu thương', 'tieu thuong',
 }
 # VSRO / common private enums: 0 none; trader/hunter/thief vary by build.
 _JOB_THIEF_ENUMS = {2, 4}          # 2=Thief on many builds; 4=Bandit on some
@@ -3788,30 +3788,49 @@ def auto_pk_job_raw(entity):
     return None
 
 
+def _auto_pk_job_side_from_text(text):
+    text = (text or '').strip().casefold()
+    if not text or text in ('0', 'none', 'no', 'off', 'false', '-'):
+        return None
+    # Prefer thief markers before escort (e.g. "Cướp Chuyên Nghiệp").
+    if text in _JOB_THIEF_WORDS or any(word in text for word in _JOB_THIEF_WORDS):
+        return 'thief'
+    if text in _JOB_ESCORT_WORDS or any(word in text for word in _JOB_ESCORT_WORDS):
+        return 'escort'
+    return None
+
+
 def auto_pk_job_side(entity):
     """Return 'thief', 'escort' (trader/hunter), or None if no job flag."""
     value = auto_pk_job_raw(entity)
     if value is None or value is False:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, float) and value.is_integer():
+        value = None
+    elif isinstance(value, bool):
+        value = None
+    elif isinstance(value, float) and value.is_integer():
         value = int(value)
     if isinstance(value, int):
         if value in _JOB_THIEF_ENUMS:
             return 'thief'
         if value in _JOB_ESCORT_ENUMS:
             return 'escort'
-        return None
-    text = str(value).strip().casefold()
-    if not text or text in ('0', 'none', 'no', 'off', 'false', '-'):
-        return None
-    if text.isdigit():
-        return auto_pk_job_side({'job_type': int(text)})
-    if text in _JOB_THIEF_WORDS or any(word in text for word in _JOB_THIEF_WORDS):
-        return 'thief'
-    if text in _JOB_ESCORT_WORDS or any(word in text for word in _JOB_ESCORT_WORDS):
-        return 'escort'
+        value = None
+    elif value is not None:
+        text = str(value).strip().casefold()
+        if text.isdigit():
+            return auto_pk_job_side({'job_type': int(text)})
+        side = _auto_pk_job_side_from_text(text)
+        if side:
+            return side
+    # phBot Stable often omits job_type but still exposes job title text
+    # ("Cướp Chuyên Nghiệp", …) in miscellaneous string fields.
+    if isinstance(entity, dict):
+        for key, entry in entity.items():
+            if key in ('name', 'guild', 'servername') or not isinstance(entry, str):
+                continue
+            side = _auto_pk_job_side_from_text(entry)
+            if side:
+                return side
     return None
 
 
@@ -3824,20 +3843,106 @@ def auto_pk_job_flag_hostile(self_entity, other_entity):
     return mine != theirs and {mine, theirs} == {'thief', 'escort'}
 
 
-def auto_pk_is_hostile_opponent(player, character=None, require_color=False):
+def auto_pk_dual_listed(uid, monsters=None):
+    """Opposing-faction / scarf hostiles are often dual-listed in get_monsters()."""
+    if monsters is None:
+        monsters = get_monsters()
+    if not isinstance(monsters, dict):
+        return False
+    try:
+        return uid in monsters or str(uid) in monsters or int(uid) in monsters
+    except (TypeError, ValueError):
+        return uid in monsters or str(uid) in monsters
+
+
+def auto_pk_monster_entry(uid, monsters=None):
+    if monsters is None:
+        monsters = get_monsters()
+    if not isinstance(monsters, dict):
+        return None
+    if uid in monsters and isinstance(monsters[uid], dict):
+        return monsters[uid]
+    text = str(uid)
+    if text in monsters and isinstance(monsters[text], dict):
+        return monsters[text]
+    try:
+        number = int(uid)
+    except (TypeError, ValueError):
+        return None
+    entry = monsters.get(number)
+    return entry if isinstance(entry, dict) else None
+
+
+def auto_pk_player_view(player, uid=None, monsters=None):
+    """Merge dual-listed monster fields under player so job/color cues survive."""
+    if not isinstance(player, dict):
+        return {}
+    entry = auto_pk_monster_entry(uid, monsters) if uid is not None else None
+    if not entry:
+        return player
+    merged = dict(entry)
+    merged.update(player)
+    return merged
+
+
+def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid=None,
+                                monsters=None):
     """Opponent for Auto PK list select.
 
-    Always-enemy when job-flag thief ↔ trader/hunter. Also enemy on red/purple
-    hostile name colors. Missing color does not block Insert / war-scarf /
-    Alt-hostile server selects — those paths stay intact.
+    Priority: job-flag thief↔bảo tiêu; red/purple name color; when color is
+    hidden (common on Stable), dual-list in get_monsters (scarf/red hostiles).
+    Explicit white/non-hostile color stays skipped. Insert / war-scarf /
+    Alt-hostile server selects remain intact.
     """
     self_entity = get_character_data() or {} if character is None else character
-    if auto_pk_job_flag_hostile(self_entity, player):
+    view = auto_pk_player_view(player, uid, monsters)
+    if auto_pk_job_flag_hostile(self_entity, view):
         return True
-    verdict = auto_pk_hostile_name_color(player)
-    if verdict is None:
-        return not require_color
-    return bool(verdict)
+    verdict = auto_pk_hostile_name_color(view)
+    if verdict is True:
+        return True
+    if verdict is False:
+        return False
+    # Color field missing ("màu tên ẩn"): dual-list (khăn/phe địch) is enough.
+    if uid is not None and auto_pk_dual_listed(uid, monsters):
+        return True
+    # Title-only job cues (e.g. "Cướp Chuyên Nghiệp") when self is bảo tiêu.
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return True
+    theirs = auto_pk_job_side(view)
+    mine = auto_pk_job_side(self_entity)
+    if theirs and mine and theirs != mine and {mine, theirs} == {'thief', 'escort'}:
+        return True
+    if require_color:
+        return False
+    return False
+
+
+def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
+    """Short VN label for Auto PK scan rows."""
+    view = auto_pk_player_view(player, uid, monsters)
+    self_entity = character or {}
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return 'địch cờ nghề', True
+    color = auto_pk_hostile_name_color(view)
+    if color is True:
+        return 'chữ đỏ/tím', True
+    if color is False:
+        return 'không thù địch', False
+    dual = uid is not None and auto_pk_dual_listed(uid, monsters)
+    if dual:
+        return 'địch (dual-list/khăn)', True
+    theirs = auto_pk_job_side(view)
+    mine = auto_pk_job_side(self_entity)
+    if theirs == 'thief' and mine == 'escort':
+        return 'địch cờ nghề', True
+    if theirs == 'escort' and mine == 'thief':
+        return 'địch cờ nghề', True
+    if theirs == 'thief':
+        return 'cướp/đạo tặc (thiếu cờ mình)', False
+    if theirs == 'escort':
+        return 'bảo tiêu (thiếu cờ mình)', False
+    return 'màu tên ẩn', False
 
 
 def auto_pk_distance(target, anchor):
@@ -4052,9 +4157,14 @@ def auto_pk_try_native_enemy_key(runtime, client, now, reason):
     key = runtime.get('native_key', 0)
     if key not in AUTO_PK_NATIVE_KEYS.values():
         return False
+    window = client.get('window')
     runtime['native_probe_until'] = now + AUTO_PK_NATIVE_TIMEOUT
     runtime['select_until'] = runtime['native_probe_until']
-    if post_game_key(key, client.get('window')):
+    sent = post_game_key(key, window)
+    if not sent and window and user32 and user32.GetForegroundWindow() == window:
+        # Foreground fallback when PostMessage did not stick.
+        sent = press_key(key, window)
+    if sent:
         QtBind.setText(gui, auto_pk_status_label,
                        'Đã gửi Target Enemy (%s) · chờ game phát 7045.' % reason)
         return True
@@ -4082,6 +4192,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
         direct_select_request = 0
     runtime.update(requested=0, native_uid=0)
     players = auto_pk_players()
+    monsters = get_monsters() if callable(get_monsters) else None
     anchor = runtime['anchor']
     position = get_position() or {}
     own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
@@ -4113,10 +4224,10 @@ def auto_pk_select(character, runtime, now, from_event=False):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
             continue
-        # List-select only clear opponents: job-flag thief↔bảo tiêu and/or
-        # red/purple hostile name colors. Non-hostile names are skipped; Insert /
-        # Target Enemy + war-scarf / Alt-hostile paths still handle the rest.
-        if not auto_pk_is_hostile_opponent(target, character, require_color=True):
+        # List-select clear opponents: job-flag thief↔bảo tiêu, red/purple color,
+        # or (when color ẩn) dual-list/khăn. Explicit white/non-hostile stays skipped.
+        if not auto_pk_is_hostile_opponent(target, character, require_color=True,
+                                           uid=uid, monsters=monsters):
             continue
         anchor_distance = auto_pk_target_distance(target, anchor, runtime)
         if anchor_distance is None or anchor_distance > runtime['radius']:
@@ -4125,18 +4236,25 @@ def auto_pk_select(character, runtime, now, from_event=False):
         if best is None or candidate < best:
             best = candidate
     if best is None:
-        if auto_pk_try_native_enemy_key(runtime, client, now, 'không thấy đối thủ thù địch trong Player list'):
+        # After Insert failed to yield 7045, do not only re-spam the key forever.
+        if native_expired:
+            runtime['native_misses'] = runtime.get('native_misses', 0) + 1
+        if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
+                runtime, client, now, 'không thấy đối thủ thù địch trong Player list'):
             return
         if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chưa thấy chữ đỏ/tím hoặc cờ nghề địch · thử Target Enemy (Insert) nếu đã gán.' %
+                           'Đang canh %.0f m · chưa thấy chữ đỏ/tím, dual-list/khăn hoặc cờ nghề địch.' %
                            runtime['radius'])
         return
+    runtime['native_misses'] = 0
     stop_auto_pk_patrol(runtime)
     distance, uid = best
     failed_pid, until = runtime.get('fast_select_fallback', (None, 0))
     prefer_direct = (runtime.get('fast_scan') and auto_pk_in_background(client)
                      and failed_pid == client.get('pid') and now < until)
+    # After Insert produced no 7045, prefer direct 7045 inject for the dual-list /
+    # job-hostile UID rather than waiting on another native key cycle.
     if (native_expired or prefer_direct) and start_auto_pk_skill_probe(runtime, uid):
         return
     sent_at = monotonic()
@@ -7142,29 +7260,66 @@ _boss_engine.__dict__.update(_boss_bot=_BossAPI(), _disarm_boss=disarm_boss,
 exec(compile('# -*- coding: utf-8 -*-\n"""Ghost Boss nền theo ID, đồng bộ từng lượt đánh với phản hồi server."""\nimport json\nimport os\nimport queue\nimport struct\nimport subprocess\nimport tempfile\nfrom collections import deque\nfrom datetime import datetime\nfrom pathlib import Path\nfrom threading import Event, RLock, Thread\nfrom time import monotonic, time\nbot = _boss_bot\n\nNAME, VERSION = \'GhostBossBackground\', \'1.0.8\'\nLOCK=RLock()\nactive=None\nselected=0\nconfirmed_target=0\nselection_revision=0\nupdates=deque(maxlen=5)\n\n\ndef emit(j,text,quiet=False,error=False):\n    with LOCK:\n        if j and j.get(\'stream\'):\n            j[\'stream\'].write(\'[%s] +%d ms %s\\n\' % (datetime.now().strftime(\'%H:%M:%S.%f\')[:-3],round((monotonic()-j[\'start\'])*1000),text))\n            j[\'stream\'].flush()\n        if j and not j.get(\'details\') and j.get(\'cycle\',0)>1 and not any(k in text for k in (\'DỪNG\',\'KẾT THÚC\',\'Vòng\')):quiet=True\n        if not quiet:updates.append(text)\n    if error:bot.log(\'[Auto Boss] %s\' % text)\n\n\ndef identity(c):return c.get(\'server\'),c.get(\'name\'),c.get(\'player_id\')\n\n\ndef entity(records,uid):\n    if not isinstance(records,dict):return None\n    return records.get(uid) or records.get(str(uid))\n\n\ndef mob_alive(mob):\n    if not mob or mob.get(\'dead\'):\n        return False\n    try:\n        return float(mob.get(\'hp\') or 0) > 0\n    except (TypeError, ValueError):\n        return False\n\n\ndef live_target(uid):\n    return mob_alive(entity(bot.get_monsters() or {}, uid))\n\n\ndef stop(reason=\'bấm DỪNG\', notify=True):\n    with LOCK:\n        j=active\n        if not j:return\n        first=not j[\'stop\'].is_set()\n        if first:j[\'reason\']=reason\n        j[\'stop\'].set()\n        if first:\n            try:\n                mob=entity(bot.get_monsters() or {},j[\'target\'])\n                snapshot=dict(uid=j[\'target\'],expected=j.get(\'expected\'),visible=mob is not None,\n                              hp=(mob or {}).get(\'hp\'),dead=(mob or {}).get(\'dead\'))\n            except Exception:snapshot={\'uid\':j[\'target\'],\'expected\':j.get(\'expected\')}\n            emit(j,\'DỪNG: \'+reason, error=notify)\n            emit(j,\'Trạng thái khi dừng: \'+json.dumps(snapshot,ensure_ascii=False), quiet=True)\n\n\ndef valid(j):\n    if j[\'stop\'].is_set():return False\n    if any(monotonic() - at > 3 for at in j[\'cut_requests\'].values()):\n        stop(\'quá 3 giây chưa có hậu kiểm nút ngắt Boss\')\n        return False\n    c=bot.get_character_data() or {}\n    if identity(c)!=j[\'owner\'] or c.get(\'dead\') or bot.get_status():\n        stop(\'nhân vật thay đổi/chết hoặc bot chính được bật\');return False\n    mob=entity(bot.get_monsters() or {},j[\'target\'])\n    if not mob:\n        stop(\'không còn dữ liệu boss/quái trong tầm nhìn\');return False\n    if not mob_alive(mob):\n        if mob.get(\'dead\') or mob.get(\'hp\') == 0:\n            stop(\'boss/quái đã chết\', notify=False)\n        else:\n            stop(\'không đọc được HP của boss/quái\')\n        return False\n    return True\n\n\ndef wait(j,predicate,seconds):\n    end=monotonic()+seconds\n    while valid(j):\n        with LOCK:\n            if predicate():return True\n        if monotonic()>=end:return False\n        j[\'stop\'].wait(0.01)\n    return False\n\n\ndef pause(j,seconds):\n    end=monotonic()+seconds\n    return wait(j,lambda:monotonic()>=end,seconds+0.2)\n\n\ndef reader(j,process):\n    try:\n        for line in process.stdout:\n            try:\n                reply=json.loads(line)\n                # The focus report arrives after the cut\'s posted-message ack.\n                # Monitor it independently: it must not hold up the next skill.\n                with LOCK:\n                    cut=j.get(\'cut_requests\',{}).get(reply.get(\'id\'))\n                    if cut is not None and not reply.get(\'stage\'):\n                        j[\'cut_requests\'].pop(reply[\'id\'],None)\n                        emit(j,\'HẬU KIỂM postmouse: focus=%s → %s | gọi nút=%s ms | lỗi=%s\' %\n                             (reply.get(\'focus_before\'),reply.get(\'focus_after\'),reply.get(\'ms\'),reply.get(\'error\',\'không\')))\n                        if (reply.get(\'ok\') is not True or reply.get(\'focus_stolen\')) and active is j:\n                            stop(\'hậu kiểm Exchange lỗi hoặc phBot giành tiêu điểm; không chuyển Invoke\')\n                j[\'replies\'].put(reply)\n            except ValueError:\n                if line.strip():emit(j,\'HELPER: \'+line.strip()[:250],True)\n    finally:j[\'replies\'].put({\'ended\':True})\n\n\ndef request(j,action):\n    with LOCK:\n        if not valid(j):return None\n        if action == \'cut\' and j[\'ended\']:\n            return {\'ended_naturally\': True}\n        request_id=str(monotonic())\n        timeout=15 if action==\'probe\' else 2\n        q=dict(id=request_id,pid=os.getpid(),name=j[\'preferred_player\'] if action==\'probe\' else j[\'player\'],\n               own_name=j[\'owner\'][1],transport=\'postmouse\',\n               action=action,expires=round((time()+timeout)*1000))\n        process=j[\'process\']\n        if action==\'cut\':\n            j.setdefault(\'cut_requests\',{})[request_id]=monotonic()\n            j[\'cut_wait\']=dict(request_id=request_id,skill=j[\'expected\'],armed_at=monotonic(),cancel_at=None)\n        process.stdin.write(json.dumps(q,ensure_ascii=False)+\'\\n\');process.stdin.flush()\n    deadline=monotonic()+timeout+0.3\n    while valid(j) and monotonic()<deadline:\n        try:r=j[\'replies\'].get(timeout=0.03)\n        except queue.Empty:continue\n        if r.get(\'ended\'):raise ValueError(\'Helper đã dừng.\')\n        if r.get(\'id\')!=request_id:continue\n        if r.get(\'stage\'):\n            emit(j,\'POSTMESSAGE: \'+str(r[\'stage\']),True)\n            if action==\'cut\' and r[\'stage\']==\'mouse_posted\':\n                emit(j,\'ĐƯỜNG=postmouse | đã gửi cặp thông điệp, %s ms trong helper; chờ B074 02 00 rồi mới nối skill.\' % r.get(\'post_ms\'))\n                return r\n            continue\n        if not r.get(\'ok\'):raise ValueError(str(r.get(\'error\',\'Không gọi được nút Exchange\')))\n        if r.get(\'focus_stolen\'):raise ValueError(\'phBot giành tiêu điểm; dừng, không thử Invoke.\')\n        if action!=\'probe\':\n            emit(j,\'ĐƯỜNG=postmouse | Player=%s | gọi nút=%s ms | focus=%s → %s; không phải xác nhận server.\' %\n                 (r.get(\'name\'),r.get(\'ms\'),r.get(\'focus_before\'),r.get(\'focus_after\')))\n        return r\n    if valid(j):raise ValueError(\'Hết thời gian gọi nút phBot; không gửi lại.\')\n    return None\n\n\ndef acquire_player(j):\n    announced = False\n    while valid(j):\n        reply = request(j, \'probe\')\n        if reply is None:\n            return False\n        if reply.get(\'needs_phbot_foreground\'):\n            if announced != \'foreground\':\n                emit(j, \'Auto Boss: mở cửa sổ phBot để tự chọn acc hỗ trợ; sau đó có thể chuyển cửa sổ.\')\n                announced = \'foreground\'\n            j[\'stop\'].wait(1.0)\n            continue\n        player = str(reply.get(\'name\') or \'\').strip()\n        if player and not reply.get(\'no_player\') and player.casefold() != str(j[\'owner\'][1]).casefold():\n            j[\'player\'] = player\n            j[\'recheck_player\'] = False\n            emit(j, \'Đã chọn Player hỗ trợ Boss: \' + player)\n            return True\n        if announced != \'player\':\n            emit(j, \'Chưa có Player hỗ trợ trong tầm. Đang tự làm mới danh sách.\')\n            announced = \'player\'\n        j[\'stop\'].wait(1.0)\n    return False\n\n\ndef send_action(j, payload):\n    """Register an exact match before sending, including delayed callbacks."""\n    now = monotonic()\n    recent = j[\'recent_actions\']\n    while recent and recent[0][1] < now:\n        recent.popleft()\n    recent.append((payload, now + 1.5))\n    return bot.inject_joymax(0x7074, payload, False)\n\n\ndef describe_action(raw):\n    if raw == b\'\\x02\':\n        return \'hủy tác vụ\'\n    if len(raw) == 7 and raw[:3] == b\'\\x01\\x01\\x01\':\n        return \'đánh thường UID=%d\' % struct.unpack_from(\'<I\', raw, 3)[0]\n    if len(raw) in (7, 11) and raw[:2] == b\'\\x01\\x04\':\n        skill = struct.unpack_from(\'<I\', raw, 2)[0]\n        if len(raw) == 11 and raw[6] == 1:\n            return \'skill ID=%d UID=%d\' % (skill, struct.unpack_from(\'<I\', raw, 7)[0])\n        if len(raw) == 7 and raw[6] == 0:\n            return \'skill tự buff ID=%d\' % skill\n    return \'tác vụ chưa nhận diện\'\n\n\ndef maintain_imbue(j):\n    """Run only between attacks, before arming the next attack\'s B070 wait."""\n    uid = j.get(\'imbue_id\')\n    now = monotonic()\n    if not uid:\n        return True\n    data = entity(bot.get_skills() or {}, uid)\n    if not data:\n        return True\n    active = imbue_is_active(bot, uid, data)\n    payload = struct.pack(\'<BBIB\', 1, 4, uid, 0)\n    cast_time = max(0.2, imbue_seconds(data, \'cast_time\') + 0.1)\n    with LOCK:\n        if not valid(j):\n            return False\n        if uid != j[\'imbue_id\']:\n            return True\n        delay = imbue_refresh_delay(data, j[\'imbue_early\'])\n        if active:\n            if not j[\'imbue_seen_active\'] and not j[\'imbue_until\'] and delay:\n                j[\'imbue_until\'] = now + delay\n            j[\'imbue_seen_active\'] = True\n            if not j[\'imbue_until\']:\n                return True\n        elif j[\'imbue_seen_active\']:\n            j[\'imbue_seen_active\'] = False\n            j[\'imbue_until\'] = 0.0\n        if now < max(j[\'imbue_retry\'], j[\'imbue_until\']) or data.get(\'can_cast\') is False:\n            return True\n        j.update(imbue_payload=payload, imbue_ack=None)\n        j[\'imbue_retry\'] = now + max(2.0, imbue_seconds(data, \'cooldown\'))\n        accepted = send_action(j, payload)\n        emit(j, \'Tay phép Boss: %s (ID=%d), API=%r.\' % (data.get(\'name\') or \'Tự buff\', uid, accepted))\n    try:\n        if accepted is False:\n            with LOCK:\n                if uid == j[\'imbue_id\']:\n                    j[\'imbue_retry\'] = monotonic() + 2.0\n            return True\n        if wait(j, lambda: j[\'imbue_ack\'] is not None, 1.0):\n            with LOCK:\n                if uid == j[\'imbue_id\']:\n                    j[\'imbue_until\'] = j[\'imbue_ack\'] + (delay or 1.0)\n        elif not j[\'stop\'].is_set():\n            emit(j, \'Tay phép Boss: chưa thấy B070 xác nhận, tiếp tục chuỗi đánh.\')\n        return pause(j, max(0, now + cast_time - monotonic()))\n    finally:\n        with LOCK:\n            j[\'imbue_payload\'] = None\n\n\ndef skill_available(skill):\n    data = entity(bot.get_skills() or {}, skill)\n    return data is not None and data.get(\'can_cast\') is not False\n\n\n# B074 carries no skill ID. Use the ordered start/end pair only to\n# permit one reclick of the same skill, never as evidence of a hit.\nCAST_RECOVERY_GRACE = 0.35\n\n\ndef cast_attack(j, skill):\n    data = struct.pack(\'<BBIBI\', 1, 4, skill, 1, j[\'target\'])\n    for attempt in range(2):\n        if not skill_available(skill):\n            emit(j, \'ID=%d: phBot báo chưa thể dùng; đợi dữ liệu cập nhật.\' % skill)\n            if not wait(j, lambda: skill_available(skill) or (attempt and j[\'ack\'] is not None), 6):\n                if j[\'stop\'].is_set():\n                    return False\n                raise ValueError(\'ID=%d chưa thể dùng trong 6 giây; kiểm tra hồi chiêu, vũ khí và điều kiện của skill.\' % skill)\n        with LOCK:\n            if not valid(j):\n                return False\n            if attempt and j[\'ack\'] is not None:\n                return True\n            if attempt:\n                emit(j, \'Boss ID=%d: đã thấy B074 01 01 → 02 00, thiếu B070; thử lại đúng skill một lần.\' % skill)\n            j[\'cast_replies\'].clear()\n            j.update(expected=skill, expected_packet=data, ack=None, ended=False, sent=monotonic(),\n                     cast_started=False, cast_closed_at=None)\n            result = send_action(j, data)\n            emit(j, \'Gửi skill ID=%d; API=%r; chờ B070 đúng UID.\' % (skill, result))\n            if result is False:\n                raise ValueError(\'phBot từ chối gửi skill ID=%d.\' % skill)\n\n        def cast_resolved():\n            return j[\'ack\'] is not None or (\n                j[\'cast_closed_at\'] is not None and monotonic() >= j[\'cast_closed_at\'] + CAST_RECOVERY_GRACE)\n\n        wait(j, cast_resolved, 6)\n        with LOCK:\n            if not valid(j):\n                return False\n            if j[\'ack\'] is not None:\n                return True\n            if not attempt and j[\'cast_closed_at\'] is not None and cast_resolved():\n                continue\n            elapsed = round((monotonic() - j[\'sent\']) * 1000)\n            replies = \' | \'.join(j[\'cast_replies\']) or \'chưa thấy B070 của nhân vật hoặc B074\'\n            retry = \'Đã thử lại một lần. \' if attempt else \'\'\n            raise ValueError(\'ID=%d UID=%d: sau %d ms chưa có B070 khớp. %s. %sLog: %s\' %\n                             (skill, j[\'target\'], elapsed, replies, retry, j[\'path\']))\n\n\ndef stage(j):\n    for skill, delay in j[\'sequence\']:\n        if delay is not None and j[\'recheck_player\'] and not acquire_player(j):\n            return False\n        with LOCK:\n            if not valid(j):return False\n            ready_at=j[\'ready\'].get(skill,0)\n        if not wait(j,lambda:monotonic()>=ready_at,max(0,ready_at-monotonic())+0.5):return False\n        if not maintain_imbue(j):return False\n        if not cast_attack(j, skill):\n            return False\n        ack = j[\'ack\']\n        j[\'ready\'][skill] = ack + j[\'cooldowns\'].get(skill, 0) + 0.05\n        if delay is not None:\n            cut_at = ack + delay / 1000\n            if not wait(j, lambda: j[\'ended\'] or monotonic() >= cut_at, delay / 1000 + 0.5):\n                return False\n            with LOCK:\n                if not valid(j):\n                    return False\n                should_cut = not j[\'ended\']\n            if should_cut:\n                reply = request(j, \'cut\')\n                if reply is None:\n                    return False\n                if not reply.get(\'ended_naturally\'):\n                    wait(j, lambda: j[\'ended\'] or j[\'cut_wait\'][\'cancel_at\'] is not None, 1.5)\n                    with LOCK:\n                        if not valid(j):\n                            return False\n                        if j[\'cut_wait\'][\'cancel_at\'] is None:\n                            emit(j, \'Chưa xác nhận ngắt ID=%d. Đợi skill kết thúc rồi tự tìm lại Player.\' % skill)\n                            j[\'recheck_player\'] = True\n                        j[\'cut_wait\'] = None\n        if not wait(j, lambda: j[\'ended\'], 12):\n            if j[\'stop\'].is_set():\n                return False\n            raise ValueError(\'Thiếu B074 kết thúc cho skill ID=%d; dừng chuỗi.\' % skill)\n        if not pause(j, 0.1):\n            return False\n    return True\n\n\ndef run(j):\n    global active\n    helper_path = None\n    try:\n        emit(j,\'BẮT ĐẦU | target=%d | dãy=%r | log=%s\' % (j[\'target\'],j[\'sequence\'],j[\'path\']))\n        if any(delay is not None for _, delay in j[\'sequence\']):\n            emit(j, \'Auto Boss đang mở Hòm đồ phBot và chọn acc hỗ trợ.\')\n            # Windows caps the command line at 32767 characters. Keep the\n            # script in a file and use UTF-8 BOM for Windows PowerShell 5.1.\n            with tempfile.NamedTemporaryFile(mode=\'w\', encoding=\'utf-8-sig\', prefix=\'AGBoss-\',\n                                             suffix=\'.ps1\', delete=False) as script:\n                helper_path = Path(script.name)\n                script.write(HELPER)\n            exe = Path(os.environ.get(\'SystemRoot\', \'C:/Windows\')) / \'System32/WindowsPowerShell/v1.0/powershell.exe\'\n            with LOCK:\n                if not valid(j):\n                    return\n                process = subprocess.Popen(\n                    [str(exe), \'-NoProfile\', \'-NonInteractive\', \'-ExecutionPolicy\', \'Bypass\',\n                     \'-File\', str(helper_path)],\n                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,\n                    text=True, encoding=\'utf-8\', creationflags=0x08000000, bufsize=1)\n                j[\'process\'] = process\n            Thread(target=reader, args=(j, process), daemon=True).start()\n            if not acquire_player(j):\n                return\n        with LOCK:\n            if not valid(j) or confirmed_target != j[\'target\']:\n                return\n        emit(j,\'Đã sẵn sàng: Ghost Boss nền theo ID. F4 dừng.\')\n        quiet_after = monotonic() + j[\'rest\']\n        def ready_to_attack():\n            now = monotonic()\n            if now >= quiet_after and now - j[\'last_foreign_action\'] >= 1.4:\n                j[\'starting\'] = False\n                return True\n            return False\n        if not wait(j, ready_to_attack, j[\'rest\'] + 4):\n            if not j[\'stop\'].is_set():\n                stop(\'vẫn thấy lệnh ngoài khi chuẩn bị Boss; tắt Auto khác và ngừng đánh tay\')\n            return\n        while valid(j):\n            j[\'cycle\']+=1\n            if not stage(j):break\n            if j[\'cycle\']==1 or j[\'cycle\']%10==0:emit(j,\'Vòng %d đã hoàn tất đủ %d skill; tiếp tục, chờ hồi riêng từng ID.\' % (j[\'cycle\'],len(j[\'sequence\'])))\n    except Exception as error:\n        if not j[\'reason\']:\n            j[\'reason\'] = str(error)\n            emit(j, \'DỪNG: \' + j[\'reason\'], error=True)\n    finally:\n        with LOCK:\n            j[\'stop\'].set()\n            process = j.get(\'process\')\n        if process is not None and process.poll() is None:\n            try:\n                process.kill()\n                process.wait(timeout=2)\n            except (OSError, subprocess.TimeoutExpired):\n                pass\n        if helper_path is not None:\n            try:\n                helper_path.unlink(missing_ok=True)\n            except OSError as error:\n                emit(j, \'Chưa dọn được tệp helper tạm: \' + str(error), quiet=True)\n        with LOCK:\n            emit(j,\'KẾT THÚC: %s | FILE: %s\' % (j[\'reason\'] or \'đã dừng chuỗi\',j[\'path\']))\n            j[\'stream\'].close();j[\'stream\']=None\n            if active is j:active=None\n\n\ndef start(target, sequence, imbue_id, imbue_early, player):\n    global active, selected\n    with LOCK:\n        if active:\n            emit(None, \'Boss đang kết thúc lượt trước hoặc đã chạy.\')\n            return\n        try:\n            if os.name != \'nt\':\n                raise ValueError(\'Auto Boss dùng trên Windows/phBot.\')\n            c = bot.get_character_data() or {}\n            if not c.get(\'player_id\') or c.get(\'dead\'):\n                raise ValueError(\'Vào game và còn sống trước.\')\n            if bot.get_status():\n                raise ValueError(\'Dừng bot chính trước khi bật Auto Boss.\')\n            if not live_target(target):\n                raise ValueError(\'Chọn Boss/quái còn sống trong game rồi bấm Bật.\')\n            learned = {int(k): v for k, v in (bot.get_skills() or {}).items()}\n            if any(skill not in learned or skill == imbue_id for skill, _ in sequence):\n                raise ValueError(\'Kiểm tra ID skill và bỏ tay phép khỏi dãy đánh Boss.\')\n            rest = 0\n            folder=Path(bot.get_config_dir())/NAME;folder.mkdir(parents=True,exist_ok=True)\n            path=folder/(\'GhostBoss_\'+datetime.now().strftime(\'%Y%m%d_%H%M%S_%f\')+\'.log\')\n            selected=target\n            j=dict(owner=identity(c),source=c[\'player_id\'],target=target,sequence=sequence,rest=rest,ready={s:monotonic()+max(0,float(learned[s].get(\'cooldown\') or 0)/1000) for s,_ in sequence if learned[s].get(\'can_cast\') is False},cooldowns={s:max(0,float(learned[s].get(\'cooldown\') or 0)/1000) for s,_ in sequence},cycle=0,details=False,\n                   stream=path.open(\'w\',encoding=\'utf-8\'),path=path,start=monotonic(),stop=Event(),reason=\'\',\n                   expected=None,expected_packet=None,ack=None,ended=False,cast_replies=deque(maxlen=4),\n                   cast_started=False,cast_closed_at=None,\n                   preferred_player=player,player=\'\',recheck_player=False,process=None,replies=queue.Queue(),cut_requests={},cut_wait=None,\n                   imbue_id=imbue_id,imbue_early=imbue_early,imbue_seen_active=False,imbue_payload=None,imbue_ack=None,imbue_retry=0.0,imbue_until=0.0,\n                   starting=True,last_foreign_action=0.0,recent_actions=deque(maxlen=16))\n            emit(j, \'Auto Boss dùng chung dãy skill của Auto Ghost.\')\n            active=j;Thread(target=run,args=(j,),daemon=True).start()\n        except Exception as error:emit(None, str(error), error=True)\n\n\ndef packet(outgoing,opcode,data):\n    global selected, confirmed_target, selection_revision\n    raw=bytes(data or b\'\')\n    with LOCK:\n        if outgoing and opcode == 0x7045 and len(raw) == 4:\n            selected = struct.unpack(\'<I\', raw)[0]\n            if selected != confirmed_target:\n                confirmed_target = 0\n        elif outgoing and opcode == 0x7046:\n            selected = confirmed_target = 0\n        elif not outgoing and opcode == 0xB045:\n            target = struct.unpack_from(\'<I\', raw, 1)[0] if len(raw) >= 5 and raw[0] == 1 else 0\n            if target and target != confirmed_target:\n                selection_revision += 1\n            selected = confirmed_target = target\n        j=active\n        if not j or j[\'stop\'].is_set():return\n        if selected != j[\'target\']:\n            stop(\'đổi hoặc bỏ mục tiêu khi đang Auto Boss\', notify=False)\n            return\n        if outgoing and opcode == 0x7074:\n            now = monotonic()\n            if not any(payload == raw and now <= expires for payload, expires in j[\'recent_actions\']):\n                description = \'%s | 7074=%s | Boss đang chờ ID=%s\' % (\n                    describe_action(raw), raw[:48].hex(\' \').upper(), j[\'expected\'])\n                if j[\'starting\']:\n                    j[\'last_foreign_action\'] = now\n                    emit(j, \'Chuẩn bị: thấy lệnh ngoài, đợi ngừng đánh | \' + description, True)\n                else:\n                    stop(\'có lệnh ngoài: \' + description)\n                    return\n        if outgoing and opcode in (0x7034,0x7005):stop(\'đổi đồ hoặc thoát game khi Ghost Boss\')\n        if opcode==0x3085 or (not outgoing and opcode==0xB081 and raw[:1]==b\'\\x01\'):\n            stop(\'giao dịch thật được mở; không tự xác nhận đồ\')\n        if not outgoing and opcode==0xB070 and len(raw)>=11 and raw[0]==1:\n            skill, source = struct.unpack_from(\'<II\', raw, 3)\n            payload = j.get(\'imbue_payload\')\n            if (payload and skill == struct.unpack_from(\'<I\', payload, 2)[0]\n                    and source == j[\'source\'] and j[\'imbue_ack\'] is None):\n                j[\'imbue_ack\'] = monotonic()\n        waiting_cast = j[\'expected\'] is not None and j[\'ack\'] is None\n        if not outgoing and waiting_cast and opcode == 0xB074:\n            j[\'cast_replies\'].append(\'B074 \' + raw[:8].hex(\' \').upper())\n            if raw == b\'\\x02\\x00\' and j[\'cast_started\'] and j[\'cast_closed_at\'] is None:\n                j[\'cast_closed_at\'] = monotonic()\n            elif raw == b\'\\x01\\x01\':\n                j[\'cast_closed_at\'] = None\n            j[\'cast_started\'] = raw == b\'\\x01\\x01\'\n        if not outgoing and waiting_cast and opcode == 0xB070 and len(raw) >= 11 and raw[0] == 1:\n            skill, source = struct.unpack_from(\'<II\', raw, 3)\n            if source == j[\'source\']:\n                target = struct.unpack_from(\'<I\', raw, 15)[0] if len(raw) >= 19 else None\n                if skill == j[\'expected\'] and target == j[\'target\']:\n                    j[\'ack\'] = monotonic()\n                else:\n                    j[\'cast_replies\'].append(\'B070 ID=%d UID=%s\' % (skill, target))\n                    emit(j, \'B070 chưa khớp: \' + raw.hex(\' \').upper(), quiet=True)\n        if not outgoing and opcode == 0xB074 and not j.get(\'imbue_payload\') and j[\'ack\'] is not None:\n            if raw in (b\'\\x02\\x00\', b\'\\x02\\x01\'):\n                j[\'ended\'] = True\n            cut = j[\'cut_wait\']\n            if raw == b\'\\x02\\x00\' and cut and cut[\'skill\'] == j[\'expected\'] and cut[\'cancel_at\'] is None:\n                cut[\'cancel_at\'] = monotonic()\n                emit(j, \'Boss ID=%d · nhận B074 02 00 sau yêu cầu ngắt.\' % j[\'expected\'])\n        if j.get(\'details\') and opcode in (0x7045,0xB045,0x7074,0xB070,0xB074,0x3085):\n            emit(j,\'%s %04X: %s\' % (\'C→S\' if outgoing else \'S→C\',opcode,raw.hex(\' \').upper()),True)\n\n\ndef handle_silkroad(opcode,data):packet(True,opcode,data);return True\ndef handle_joymax(opcode,data):packet(False,opcode,data);return True\ndef disconnected():stop(\'mất kết nối\')\ndef teleported():stop(\'dịch chuyển\')\ndef finished():stop(\'đóng plugin\')\ndef stop_button():stop()\n\n\nHELPER = \'\\n$ErrorActionPreference=\\\'Stop\\\'\\nAdd-Type -AssemblyName UIAutomationClient\\nAdd-Type -AssemblyName UIAutomationTypes\\nAdd-Type -TypeDefinition @\\\'\\nusing System;\\nusing System.Runtime.InteropServices;\\npublic static class HHFocusSnapshot {\\n [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }\\n [DllImport("user32.dll",SetLastError=true)] public static extern bool PostMessage(IntPtr hwnd,uint msg,UIntPtr wp,IntPtr lp);\\n [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hwnd,ref POINT point);\\n [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint pid);\\n [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }\\n [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();\\n [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);\\n public static uint InputTick() { var info=new LASTINPUTINFO(); info.cbSize=(uint)Marshal.SizeOf(info); return GetLastInputInfo(ref info)?info.dwTime:0; }\\n}\\n\\\'@\\n[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false)\\n[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)\\n\\nfunction Send-NavMouse($element,[int]$expectedPid) {\\n if($element.Current.IsOffscreen){\\n  $scroll=$null\\n  if($element.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern,[ref]$scroll)){$scroll.ScrollIntoView();Start-Sleep -Milliseconds 100}\\n }\\n $rect=$element.Current.BoundingRectangle\\n if($element.Current.IsOffscreen -or $rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw \\\'Inventory navigation has no visible rectangle\\\'}\\n $node=$element;$hwnd=[IntPtr]::Zero\\n for($i=0;$node -and $i -lt 12;$i++){\\n  if($node.Current.ProcessId -ne $expectedPid){break}\\n  if($node.Current.NativeWindowHandle){$hwnd=[IntPtr]$node.Current.NativeWindowHandle;break}\\n  $node=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)\\n }\\n [uint32]$owner=0\\n [HHFocusSnapshot]::GetWindowThreadProcessId($hwnd,[ref]$owner)|Out-Null\\n if($hwnd -eq [IntPtr]::Zero -or $owner -ne $expectedPid){throw \\\'Inventory navigation window mismatch\\\'}\\n $point=New-Object HHFocusSnapshot+POINT\\n $point.X=[int]($rect.Left+$rect.Width/2);$point.Y=[int]($rect.Top+$rect.Height/2)\\n if(![HHFocusSnapshot]::ScreenToClient($hwnd,[ref]$point)){throw \\\'Inventory coordinate mapping failed\\\'}\\n if($point.X -lt 0 -or $point.Y -lt 0 -or $point.X -gt 32767 -or $point.Y -gt 32767){throw \\\'Inventory coordinates outside range\\\'}\\n $lp=[IntPtr](($point.Y -shl 16) -bor ($point.X -band 65535))\\n if(![HHFocusSnapshot]::PostMessage($hwnd,0x0201,[UIntPtr]::new([uint32]1),$lp)){throw \\\'Inventory mouse-down rejected\\\'}\\n if(![HHFocusSnapshot]::PostMessage($hwnd,0x0202,[UIntPtr]::Zero,$lp)){throw \\\'Inventory mouse-up rejected\\\'}\\n}\\n\\nfunction Test-PhBotForeground([int]$expectedPid) {\\n [uint32]$foregroundPid=0\\n [HHFocusSnapshot]::GetWindowThreadProcessId([HHFocusSnapshot]::GetForegroundWindow(),[ref]$foregroundPid)|Out-Null\\n return $foregroundPid -eq [uint32]$expectedPid\\n}\\n\\nfunction Test-PlayerName([string]$name,$q) {\\n if([string]::IsNullOrWhiteSpace($name) -or $name -ieq [string]$q.own_name){return $false}\\n if($q.name){return ($name -ieq [string]$q.name)}\\n return ($name.Trim() -notin @(\\\'-\\\',\\\'--\\\',\\\'(none)\\\',\\\'none\\\',\\\'player\\\',\\\'players\\\',\\\'select player\\\',\\\'no player\\\',\\\'no players\\\',\\\'...\\\',\\\'chọn người chơi\\\',\\\'không có người chơi\\\',\\\'chọn player\\\'))\\n}\\n\\n$button=$null\\n$inventoryOpened=$false\\n[Console]::WriteLine(\\\'{"stage":"ready"}\\\')\\nwhile ($line=[Console]::ReadLine()) {\\n $q=$null\\n try {\\n  $q=$line|ConvertFrom-Json\\n  @{id=$q.id;stage=\\\'searching_button\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires) {throw \\\'Request expired\\\'}\\n  if($q.action -eq \\\'probe\\\' -and !$inventoryOpened -and (Test-PhBotForeground ([int]$q.pid))) {\\n   $roots=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$q.pid)))\\n   $navDone=$false;$labels=New-Object System.Collections.Generic.List[string]\\n   foreach($root in $roots) {\\n    if($navDone){break}\\n    $nodes=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)\\n    foreach($node in $nodes) {\\n     $name=($node.Current.Name -replace \\\'[\\\\p{P}\\\\p{S}\\\\s]\\\',\\\'\\\').ToLowerInvariant()\\n     if($labels.Count -lt 30 -and $node.Current.Name){$labels.Add($node.Current.Name)}\\n     if($name -in @(\\\'inventory\\\',\\\'hòmđồ\\\',\\\'thùngđồ\\\')) {\\n      if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Expired before Inventory navigation\\\'}\\n      Send-NavMouse $node ([int]$q.pid)\\n      @{id=$q.id;stage=\\\'inventory_mouse_posted\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n      $navDone=$true;break\\n     }\\n    }\\n   }\\n   if(!$navDone){@{id=$q.id;stage=(\\\'inventory_navigation_not_found; labels=\\\'+($labels -join \\\' | \\\'))}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}}\\n   $inventoryOpened=$navDone\\n   $button=$null\\n  }\\n  if (!$button -or $button.Current.ProcessId -ne [int]$q.pid -or $button.Current.IsOffscreen) {\\n   $exchangeOpened=$false\\n   do {\\n   $roots=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$q.pid)))\\n   $matches=New-Object System.Collections.Generic.List[System.Windows.Automation.AutomationElement]\\n   $exchangeTabs=@()\\n   $captions=New-Object System.Collections.Generic.List[string]\\n   foreach($root in $roots) {\\n    $buttons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)\\n    foreach($b in $buttons) {\\n     $caption=$b.Current.Name\\n     $normalized=($caption -replace \\\'&\\\',\\\'\\\' -replace \\\'\\\\s\\\',\\\'\\\').ToLowerInvariant()\\n     if($b.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $captions.Count -lt 30){$captions.Add($caption)}\\n     if($b.Current.ControlType -eq [System.Windows.Automation.ControlType]::TabItem -and !$b.Current.IsOffscreen -and $normalized -in @(\\\'exchange\\\',\\\'traođổi\\\',\\\'giaodịch\\\')){$exchangeTabs+= $b}\\n     if(!$b.Current.IsOffscreen -and $normalized -in @(\\\'requestexchange\\\',\\\'yêucầugiaodịch\\\',\\\'yêucầutraođổi\\\')) {\\n      $ip=$null\\n      $matches.Add($b)\\n     }\\n    }\\n   }\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !(Test-PhBotForeground ([int]$q.pid))){\\n    break\\n   }\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !$exchangeOpened -and $exchangeTabs.Count -eq 1){\\n    Send-NavMouse $exchangeTabs[0] ([int]$q.pid)\\n    $exchangeOpened=$true\\n   }\\n   if($q.action -in @(\\\'probe\\\',\\\'mouse_probe\\\') -and $matches.Count -ne 1){Start-Sleep -Milliseconds 100}\\n   } while($q.action -in @(\\\'probe\\\',\\\'mouse_probe\\\') -and $matches.Count -ne 1 -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt [long]$q.expires)\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !(Test-PhBotForeground ([int]$q.pid))){\\n    @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if($matches.Count -ne 1){throw (\\\'Request Exchange button count: \\\'+$matches.Count+\\\'; ProcessId=\\\'+$q.pid+\\\'; roots=\\\'+$roots.Count+\\\'; buttons=[\\\'+($captions -join \\\' | \\\')+\\\']\\\')}\\n   $button=$matches[0]\\n  }\\n  if($button.Current.IsOffscreen -or ($q.action -ne \\\'probe\\\' -and !$button.Current.IsEnabled)){throw \\\'Open phBot Inventory / Exchange page and leave it visible\\\'}\\n  $scope=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($button)\\n  $combos=$scope.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::ComboBox)))\\n  for($depth=0;$combos.Count -eq 0 -and $depth -lt 3;$depth++) {\\n   $parent=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($scope)\\n   if(!$parent -or $parent.Current.ProcessId -ne [int]$q.pid){break}\\n   $scope=$parent\\n   $combos=$scope.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::ComboBox)))\\n  }\\n\\n  if($q.action -eq \\\'probe\\\' -and $combos.Count -eq 1) {\\n   $combo=$combos[0]\\n   $focusBeforeSelection=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n   $selection=$null\\n   $selectedText=\\\'\\\'\\n   if($combo.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern,[ref]$selection)){\\n    $current=$selection.Current.GetSelection()\\n    if($current.Count -eq 1){$selectedText=$current[0].Current.Name}\\n   }\\n   $valuePattern=$null\\n   if(!$selectedText -and $combo.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$valuePattern)){\\n    $selectedText=$valuePattern.Current.Value\\n   }\\n   if(!(Test-PlayerName $selectedText $q)){\\n    if(!(Test-PhBotForeground ([int]$q.pid))){\\n     @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n     continue\\n    }\\n    $row=$combo.Current.BoundingRectangle\\n    $refresh=@()\\n    $refreshScope=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($scope)\\n    if(!$refreshScope -or $refreshScope.Current.ProcessId -ne [int]$q.pid){$refreshScope=$scope}\\n    foreach($node in $refreshScope.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)){\\n     $caption=($node.Current.Name -replace \\\'[&\\\\s]\\\',\\\'\\\').ToLowerInvariant()\\n     if($node.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or $node.Current.IsOffscreen -or !$node.Current.IsEnabled -or $caption -notin @(\\\'refresh\\\',\\\'refreshplayers\\\',\\\'làmmới\\\',\\\'cậpnhật\\\')){continue}\\n     $rect=$node.Current.BoundingRectangle\\n     if($rect.Left -ge $row.Right-4 -and [Math]::Abs(($rect.Top+$rect.Bottom)-($row.Top+$row.Bottom)) -le 30){$refresh+= $node}\\n    }\\n    if($refresh.Count -eq 1){\\n     Send-NavMouse $refresh[0] ([int]$q.pid)\\n     Start-Sleep -Milliseconds 100\\n    }\\n   }\\n   if(!$combo.Current.IsEnabled){\\n    @{id=$q.id;ok=$true;no_player=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if(!(Test-PlayerName $selectedText $q)){\\n    $selectedText=\\\'\\\'\\n    $expand=$null\\n    if(!$combo.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$expand)){\\n     throw \\\'Không đọc được danh sách Player tự động của phBot.\\\'\\n    }\\n    $wasCollapsed=$expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed\\n    try{\\n     if($wasCollapsed){$expand.Expand();Start-Sleep -Milliseconds 100}\\n     foreach($item in $combo.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)){\\n      $selector=$null\\n      $candidate=$item.Current.Name\\n      if($item.Current.ProcessId -eq [int]$q.pid -and (Test-PlayerName $candidate $q) -and $item.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selector)){\\n       if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Hết thời gian chọn Player hỗ trợ.\\\'}\\n       $selector.Select()\\n       $selectedText=$candidate\\n       break\\n      }\\n     }\\n    } finally {\\n     if($wasCollapsed -and $expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded){$expand.Collapse()}\\n    }\\n   }\\n   [uint32]$ownerAfter=0\\n   $focusAfterSelection=[HHFocusSnapshot]::GetForegroundWindow()\\n   [HHFocusSnapshot]::GetWindowThreadProcessId($focusAfterSelection,[ref]$ownerAfter)|Out-Null\\n   if($focusAfterSelection.ToInt64() -ne $focusBeforeSelection -and $ownerAfter -eq [uint32]$q.pid){\\n    @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if(!$selectedText){\\n    @{id=$q.id;ok=$true;no_player=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n  }\\n\\n  $matched=0\\n  $comboDetails=New-Object System.Collections.Generic.List[string]\\n  foreach($combo in $combos) {\\n   $selectedText=\\\'\\\'\\n   $source=\\\'none\\\'\\n   $sp=$null\\n   if($combo.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern,[ref]$sp)) {\\n    $selected=$sp.Current.GetSelection()\\n    if($selected.Count -eq 1){$selectedText=$selected[0].Current.Name;$source=\\\'SelectionPattern\\\'}\\n   }\\n   if(!$selectedText) {\\n    $vp=$null\\n    if($combo.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$vp)) {\\n     $value=$vp.Current.Value\\n     $selectedText=$value\\n     $source=if($vp.Current.IsReadOnly){\\\'ReadOnlyValue\\\'}else{\\\'EditableValue\\\'}\\n    }\\n   }\\n   $comboDetails.Add((\\\'Name=\\\'+$combo.Current.Name+\\\', selected=\\\'+$selectedText+\\\', source=\\\'+$source))\\n   if(Test-PlayerName $selectedText $q){$matched++;$selectedName=$selectedText;$matchedCombo=$combo;$matchedSource=$source}\\n  }\\n  if($matched -ne 1){throw (\\\'Player selection matches=\\\'+$matched+\\\'; expected=[\\\'+$q.name+\\\']; ComboBoxes=\\\'+$combos.Count+\\\'; details=[\\\'+($comboDetails -join \\\' | \\\')+\\\']\\\')}\\n  if($q.action -eq \\\'probe\\\') {\\n   @{id=$q.id;ok=$true;name=$selectedName;probe=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n   continue\\n  }\\n  @{id=$q.id;stage=\\\'posting_mouse\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Request expired before invoke\\\'}\\n  if($matchedSource -eq \\\'EditableValue\\\' -or $matchedSource -eq \\\'ReadOnlyValue\\\') {\\n   $verify=$matchedCombo.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)\\n   if($verify.Current.Value -cne $selectedName){throw \\\'Player changed before invoke\\\'}\\n  } else {\\n   $verify=$matchedCombo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern)\\n   $verifyItems=$verify.Current.GetSelection()\\n   if($verifyItems.Count -ne 1 -or $verifyItems[0].Current.Name -cne $selectedName){throw \\\'Player changed before invoke\\\'}\\n  }\\n  $focusBefore=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n  $inputBefore=[HHFocusSnapshot]::InputTick()\\n  $watch=[Diagnostics.Stopwatch]::StartNew()\\n  if($q.transport -eq \\\'postmouse\\\') {\\n   [uint32]$foregroundPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId([IntPtr]$focusBefore,[ref]$foregroundPid)|Out-Null\\n   if($q.action -eq \\\'mouse_probe\\\' -and $foregroundPid -eq [uint32]$q.pid){throw \\\'Switch to game or another window before the one-shot test; phBot must not be foreground\\\'}\\n   $rect=$button.Current.BoundingRectangle\\n   if($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw \\\'Invalid Exchange button rectangle\\\'}\\n   $node=$button\\n   $hwnd=[IntPtr]::Zero\\n   for($n=0;$node -and $n -lt 12;$n++) {\\n    if($node.Current.ProcessId -ne [int]$q.pid){break}\\n    $handle=$node.Current.NativeWindowHandle\\n    if($handle){$hwnd=[IntPtr]$handle;break}\\n    $node=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)\\n   }\\n   if($hwnd -eq [IntPtr]::Zero){throw \\\'No native ancestor window for Exchange button\\\'}\\n   [uint32]$ownerPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId($hwnd,[ref]$ownerPid)|Out-Null\\n   if($ownerPid -ne [uint32]$q.pid){throw \\\'Exchange window belongs to another process\\\'}\\n   $point=New-Object HHFocusSnapshot+POINT\\n   $point.X=[int]($rect.Left+$rect.Width/2);$point.Y=[int]($rect.Top+$rect.Height/2)\\n   if(![HHFocusSnapshot]::ScreenToClient($hwnd,[ref]$point)){throw \\\'Cannot map Exchange coordinates\\\'}\\n   if($point.X -lt 0 -or $point.Y -lt 0 -or $point.X -gt 32767 -or $point.Y -gt 32767){throw \\\'Exchange coordinates outside supported range\\\'}\\n   if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Request expired before PostMessage\\\'}\\n   $lp=[IntPtr](($point.Y -shl 16) -bor ($point.X -band 65535))\\n   if(![HHFocusSnapshot]::PostMessage($hwnd,0x0201,[UIntPtr]::new([uint32]1),$lp)){throw \\\'WM_LBUTTONDOWN rejected\\\'}\\n   $released=[HHFocusSnapshot]::PostMessage($hwnd,0x0202,[UIntPtr]::Zero,$lp)\\n   if(!$released){throw \\\'WM_LBUTTONUP rejected; inspect phBot button state\\\'}\\n   @{id=$q.id;stage=\\\'mouse_posted\\\';post_ms=$watch.ElapsedMilliseconds}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n   [Console]::Out.Flush()\\n   Start-Sleep -Milliseconds 120\\n   $after=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n   [uint32]$afterPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId([IntPtr]$after,[ref]$afterPid)|Out-Null\\n   $stolen=($foregroundPid -ne [uint32]$q.pid -and $afterPid -eq [uint32]$q.pid)\\n   @{id=$q.id;ok=$true;name=$selectedName;transport=\\\'postmouse\\\';ms=$watch.ElapsedMilliseconds;focus_before=$focusBefore;focus_after=$after;focus_stolen=$stolen;input_before=$inputBefore;input_after=[HHFocusSnapshot]::InputTick();mouse_probe=($q.action -eq \\\'mouse_probe\\\')}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  } else {throw \\\'Only PostMessage transport is supported\\\'}\\n } catch {\\n  $button=$null\\n  $inventoryOpened=$false\\n  @{id=$q.id;ok=$false;error=$_.Exception.Message}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n }\\n}\\n\'\n', __file__+':boss_background', 'exec'), _boss_engine.__dict__)
 
 # Solo Auto Ghost Boss: no support account required. Keep Exchange-helper path
-# when "Acc hỗ trợ ngắt Boss" is filled; otherwise cut with SROPlus-style
-# 0x7074 cancel (hủy tác vụ) and wait for B074 02 00.
+# when "Acc hỗ trợ ngắt Boss" is filled.
+#
+# Live SROPlus capture (hiep.txt) ghosts by sending CLIENT exchange 0x7081 to the
+# *boss/monster UID itself* after B070+delay — not 7074 \x02 cancel (zero cancels
+# in that capture). Server auto-rejects the trade ("yêu cầu buôn bán… hủy bỏ")
+# and that rejects the cast → B074 02 00, same interrupt family as PvP 7081.
 _boss_request_exchange = _boss_engine.request
 _boss_run_exchange = _boss_engine.run
 _boss_start_exchange = _boss_engine.start
 _boss_stage_exchange = _boss_engine.stage
+_boss_packet_exchange = _boss_engine.packet
 
 
 def _boss_solo_cut(j):
+    """Mirror hiep.txt: 7081 exchange petition to the current Boss UID."""
     with _boss_engine.LOCK:
         if not _boss_engine.valid(j):
             return None
         if j['ended']:
             return {'ended_naturally': True}
-        j['cut_wait'] = dict(request_id='solo-cut', skill=j['expected'],
-                             armed_at=monotonic(), cancel_at=None)
-        accepted = _boss_engine.send_action(j, b'\x02')
+        target = int(j['target'])
+        payload = struct.pack('<I', target)
+        j['cut_wait'] = dict(request_id='solo-7081', skill=j['expected'],
+                             armed_at=monotonic(), cancel_at=None,
+                             exchange_uid=target)
+        j['solo_exchange_uid'] = target
+        j['solo_exchange_until'] = monotonic() + 2.0
+        accepted = _boss_send(0x7081, payload, False)
         _boss_engine.emit(
             j,
-            'Solo Boss ngắt kiểu SROPlus: gửi 7074 hủy tác vụ, API=%r; chờ B074 02 00.' % accepted)
+            'Solo Boss ngắt kiểu SROPlus (hiep/7081): Exchange UID=%d, API=%r; chờ B074 02 00.' %
+            (target, accepted))
         if accepted is False:
-            raise ValueError('phBot từ chối gửi hủy tác vụ ngắt Boss solo.')
-        return {'ok': True, 'solo': True}
+            j.pop('solo_exchange_uid', None)
+            j.pop('solo_exchange_until', None)
+            raise ValueError('phBot từ chối gửi 0x7081 ngắt Boss solo tới UID %d.' % target)
+        return {'ok': True, 'solo': True, 'uid': target}
+
+
+def _boss_packet(outgoing, opcode, data):
+    """Allow intentional solo 7081↔boss cuts; do not treat auto-rejected trade as fatal."""
+    raw = bytes(data or b'')
+    with _boss_engine.LOCK:
+        job = _boss_engine.active
+        solo = bool(job and job.get('solo_cut') and not job['stop'].is_set())
+        exchange_uid = job.get('solo_exchange_uid') if solo else None
+        armed = bool(solo and exchange_uid and monotonic() < job.get('solo_exchange_until', 0))
+        if armed and outgoing and opcode == 0x7081 and len(raw) == 4:
+            if struct.unpack('<I', raw)[0] == exchange_uid:
+                job['solo_exchange_seen'] = True
+        if armed and not outgoing and opcode in (0xB081, 0x3085, 0x3088, 0xB084):
+            # Monster/boss 7081 is auto-cancelled by the server; that cancel is the
+            # interrupt. Never stop the solo chain for the petition we just sent.
+            cut = job.get('cut_wait')
+            if cut and cut.get('exchange_uid') == exchange_uid:
+                job['solo_exchange_reply'] = raw[:8]
+                return
+            if opcode in (0xB081, 0x3085) and raw[:1] == b'\x01':
+                return
+    return _boss_packet_exchange(outgoing, opcode, data)
 
 
 def _boss_request(j, action):
@@ -7216,13 +7371,16 @@ def _boss_stage(j):
                             if j.get('solo_cut'):
                                 _boss_engine.emit(
                                     j,
-                                    'Solo Boss: chưa thấy B074 02 00 cho ID=%d; đợi skill kết thúc rồi tiếp.' % skill)
+                                    'Solo Boss: chưa thấy B074 02 00 sau 7081 cho ID=%d; đợi skill kết thúc rồi tiếp.' %
+                                    skill)
                             else:
                                 _boss_engine.emit(
                                     j,
                                     'Chưa xác nhận ngắt ID=%d. Đợi skill kết thúc rồi tự tìm lại Player.' % skill)
                                 j['recheck_player'] = True
                         j['cut_wait'] = None
+                        j.pop('solo_exchange_uid', None)
+                        j.pop('solo_exchange_until', None)
         if not _boss_engine.wait(j, lambda: j['ended'], 12):
             if j['stop'].is_set():
                 return False
@@ -7242,11 +7400,13 @@ def _boss_run(j):
         _boss_engine.emit(
             j,
             'BẮT ĐẦU solo | target=%d | dãy=%r | log=%s' % (j['target'], j['sequence'], j['path']))
-        _boss_engine.emit(j, 'Solo Boss: không cần acc hỗ trợ đứng canh; ngắt bằng hủy tác vụ (SROPlus-style).')
+        _boss_engine.emit(
+            j,
+            'Solo Boss: không cần acc hỗ trợ; ngắt bằng 0x7081 Exchange tới UID Boss (như SROPlus/hiep.txt).')
         with _boss_engine.LOCK:
             if not _boss_engine.valid(j) or _boss_engine.confirmed_target != j['target']:
                 return
-        _boss_engine.emit(j, 'Đã sẵn sàng: Ghost Boss solo theo ID. F4 dừng.')
+        _boss_engine.emit(j, 'Đã sẵn sàng: Ghost Boss solo 7081 theo ID. F4 dừng.')
         quiet_after = monotonic() + j['rest']
 
         def ready_to_attack():
@@ -7296,7 +7456,10 @@ def _boss_start(target, sequence, imbue_id, imbue_early, player):
                 job['solo_cut'] = solo
                 if solo:
                     job['recheck_player'] = False
-                    _boss_engine.emit(job, 'Chế độ Solo Boss: bỏ qua acc hỗ trợ / Exchange helper.')
+                    job['solo_cut'] = True
+                    _boss_engine.emit(
+                        job,
+                        'Chế độ Solo Boss: ngắt 7081→UID Boss (SROPlus); không dùng acc hỗ trợ.')
     finally:
         _boss_engine._pending_solo_cut = None
 
@@ -7305,6 +7468,9 @@ _boss_engine.request = _boss_request
 _boss_engine.stage = _boss_stage
 _boss_engine.run = _boss_run
 _boss_engine.start = _boss_start
+_boss_engine.packet = _boss_packet
+_boss_engine.handle_silkroad = lambda opcode, data: (_boss_packet(True, opcode, data) or True)
+_boss_engine.handle_joymax = lambda opcode, data: (_boss_packet(False, opcode, data) or True)
 
 
 # Damage timing meter. Keep both clock origins because Ghost starts its
@@ -7584,7 +7750,7 @@ def read_boss_settings(owner):
     player = QtBind.text(gui, boss_exchange_player_field).strip()
     if player.casefold() == owner[1].casefold():
         raise ValueError('Acc hỗ trợ không thể là chính acc đánh Boss. Có thể để trống.')
-    # Empty support name => solo Boss (packet cancel). Named support keeps Exchange path.
+    # Empty support name => solo Boss (7081→Boss UID, SROPlus/hiep). Named support keeps helper Exchange.
     return dict(page=page, sequence=sequence, imbue_id=uid, imbue_early=early, player=player)
 
 
