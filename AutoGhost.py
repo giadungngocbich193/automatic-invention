@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.39'
-# raw-main download stamp: 2026-11-10T22:45Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.40'
+# raw-main download stamp: 2026-11-10T22:50Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -7263,10 +7263,9 @@ exec(compile('# -*- coding: utf-8 -*-\n"""Ghost Boss nền theo ID, đồng bộ
 # Solo Auto Ghost Boss: no support account required. Keep Exchange-helper path
 # when "Acc hỗ trợ ngắt Boss" is filled.
 #
-# Monster/Boss ghost ≠ PvP player ghost. Do NOT reuse NativeCut / client-7081.
-# Primary Solo cut = classic Ghost Boss cancel (interrupt key or ESC→ESC with
-# BOSS_ESC_GAP). Optional inject 0x7081→monster UID is fire-and-forget only
-# (never delays ESC). Soft 7074 cancel last. PvP untouched.
+# Ghost method from hiep.txt ONLY (Client packets):
+#   skill 7074 → Boss UID, then ghost = 0x7081 + 4-byte Boss/monster UID
+#   (often doubled). Zero ESC. Zero 7074\x02 cancel. PvP NativeCut untouched.
 _boss_request_exchange = _boss_engine.request
 _boss_run_exchange = _boss_engine.run
 _boss_start_exchange = _boss_engine.start
@@ -7274,75 +7273,8 @@ _boss_stage_exchange = _boss_engine.stage
 _boss_packet_exchange = _boss_engine.packet
 
 
-def _boss_solo_send_key(key):
-    """Send one key for Boss cancel. Prefer real key when game is focused (classic)."""
-    client = get_client() or {}
-    window = client.get('window')
-    if not window or not client.get('running') or not user32:
-        return False
-    try:
-        focused = user32.GetForegroundWindow() == window
-    except (AttributeError, OSError, ValueError):
-        focused = False
-    if focused:
-        try:
-            if any(user32.GetAsyncKeyState(code) & 0x8000 for code in (0x10, 0x11, 0x12, key)):
-                return False
-            user32.keybd_event(key, 0, 0, 0)
-            user32.keybd_event(key, 0, 2, 0)
-            return True
-        except (AttributeError, OSError, ValueError):
-            pass
-    return bool(post_game_key(key, window))
-
-
-def _boss_solo_esc_cut():
-    """Classic Ghost Boss ESC open → BOSS_ESC_GAP → ESC close (monster cast cancel)."""
-    if not _boss_solo_send_key(0x1B):
-        return False
-    sleep(BOSS_ESC_GAP)
-    _boss_solo_send_key(0x1B)
-    return True
-
-
-def _boss_solo_key_cut():
-    """Optional GUI 'Phím ngắt' for Solo Boss (same idea as Ghost Boss key cut)."""
-    key = boss_interrupt_key
-    if key is None:
-        return False
-    return _boss_solo_send_key(key)
-
-
-def _boss_solo_try_inject_7081(j, target):
-    """Optional hiep-style monster packet; never blocks ESC and never aborts the loop."""
-    if j.get('solo_inject_7081_blocked'):
-        return False
-    with _boss_engine.LOCK:
-        if not _boss_engine.valid(j) or j.get('ended'):
-            return False
-        j['solo_exchange_uid'] = target
-        j['solo_exchange_until'] = monotonic() + 2.0
-        accepted = _boss_send(0x7081, struct.pack('<I', target), False)
-        if accepted is False:
-            j['solo_inject_7081_blocked'] = True
-            j.pop('solo_exchange_uid', None)
-            j.pop('solo_exchange_until', None)
-            _boss_engine.emit(
-                j,
-                'Solo Boss: phBot từ chối inject 0x7081→UID %d · giữ ESC/phím Boss (không NativeCut PvP).' %
-                target)
-            return False
-        if j.get('cut_wait') is not None:
-            j['cut_wait']['request_id'] = 'solo-inject-7081'
-        _boss_engine.emit(
-            j,
-            'Solo Boss kèm inject-7081→UID quái/Boss %d, API=%r (không trì hoãn ESC).' %
-            (target, accepted))
-        return True
-
-
 def _boss_solo_cut(j):
-    """Solo monster/Boss interrupt — ESC/key first, never PvP NativeCut."""
+    """Solo Boss/monster ghost = hiep 0x7081→UID (packet only). No ESC."""
     with _boss_engine.LOCK:
         if not _boss_engine.valid(j):
             return None
@@ -7350,71 +7282,49 @@ def _boss_solo_cut(j):
             return {'ended_naturally': True}
         target = int(j['target'])
         skill = j['expected']
-        j['cut_wait'] = dict(request_id='solo-cut', skill=skill,
+        packet = struct.pack('<I', target)
+        j['cut_wait'] = dict(request_id='solo-hiep-7081', skill=skill,
                              armed_at=monotonic(), cancel_at=None,
                              exchange_uid=target)
-    method = None
-    used = []
+        j['solo_exchange_uid'] = target
+        j['solo_exchange_until'] = monotonic() + 2.0
 
-    # 1) Classic AutoGhost Boss cancel FIRST (timing-critical for skill 1).
-    if _boss_solo_key_cut():
-        method = 'interrupt-key'
-        used.append(method)
+    # hiep.txt: first ghost fires two 0x7081 to the same Boss UID back-to-back.
+    results = []
+    for index in (1, 2):
         with _boss_engine.LOCK:
-            if j.get('cut_wait') is not None:
-                j['cut_wait']['request_id'] = 'solo-key'
+            if not _boss_engine.valid(j) or j.get('ended'):
+                return {'ended_naturally': True} if j.get('ended') else None
+            accepted = _boss_send(0x7081, packet, False)
+            results.append(accepted)
             _boss_engine.emit(
                 j,
-                'Solo Boss ngắt phím %s (Ghost Boss); chờ B074 02 00.' %
-                (chr(boss_interrupt_key) if boss_interrupt_key else '?'))
-    elif _boss_solo_esc_cut():
-        method = 'ESC'
-        used.append(method)
+                'Solo Boss ghost hiep 7081×%d→UID quái/Boss %d, encrypted=False, API=%r.' %
+                (index, target, accepted))
+        if accepted is False:
+            break
+        if index == 1:
+            # Tiny gap matching the capture's consecutive 7081 pair.
+            j['stop'].wait(0.02)
+
+    if all(value is False for value in results):
         with _boss_engine.LOCK:
-            if j.get('cut_wait') is not None:
-                j['cut_wait']['request_id'] = 'solo-esc'
-            _boss_engine.emit(j, 'Solo Boss ngắt ESC→ESC (Ghost Boss cũ); chờ B074 02 00.')
+            j.pop('solo_exchange_uid', None)
+            j.pop('solo_exchange_until', None)
+            _boss_engine.emit(
+                j,
+                'Solo Boss: phBot từ chối inject 0x7081→UID %d (hiep ghost). Không dùng ESC. Đợi skill tự kết thúc.' %
+                target)
+            return {'ok': False, 'solo': True, 'soft_fail': True, 'uid': target,
+                    'method': None, 'api': results}
 
-    # 2) Optional monster 7081 packet — fire-and-forget; never delays the ESC cut.
-    if _boss_solo_try_inject_7081(j, target):
-        used.append('inject-7081')
-        if method is None:
-            method = 'inject-7081'
-
-    # 3) Soft packet cancel only if no key/ESC could be delivered.
-    if method is None:
-        with _boss_engine.LOCK:
-            accepted_cancel = _boss_engine.send_action(j, b'\x02')
-            if accepted_cancel is not False:
-                method = '7074-02'
-                used.append(method)
-                j['cut_wait']['request_id'] = 'solo-7074'
-                _boss_engine.emit(
-                    j,
-                    'Solo Boss ngắt fallback 7074 hủy tác vụ, API=%r; chờ B074 02 00.' % accepted_cancel)
-
-    # 4) One quick ESC retry if the first cancel path has not closed the cast yet.
-    if method in ('ESC', 'interrupt-key', 'inject-7081'):
-        got = _boss_engine.wait(
+    with _boss_engine.LOCK:
+        if j.get('cut_wait') is not None:
+            j['cut_wait']['request_id'] = 'solo-hiep-7081'
+        _boss_engine.emit(
             j,
-            lambda: j['ended'] or (j.get('cut_wait') or {}).get('cancel_at') is not None,
-            0.25)
-        if not got and method != 'interrupt-key' and _boss_solo_esc_cut():
-            used.append('ESC-retry')
-            method = 'ESC-retry'
-            with _boss_engine.LOCK:
-                if j.get('cut_wait') is not None:
-                    j['cut_wait']['request_id'] = 'solo-esc-retry'
-                _boss_engine.emit(j, 'Solo Boss: ESC lại lần 2 vì chưa thấy B074 02 00.')
-
-    if method is None:
-        with _boss_engine.LOCK:
-            _boss_engine.emit(
-                j,
-                'Solo Boss: chưa gửi được ngắt cho ID=%s · đợi skill tự kết thúc, không dừng Auto Boss.' %
-                skill)
-            return {'ok': False, 'solo': True, 'soft_fail': True, 'uid': target, 'used': used}
-    return {'ok': True, 'solo': True, 'method': method, 'uid': target, 'used': used}
+            'Solo Boss đã gửi 7081 hiep (API=%r); chờ B074 02 00 / hủy trao đổi quái.' % results)
+    return {'ok': True, 'solo': True, 'method': 'hiep-7081', 'uid': target, 'api': results}
 
 
 def _boss_packet(outgoing, opcode, data):
@@ -7489,7 +7399,7 @@ def _boss_stage(j):
                             if j.get('solo_cut'):
                                 _boss_engine.emit(
                                     j,
-                                    'Solo Boss: chưa thấy B074 02 00 sau ngắt cho ID=%d; đợi skill kết thúc rồi tiếp.' %
+                                    'Solo Boss: chưa thấy B074 02 00 sau 7081 hiep cho ID=%d; đợi skill kết thúc rồi tiếp.' %
                                     skill)
                             else:
                                 _boss_engine.emit(
@@ -7520,11 +7430,11 @@ def _boss_run(j):
             'BẮT ĐẦU solo | target=%d | dãy=%r | log=%s' % (j['target'], j['sequence'], j['path']))
         _boss_engine.emit(
             j,
-            'Solo Boss: ưu tiên ESC/phím Ghost Boss (quái); inject 7081 chỉ kèm thêm nếu phBot cho — không NativeCut PvP.')
+            'Solo Boss: ghost theo hiep.txt = 0x7081→UID Boss/quái (×2). Không ESC, không NativeCut PvP.')
         with _boss_engine.LOCK:
             if not _boss_engine.valid(j) or _boss_engine.confirmed_target != j['target']:
                 return
-        _boss_engine.emit(j, 'Đã sẵn sàng: Ghost Boss solo (ESC/phím trước). F4 dừng.')
+        _boss_engine.emit(j, 'Đã sẵn sàng: Ghost Boss solo (hiep 7081). F4 dừng.')
         quiet_after = monotonic() + j['rest']
 
         def ready_to_attack():
@@ -7579,7 +7489,7 @@ def _boss_start(target, sequence, imbue_id, imbue_early, player):
                     job['solo_cut'] = True
                     _boss_engine.emit(
                         job,
-                        'Chế độ Solo Boss: ESC/phím Ghost Boss trước · inject 7081 kèm thêm nếu được · không NativeCut PvP.')
+                        'Chế độ Solo Boss: hiep 0x7081→UID Boss/quái (×2). Không ESC. PvP không đổi.')
     finally:
         _boss_engine._pending_solo_cut = None
 
