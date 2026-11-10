@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.48'
-# raw-main download stamp: 2026-11-11T01:50Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.49'
+# raw-main download stamp: 2026-11-11T02:55Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -40,8 +40,10 @@ AUTO_PK_CAST_RETRY_DELAY = 2.0
 AUTO_PK_SELECT_TIMEOUT = 1.2
 AUTO_PK_NATIVE_TIMEOUT = 0.55
 AUTO_PK_NATIVE_MISS_LIMIT = 1
-AUTO_PK_INJECT_COOLDOWN = 0.75  # min gap between 7045 injects — avoid flood/DC
+AUTO_PK_INJECT_COOLDOWN = 0.75  # min gap between Target engages — avoid flood/DC
 AUTO_PK_ARM_QUIET = 1.5  # no Target/7045/7046 for this long after Bật Auto PK
+# Auto PK must NOT inject_joymax(0x7045) for players: injected select desyncs
+# client vs server (or trips anti-bot) → disconnect when Target-to-attack.
 AUTO_PK_NATIVE_KEYS = {
     **{'F%d' % number: 0x6F + number for number in range(9, 13)},
     'HOME': 0x24, 'END': 0x23, 'INSERT': 0x2D, 'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
@@ -4495,26 +4497,28 @@ def auto_pk_select(character, runtime, now, from_event=False):
     job_first, distance, uid = best
     if not uid or uid == self_id:
         return
-    sent_at = monotonic()
     source = ('tóm tên job' if job_first == 0 else
               (runtime.get('native_source') if grab_after_insert else 'list địch')
               or 'tóm gần nhất')
-    runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
-                   target_seen_at=now, target_sent_at=sent_at, native_grab=False,
-                   native_source=source, inject_at=sent_at + AUTO_PK_INJECT_COOLDOWN)
-    pvp_selection_request = direct_select_request = uid
-    accepted = inject_joymax(0x7045, struct.pack('<I', uid), False)
-    if auto_pk_runtime is not runtime or runtime['requested'] != uid:
-        return
-    if accepted is not False:
+    # Engage ONLY via Target Enemy key (client 7045). Never inject_joymax(0x7045)
+    # for players — that packet caused disconnect when opponent near / Target-to-attack.
+    if not runtime.get('native_key'):
         QtBind.setText(gui, auto_pk_status_label,
-                       'Chọn UID %d · 7045 · %.1f m · chờ B045 rồi Ghost · v%s.' %
-                       (uid, distance if distance is not None else -1, VERSION))
+                       'Địch UID %d · %.1f m · gán Target Enemy (` / Insert); không inject 7045.' %
+                       (uid, distance if distance is not None else -1))
         return
-    # Inject refused → rotate without 7046 spam.
-    auto_pk_retire_and_rotate(runtime, uid, '7045 từ chối', sent_at, untarget=False)
-    if not from_event:
-        runtime['select_in_event'] = True
+    runtime.update(requested=0, native_uid=0, select_until=0.0, native_grab=False,
+                   native_source=source, target_seen_at=now,
+                   prefer_uid=uid)
+    if auto_pk_try_native_enemy_key(runtime, client, now, source):
+        runtime['target_sent_at'] = monotonic()
+        runtime['inject_at'] = runtime.get('native_send_at', now + AUTO_PK_INJECT_COOLDOWN)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Địch gần UID %d · Target Enemy · chờ B045 rồi Ghost · v%s.' %
+                       (uid, VERSION))
+        return
+    QtBind.setText(gui, auto_pk_status_label,
+                   'Địch UID %d · chưa gửi được Target · thử lại (không inject).' % uid)
 
 
 def start_auto_pk_skill_probe(runtime, uid):
@@ -4639,7 +4643,7 @@ def request_auto_pk_arm():
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
         log('[%s] %s' % (NAME, message))
-        log('[%s] Auto PK v%s: không spam Target/7045 lúc bật · chờ B045 mới Ghost · không ALT.' %
+        log('[%s] Auto PK v%s: Target Enemy only (no inject 7045) · chờ B045 mới Ghost · không ALT.' %
             (NAME, VERSION))
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
@@ -8219,5 +8223,5 @@ def finished():
 
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s · Auto PK: bật không spam · chờ B045 mới Ghost · không ALT.' %
+log('[%s] Đã nạp thành công v%s · Auto PK: Target only · chờ B045 mới Ghost · không ALT.' %
     (NAME, VERSION))
