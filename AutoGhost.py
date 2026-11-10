@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.46'
-# raw-main download stamp: 2026-11-11T00:45Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.47'
+# raw-main download stamp: 2026-11-11T01:05Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -3885,6 +3885,40 @@ def auto_pk_job_flag_hostile(self_entity, other_entity):
     return mine != theirs and {mine, theirs} == {'thief', 'escort'}
 
 
+def auto_pk_is_job_display_name(player, uid=None, monsters=None):
+    """True when the row looks like a job-mode display name (tóm first, never skip).
+
+    Examples: leading '*', readable job side, or name matching a job/guild tag
+    like client '[AE_Sro]' / '*AE_Sro'.
+    """
+    view = auto_pk_player_view(player, uid, monsters)
+    if auto_pk_job_side(view):
+        return True
+    name = str(view.get('name') or '').strip()
+    if not name:
+        return False
+    bare = name.lstrip('*').strip()
+    if name.startswith('*') and bare:
+        return True
+    bare_fold = bare.casefold()
+    for key in ('guild', 'job_name', 'jobName', 'job_title', 'jobTitle', 'nickname',
+                'title', 'desc', 'description', 'job'):
+        tag = str(view.get(key) or '').strip()
+        if not tag:
+            continue
+        cleaned = tag.strip('[]<>* ').casefold()
+        if cleaned and cleaned == bare_fold:
+            return True
+    return False
+
+
+def auto_pk_grab_rank(player, distance, uid=None, monsters=None):
+    """Sort key: job-display names first, then nearer distance."""
+    job_first = 0 if auto_pk_is_job_display_name(player, uid, monsters) else 1
+    dist = distance if distance is not None else 1e9
+    return (job_first, dist, uid or 0)
+
+
 def auto_pk_dual_listed(uid, monsters=None):
     """Opposing-faction / scarf hostiles are often dual-listed in get_monsters()."""
     if monsters is None:
@@ -3934,9 +3968,10 @@ def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid
     Hostile when:
     - name color is red/purple (when phBot exposes it), or
     - war-scarf dual-list in get_monsters, or
-    - opposing job thief↔trader/hunter (both sides readable).
-    Explicit white/ally colors stay skipped. Target Enemy / B045 lock is separate
-    and may trust the client's select without this gate.
+    - opposing job đạo tặc↔bảo tiêu (thief↔trader/hunter) — must-attack, or
+    - job-mode display name (*AE_Sro / matching job tag) unless same-job ally.
+    Explicit white/ally colors stay skipped. Never ALT. B045 lock may trust
+    Target Enemy without this gate.
     """
     view = auto_pk_player_view(player, uid, monsters)
     self_entity = character if isinstance(character, dict) else (get_character_data() or {})
@@ -3948,8 +3983,15 @@ def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid
     # Color missing in phBot while client may still show purple/job.
     if uid is not None and auto_pk_dual_listed(uid, monsters):
         return True
+    # bảo tiêu ↔ đạo tặc is always enemy when both job sides are readable.
     if auto_pk_job_flag_hostile(self_entity, view):
         return True
+    # Job-display names (tóm first): must-attack unless same job side as self.
+    if auto_pk_is_job_display_name(view, uid, monsters):
+        mine = auto_pk_job_side(self_entity)
+        theirs = auto_pk_job_side(view)
+        if not (mine and theirs and mine == theirs):
+            return True
     if require_color:
         return False
     return False
@@ -3965,15 +4007,19 @@ def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
     """Short VN label for Auto PK scan rows."""
     view = auto_pk_player_view(player, uid, monsters)
     color = auto_pk_hostile_name_color(view)
+    job_name = auto_pk_is_job_display_name(view, uid, monsters)
     if color is True:
-        return 'chữ đỏ/tím', True
+        return ('chữ đỏ/tím · tên job' if job_name else 'chữ đỏ/tím'), True
     if color is False:
         return 'không thù địch', False
     dual = uid is not None and auto_pk_dual_listed(uid, monsters)
     if dual:
-        return 'địch (dual-list/khăn)', True
+        return ('địch khăn · tên job' if job_name else 'địch (dual-list/khăn)'), True
     if auto_pk_job_flag_hostile(character or {}, view):
         return 'địch cờ nghề', True
+    if job_name:
+        # Job-display names are priority tóm targets even when color API is empty.
+        return 'tên job · ưu tiên tóm', True
     theirs = auto_pk_job_side(view)
     if theirs == 'thief':
         return 'màu tên ẩn · cướp', False
@@ -4386,23 +4432,24 @@ def auto_pk_select(character, runtime, now, from_event=False):
         anchor_distance = auto_pk_target_distance(target, anchor, runtime)
         if anchor_distance is None or anchor_distance > runtime['radius']:
             continue
-        range_candidate = (auto_pk_target_distance(target, origin, runtime), uid)
+        dist = auto_pk_target_distance(target, origin, runtime)
+        rank = auto_pk_grab_rank(target, dist, uid, monsters)
         color = auto_pk_hostile_name_color(auto_pk_player_view(target, uid, monsters))
-        # Skip only explicit ally/white; hidden/purple/job are grab candidates.
-        if color is not False and (nearest_grab is None or range_candidate < nearest_grab):
-            nearest_grab = range_candidate
+        # Skip only explicit ally/white; job-display names rank first for tóm.
+        if color is not False and (nearest_grab is None or rank < nearest_grab):
+            nearest_grab = rank
         if not auto_pk_is_hostile_opponent(target, character, require_color=True,
                                            uid=uid, monsters=monsters):
             continue
-        if best is None or range_candidate < best:
-            best = range_candidate
+        if best is None or rank < best:
+            best = rank
     # Prefer known UID inject immediately — do not hang on Target Enemy/B045.
     grab_after_insert = False
     if best is None and nearest_grab is not None:
         best = nearest_grab
         grab_after_insert = True
         runtime['native_grab'] = True
-        runtime['native_source'] = 'tóm gần nhất'
+        runtime['native_source'] = 'tóm tên job/gần nhất'
     if best is None:
         if native_expired:
             runtime['native_misses'] = runtime.get('native_misses', 0) + 1
@@ -4417,13 +4464,15 @@ def auto_pk_select(character, runtime, now, from_event=False):
         return
     runtime['native_misses'] = 0
     stop_auto_pk_patrol(runtime)
-    distance, uid = best
+    job_first, distance, uid = best
     sent_at = monotonic()
     # Always mark grab: if B045 stays silent we still lock and Ghost (no hang).
+    source = ('tóm tên job' if job_first == 0 else
+              (runtime.get('native_source') if grab_after_insert else 'list địch')
+              or 'tóm gần nhất')
     runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
                    target_seen_at=now, target_sent_at=sent_at, native_grab=True,
-                   native_source=(runtime.get('native_source') if grab_after_insert
-                                  else 'list địch') or 'tóm gần nhất')
+                   native_source=source)
     pvp_selection_request = direct_select_request = uid
     accepted = inject_joymax(0x7045, struct.pack('<I', uid), False)
     if auto_pk_runtime is not runtime or runtime['requested'] != uid:
@@ -4431,7 +4480,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
     if accepted is not False:
         QtBind.setText(gui, auto_pk_status_label,
                        'Tóm UID %d · 7045 · %.1f m · Ghost sẵn · v%s.' %
-                       (uid, distance, VERSION))
+                       (uid, distance if distance is not None else -1, VERSION))
         return
     # Inject refused → rotate to another target immediately (no ALT).
     auto_pk_retire_and_rotate(runtime, uid, '7045 từ chối', sent_at)
@@ -4555,7 +4604,7 @@ def request_auto_pk_arm():
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
         log('[%s] %s' % (NAME, message))
-        log('[%s] Auto PK v%s: tóm UID→Ghost skill · từ chối thì xoay mục tiêu · không ALT.' %
+        log('[%s] Auto PK v%s: đạo tặc↔bảo tiêu phải đánh · tên job tóm trước · từ chối xoay · không ALT.' %
             (NAME, VERSION))
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
@@ -8124,5 +8173,5 @@ def finished():
 
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s · Auto PK: tóm UID→Ghost · từ chối xoay mục tiêu · không ALT.' %
+log('[%s] Đã nạp thành công v%s · Auto PK: đạo tặc↔bảo tiêu must-attack · tên job tóm trước · không ALT.' %
     (NAME, VERSION))
