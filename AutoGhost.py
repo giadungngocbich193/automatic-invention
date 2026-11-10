@@ -23,7 +23,7 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 NAME = 'AutoGhost'
 VERSION = '1.8.48'
-# raw-main download stamp: 2026-11-11T01:20Z (UTF-8 no BOM/U+200B)
+# raw-main download stamp: 2026-11-11T01:50Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -4314,6 +4314,9 @@ def auto_pk_try_native_enemy_key(runtime, client, now, reason):
     key = runtime.get('native_key', 0)
     if not key or key not in set(AUTO_PK_NATIVE_KEYS.values()):
         return False
+    # Defense-in-depth: never Target-spam during arm quiet (enable DC path).
+    if now < runtime.get('quiet_until', 0):
+        return False
     if now < runtime.get('native_send_at', 0):
         return False
     # Manual press in progress — do not synthesize a second Insert.
@@ -5573,12 +5576,11 @@ def trace_manual_packet(outgoing, opcode, data):
 def handle_silkroad(opcode, data):
     global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
     global pvp_target, pvp_resume_page
-    if auto_pk_running and opcode in (0x7045, 0x7046, 0x7074) and get_status():
-        return True  # Auto PK yields combat and targeting to phBot's main bot.
+    # Never return True for C→S 7045/7046 while Auto PK runs — blocking caused
+    # disclient (INS + Bật). tick_auto_pk already holds when get_status().
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
             auto_pk_outgoing_selection(data)
-        # Never block Target Enemy / Insert 7045 — blocking caused disclient.
         return False
     if auto_pk_running and opcode == 0x7046:
         # Let cancel-target reach the server; only clear local wait state.
@@ -5586,6 +5588,9 @@ def handle_silkroad(opcode, data):
             runtime = auto_pk_runtime
             if runtime is not None and not pvp_target:
                 runtime.update(requested=0, select_until=0.0)
+        return False
+    if auto_pk_running and opcode == 0x7074 and get_status():
+        # Main bot owns casts; still pass skill packets through (no block).
         return False
     if auto_pk_running and auto_pk_returning:
         raw=bytes(data or b'')
