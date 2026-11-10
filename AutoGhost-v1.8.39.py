@@ -23,6 +23,7 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 NAME = 'AutoGhost'
 VERSION = '1.8.39'
+# raw-main download stamp: 2026-11-10T22:45Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
