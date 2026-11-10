@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.43'
-# raw-main download stamp: 2026-11-10T23:25Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.44'
+# raw-main download stamp: 2026-11-10T23:30Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -4157,7 +4157,10 @@ def tick_auto_pk_idle_buff(runtime, now):
 
 
 def auto_pk_try_native_enemy_key(runtime, client, now, reason):
-    """Fire configured Target Enemy when the player list cannot supply a UID."""
+    """Fire configured Target Enemy when the player list cannot supply a UID.
+
+    Never presses ALT / enters đồ sát — Target Enemy key only.
+    """
     key = runtime.get('native_key', 0)
     if key not in AUTO_PK_NATIVE_KEYS.values():
         return False
@@ -4249,7 +4252,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
             return
         if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chờ chữ đỏ/tím (ALT) hoặc khăn dual-list · không đánh màu tên ẩn.' %
+                           'Đang canh %.0f m · chờ chữ đỏ/tím hoặc khăn dual-list · không đánh màu tên ẩn.' %
                            runtime['radius'])
         return
     runtime['native_misses'] = 0
@@ -4355,8 +4358,23 @@ def auto_pk_select_reply(data):
     runtime['select_until'] = 0.0
     runtime.pop('native_probe_until', None)
     runtime.pop('soft_hidden_pending', None)
-    # Server confirmation is authoritative. Do not drop opposing-faction locks
-    # just because get_players is empty/partial or the UID is dual-listed as a mob.
+    # Target/B045 only switches select state. Friend/foe from red/purple (or
+    # war-scarf dual-list) — never attack màu tên ẩn / neutrals. No ALT key.
+    players = auto_pk_players() or {}
+    row = players.get(uid) or players.get(str(uid)) or {}
+    monsters = get_monsters() if callable(get_monsters) else None
+    character = get_character_data() or {}
+    if not auto_pk_is_hostile_opponent(row, character, require_color=True,
+                                       uid=uid, monsters=monsters):
+        runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
+        runtime['scan_at'] = 0.0
+        runtime['native_uid'] = 0
+        inject_joymax(0x7046, b'', False)
+        label = auto_pk_hostility_label(row, character, uid=uid, monsters=monsters)[0]
+        message = 'B045 UID %d · %s · không đánh (chỉ chữ đỏ/tím hoặc khăn).' % (uid, label)
+        QtBind.setText(gui, auto_pk_status_label, message)
+        log('[%s] Auto PK v%s: %s' % (NAME, VERSION, message))
+        return
     stop_auto_pk_patrol(runtime)
     pvp_target = direct_target = uid
     runtime.pop('missing_since', None)
@@ -4371,7 +4389,8 @@ def auto_pk_select_reply(data):
         QtBind.setText(gui, auto_pk_status_label, message)
         return
     source = ' qua ' + runtime['native_source'] if uid == runtime['native_uid'] else ''
-    message = 'Đã khóa UID %d%s · chuẩn bị đánh nhóm %s · v%s.' % (uid, source, runtime['page'], VERSION)
+    message = 'Đã khóa UID %d%s · chữ đỏ/tím/khăn · đánh nhóm %s · v%s.' % (
+        uid, source, runtime['page'], VERSION)
     QtBind.setText(gui, auto_pk_status_label, message)
     log('[%s] Auto PK: %s' % (NAME, message))
 
@@ -4431,7 +4450,7 @@ def request_auto_pk_arm():
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
         log('[%s] %s' % (NAME, message))
-        log('[%s] Auto PK v%s: chỉ đánh chữ đỏ/tím (ALT) hoặc dual-list/khăn · không đánh màu tên ẩn theo cờ.' %
+        log('[%s] Auto PK v%s: Target chỉ chọn mục tiêu; đánh khi chữ đỏ/tím hoặc khăn · không ALT · không đánh theo cờ ẩn.' %
             (NAME, VERSION))
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
@@ -8000,4 +8019,4 @@ def finished():
 
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s · Auto PK: chỉ chữ đỏ/tím (ALT) hoặc khăn dual-list.' % (NAME, VERSION))
+log('[%s] Đã nạp thành công v%s · Auto PK: Target chọn; đánh chữ đỏ/tím hoặc khăn · không ALT.' % (NAME, VERSION))
