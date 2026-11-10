@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.47'
-# raw-main download stamp: 2026-11-11T01:05Z (UTF-8 no BOM/U+200B)
+VERSION = '1.8.48'
+# raw-main download stamp: 2026-11-11T01:20Z (UTF-8 no BOM/U+200B)
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -37,9 +37,11 @@ AUTO_PK_FAST_SCAN_INTERVAL = 0.040
 AUTO_PK_MAX_SCAN_RADIUS = 120
 AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.35
 AUTO_PK_CAST_RETRY_DELAY = 2.0
-AUTO_PK_SELECT_TIMEOUT = 0.85
-AUTO_PK_NATIVE_TIMEOUT = 0.35
+AUTO_PK_SELECT_TIMEOUT = 1.2
+AUTO_PK_NATIVE_TIMEOUT = 0.55
 AUTO_PK_NATIVE_MISS_LIMIT = 1
+AUTO_PK_INJECT_COOLDOWN = 0.75  # min gap between 7045 injects — avoid flood/DC
+AUTO_PK_ARM_QUIET = 1.5  # no Target/7045/7046 for this long after Bật Auto PK
 AUTO_PK_NATIVE_KEYS = {
     **{'F%d' % number: 0x6F + number for number in range(9, 13)},
     'HOME': 0x24, 'END': 0x23, 'INSERT': 0x2D, 'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
@@ -3633,14 +3635,15 @@ def auto_pk_allow_unlisted_target(runtime, uid):
 
 
 def auto_pk_outgoing_selection(data):
+    """Observe C→S 7045 only — NEVER block (return True caused INS desync/DC)."""
     global pvp_selection_request, direct_select_request
     runtime = auto_pk_runtime
+    # Always allow the packet to the server. Blocking Target Enemy / Insert 7045
+    # desyncs client vs server and can disconnect when skills follow.
     if not runtime or auto_pk_returning or len(data or b'') != 4:
         return False
     uid = struct.unpack('<I', data)[0]
-    if uid and uid == runtime['requested']:
-        return True
-    if runtime['requested'] or pvp_target or not uid:
+    if not uid or uid == runtime.get('requested') or pvp_target:
         return False
     now = monotonic()
     if runtime['retired'].get(uid, 0) > now:
@@ -3648,18 +3651,17 @@ def auto_pk_outgoing_selection(data):
     native_probe = runtime.get('native_probe_until', 0) > now
     if not native_probe and not auto_pk_manual_input(auto_pk_input_tick()):
         return False
-    # Native/manual Target Enemy must not be blocked just because opposing-faction
-    # players are missing from get_players or dual-listed in get_monsters.
     if not auto_pk_allow_unlisted_target(runtime, uid)[0]:
         return False
     runtime.pop('select_in_event', None)
     runtime.update(requested=uid, select_until=now + AUTO_PK_SELECT_TIMEOUT, native_uid=uid,
                    target_seen_at=now, target_sent_at=now, native_probe_until=0.0,
+                   native_grab=False,
                    native_source='Target Enemy' if native_probe else 'chọn tay')
     QtBind.setText(gui, auto_pk_status_label,
-                   '%s UID %d · chờ B045.' % (runtime['native_source'], uid))
+                   '%s UID %d · chờ B045 (không chặn 7045).' % (runtime['native_source'], uid))
     pvp_selection_request = direct_select_request = uid
-    return True
+    return False
 
 
 def auto_pk_players():
@@ -4304,20 +4306,35 @@ def tick_auto_pk_idle_buff(runtime, now):
 
 
 def auto_pk_try_native_enemy_key(runtime, client, now, reason):
-    """Fire configured Target Enemy. Never ALT / đồ sát — Target key only."""
+    """Fire configured Target Enemy. Never ALT / đồ sát — Target key only.
+
+    Does not PostMessage while the physical key is already held (manual INS),
+    and rate-limits sends so we never flood Insert into a disconnect.
+    """
     key = runtime.get('native_key', 0)
     if not key or key not in set(AUTO_PK_NATIVE_KEYS.values()):
         return False
+    if now < runtime.get('native_send_at', 0):
+        return False
+    # Manual press in progress — do not synthesize a second Insert.
+    if user32 and (user32.GetAsyncKeyState(key) & 0x8000):
+        runtime['native_probe_until'] = now + AUTO_PK_NATIVE_TIMEOUT
+        runtime['select_until'] = runtime['native_probe_until']
+        runtime['native_source'] = 'Target Enemy'
+        runtime['native_send_at'] = now + AUTO_PK_INJECT_COOLDOWN
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Target Enemy đang giữ tay · chờ B045 (%s).' % reason)
+        return True
     window = client.get('window')
     runtime['native_probe_until'] = now + AUTO_PK_NATIVE_TIMEOUT
     runtime['select_until'] = runtime['native_probe_until']
     runtime['native_source'] = 'Target Enemy'
+    # Prefer PostMessage only; avoid keybd_event spam while camping.
     sent = post_game_key(key, window)
-    if not sent and window and user32 and user32.GetForegroundWindow() == window:
-        sent = press_key(key, window)
+    runtime['native_send_at'] = now + max(AUTO_PK_INJECT_COOLDOWN, AUTO_PK_NATIVE_TIMEOUT)
     if sent:
         QtBind.setText(gui, auto_pk_status_label,
-                       'Target Enemy đã gửi · nếu im sẽ tóm UID gần nhất (%s).' % reason)
+                       'Target Enemy đã gửi · chờ B045 rồi Ghost (%s).' % reason)
         return True
     runtime.pop('native_probe_until', None)
     runtime['select_until'] = 0.0
@@ -4353,13 +4370,18 @@ def auto_pk_lock_target(runtime, uid, source, now=None):
     return True
 
 
-def auto_pk_retire_and_rotate(runtime, uid, reason, now=None):
-    """Refuse / bad target → briefly skip UID and keep hunting the next one."""
+def auto_pk_retire_and_rotate(runtime, uid, reason, now=None, untarget=False):
+    """Refuse / bad target → briefly skip UID and keep hunting the next one.
+
+    Only inject 7046 when we actually had a server lock (untarget=True) — empty
+    7046 spam on every miss contributed to disconnect risk.
+    """
     global pvp_selection_request, direct_select_request
     now = monotonic() if now is None else now
     if uid:
         runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
-        inject_joymax(0x7046, b'', False)
+        if untarget or pvp_target == uid:
+            inject_joymax(0x7046, b'', False)
     runtime['requested'] = pvp_selection_request = direct_select_request = 0
     runtime.update(select_until=0.0, scan_at=0.0, native_uid=0)
     runtime.pop('native_grab', None)
@@ -4375,7 +4397,6 @@ def auto_pk_select(character, runtime, now, from_event=False):
         return
     if runtime.get('select_in_event') and not from_event:
         return
-    # Pending inject/Target wait expired with no B045 → force-lock that UID (tóm).
     pending_uid = runtime.get('requested') or 0
     waiting = max(runtime.get('select_until', 0), runtime.get('native_probe_until', 0))
     if waiting and now < waiting:
@@ -4383,13 +4404,16 @@ def auto_pk_select(character, runtime, now, from_event=False):
     native_expired = bool(runtime.pop('native_probe_until', 0))
     select_expired = bool(pending_uid and runtime.get('select_until', 0) and now >= runtime.get('select_until', 0))
     runtime.pop('select_in_event', None)
-    if select_expired and pending_uid and runtime.get('native_grab'):
-        # B045 silent after inject — lock anyway and stay Ghost-ready.
-        auto_pk_lock_target(runtime, pending_uid, runtime.get('native_source') or 'inject im B045', now)
+    quiet_until = runtime.get('quiet_until', 0)
+    if now < quiet_until:
+        # Enable grace: no Target/7045/7046/7074 — first-tick spam DC'd on Bật.
+        left = max(0.0, quiet_until - now)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Auto PK đã bật · chờ %.1fs ổn định rồi mới tóm (không spam).' % left)
         return
-    if pending_uid and select_expired and not runtime.get('native_grab'):
-        # List inject refused/silent → rotate to next opponent.
-        auto_pk_retire_and_rotate(runtime, pending_uid, 'chọn im/từ chối · đổi mục tiêu', now)
+    if select_expired and pending_uid:
+        # B045 silent — do NOT force-lock/cast (that DC'd). Retire and try another.
+        auto_pk_retire_and_rotate(runtime, pending_uid, 'B045 im · đổi mục tiêu', now)
     elif pending_uid and not select_expired:
         pass
     else:
@@ -4408,6 +4432,8 @@ def auto_pk_select(character, runtime, now, from_event=False):
     client = get_client() or {}
     if not client.get('running'):
         return
+    if now < runtime.get('inject_at', 0):
+        return
     if players is None:
         if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
             return
@@ -4419,12 +4445,13 @@ def auto_pk_select(character, runtime, now, from_event=False):
     best = None
     nearest_grab = None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
+    self_id = character.get('player_id')
     for raw_uid, target in players.items():
         try:
             uid = int(raw_uid)
         except (ValueError, TypeError):
             continue
-        if (not 0 < uid <= 0xffffffff or uid == character.get('player_id')
+        if (not 0 < uid <= 0xffffffff or uid == self_id
                 or not isinstance(target, dict)):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
@@ -4443,12 +4470,10 @@ def auto_pk_select(character, runtime, now, from_event=False):
             continue
         if best is None or rank < best:
             best = rank
-    # Prefer known UID inject immediately — do not hang on Target Enemy/B045.
     grab_after_insert = False
     if best is None and nearest_grab is not None:
         best = nearest_grab
         grab_after_insert = True
-        runtime['native_grab'] = True
         runtime['native_source'] = 'tóm tên job/gần nhất'
     if best is None:
         if native_expired:
@@ -4459,31 +4484,32 @@ def auto_pk_select(character, runtime, now, from_event=False):
             return
         if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · sẵn sàng Ghost · xoay tìm đối thủ · không ALT.' %
+                           'Đang canh %.0f m · sẵn sàng Ghost · chờ địch · không ALT.' %
                            runtime['radius'])
         return
     runtime['native_misses'] = 0
     stop_auto_pk_patrol(runtime)
     job_first, distance, uid = best
+    if not uid or uid == self_id:
+        return
     sent_at = monotonic()
-    # Always mark grab: if B045 stays silent we still lock and Ghost (no hang).
     source = ('tóm tên job' if job_first == 0 else
               (runtime.get('native_source') if grab_after_insert else 'list địch')
               or 'tóm gần nhất')
     runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
-                   target_seen_at=now, target_sent_at=sent_at, native_grab=True,
-                   native_source=source)
+                   target_seen_at=now, target_sent_at=sent_at, native_grab=False,
+                   native_source=source, inject_at=sent_at + AUTO_PK_INJECT_COOLDOWN)
     pvp_selection_request = direct_select_request = uid
     accepted = inject_joymax(0x7045, struct.pack('<I', uid), False)
     if auto_pk_runtime is not runtime or runtime['requested'] != uid:
         return
     if accepted is not False:
         QtBind.setText(gui, auto_pk_status_label,
-                       'Tóm UID %d · 7045 · %.1f m · Ghost sẵn · v%s.' %
+                       'Chọn UID %d · 7045 · %.1f m · chờ B045 rồi Ghost · v%s.' %
                        (uid, distance if distance is not None else -1, VERSION))
         return
-    # Inject refused → rotate to another target immediately (no ALT).
-    auto_pk_retire_and_rotate(runtime, uid, '7045 từ chối', sent_at)
+    # Inject refused → rotate without 7046 spam.
+    auto_pk_retire_and_rotate(runtime, uid, '7045 từ chối', sent_at, untarget=False)
     if not from_event:
         runtime['select_in_event'] = True
 
@@ -4534,7 +4560,7 @@ def auto_pk_select_reply(data):
             auto_pk_retire_and_rotate(runtime, uid, reason, now)
             return
         trust_insert = native_grab or runtime.get('native_source') in (
-            'Target Enemy', 'tóm gần nhất', 'inject im B045')
+            'Target Enemy', 'tóm gần nhất', 'tóm tên job', 'tóm tên job/gần nhất', 'chọn tay', 'list địch')
     players = auto_pk_players() or {}
     row = players.get(uid) or players.get(str(uid)) or {}
     monsters = get_monsters() if callable(get_monsters) else None
@@ -4584,18 +4610,24 @@ def request_auto_pk_arm():
         with pvp_lock:
             if not start_clicked(auto_pk_page=page):
                 raise ValueError('Chưa bật được bộ skill PvP; xem Log.')
+            armed_at = monotonic()
             auto_pk_anchor = anchor
             auto_pk_runtime = {'owner': owner, 'radius': radius, 'page': page, 'anchor': anchor,
-                               'move_at': 0.0, 'scan_at': 0.0, 'requested': 0, 'select_until': 0.0,
+                               'move_at': 0.0, 'scan_at': armed_at + AUTO_PK_ARM_QUIET,
+                               'requested': 0, 'select_until': 0.0,
                                'native_uid': 0, 'native_key': native_vk,
-                               'retired': {}, 'dead_uids': set()}
+                               'retired': {}, 'dead_uids': set(),
+                               'quiet_until': armed_at + AUTO_PK_ARM_QUIET,
+                               'inject_at': armed_at + AUTO_PK_ARM_QUIET,
+                               'native_send_at': armed_at + AUTO_PK_ARM_QUIET,
+                               'armed_at': armed_at}
             auto_pk_runtime.update(options)
             auto_pk_running = True
             auto_pk_returning = False
         show_auto_pk_anchor()
         key_label = key_name or 'off'
-        message = 'Đã bật Auto PK v%s · canh %.0f m · nhóm %s · Target=%s.' % (
-            VERSION, radius, page, key_label)
+        message = 'Đã bật Auto PK v%s · canh %.0f m · nhóm %s · Target=%s · chờ %.0fs ổn định.' % (
+            VERSION, radius, page, key_label, AUTO_PK_ARM_QUIET)
         if buff_error:
             QtBind.setText(gui, auto_pk_buffs_status, 'Bảng buff: ' + buff_error)
         if disable_buffs:
@@ -4604,7 +4636,7 @@ def request_auto_pk_arm():
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
         log('[%s] %s' % (NAME, message))
-        log('[%s] Auto PK v%s: đạo tặc↔bảo tiêu phải đánh · tên job tóm trước · từ chối xoay · không ALT.' %
+        log('[%s] Auto PK v%s: không spam Target/7045 lúc bật · chờ B045 mới Ghost · không ALT.' %
             (NAME, VERSION))
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
@@ -5539,11 +5571,22 @@ def trace_manual_packet(outgoing, opcode, data):
 
 
 def handle_silkroad(opcode, data):
+    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
+    global pvp_target, pvp_resume_page
     if auto_pk_running and opcode in (0x7045, 0x7046, 0x7074) and get_status():
         return True  # Auto PK yields combat and targeting to phBot's main bot.
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
-            return auto_pk_outgoing_selection(data)
+            auto_pk_outgoing_selection(data)
+        # Never block Target Enemy / Insert 7045 — blocking caused disclient.
+        return False
+    if auto_pk_running and opcode == 0x7046:
+        # Let cancel-target reach the server; only clear local wait state.
+        with pvp_lock:
+            runtime = auto_pk_runtime
+            if runtime is not None and not pvp_target:
+                runtime.update(requested=0, select_until=0.0)
+        return False
     if auto_pk_running and auto_pk_returning:
         raw=bytes(data or b'')
         withdraw=(auto_pk_runtime or {}).get('withdraw')
@@ -5553,8 +5596,6 @@ def handle_silkroad(opcode, data):
         if opcode==0x7045 or (opcode==0x7074 and raw and raw[0]==1):
             return False  # No new target/attack can restart pursuit during withdrawal.
     observe_numeric_request(opcode, data)
-    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
-    global pvp_target, pvp_resume_page
     trace_manual_packet(True, opcode, data)
     observe_hotbar_finder_request(opcode,data)
     if (opcode==0x7074 and pvp_trigger_mode=='manual' and not pvp_armed
@@ -8173,5 +8214,5 @@ def finished():
 
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s · Auto PK: đạo tặc↔bảo tiêu must-attack · tên job tóm trước · không ALT.' %
+log('[%s] Đã nạp thành công v%s · Auto PK: bật không spam · chờ B045 mới Ghost · không ALT.' %
     (NAME, VERSION))
