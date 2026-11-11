@@ -2,6 +2,11 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party sync hook] party_sync_arm/stop/select_uid cho PartyLeader: arm Auto PK
+  theo nhóm F, cho phép 7045 UID sync PT (không chặn outgoing).
+- [FIX no B070 hard-stop] Thiếu B070 / đổi cửa sổ acc: KHÔNG dừng Ghost — chờ
+  quietly rồi thử lại mãi (chỉ chết / Dừng / ks off mới tắt).
+- [FIX stale B070 ID] ID không còn trong nhóm F: bỏ ID cũ, sang skill khác.
 - [FIX drop hostile filter] Bỏ lọc đỏ/tím/job — Auto PK chọn mọi player sống
   trong vùng quét/đánh (như trước 1.8.59). Không ALT, không player 7045.
 - [FIX buff VK equip] Mỗi buff theo VK F1/F2/F3: đợi Lấy đồ sẵn sàng rồi mới
@@ -34,9 +39,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.60'
-# raw-main download stamp: 2026-11-11T06:40Z (UTF-8 no BOM/U+200B)
-# [FIX drop hostile filter] + [FIX buff VK equip] + stand-still + scan 60m + never-abort
+VERSION = '1.8.61'
+# raw-main download stamp: 2026-11-11T07:50Z (UTF-8 no BOM/U+200B)
+# [FIX party sync + stale B070] + drop hostile filter + buff VK + stand-still
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -348,7 +353,7 @@ widget('auto_pk','createLabel','Vùng quét (m)',171,69)
 auto_pk_scan_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_REPORT_RADIUS),265,65,55,22)
 widget('auto_pk','createLabel','Nhóm Ghost',340,69)
 auto_pk_page_field=widget('auto_pk','createCombobox',427,65,75,22)
-for page in ('F1','F2'):QtBind.append(gui,auto_pk_page_field,page)
+for page in PVP_EDIT_PAGES:QtBind.append(gui,auto_pk_page_field,page)
 QtBind.setText(gui,auto_pk_page_field,'F2')
 widget('auto_pk','createButton','save_auto_pk_settings','Lưu Auto PK',545,64)
 auto_pk_anchor_label=widget('auto_pk','createLabel','Điểm chờ: tự lấy khi bật.',10,103)
@@ -2743,22 +2748,42 @@ def rotate_direct(character, gate_checked=False):
             release_auto_pk_target(direct_target, 'thử skill theo UID nhưng không có B070')
             return
         next_group = runtime_skill_groups.get(current_page)
-        if current_page in runtime_skill_groups and (not next_group or direct_expected[0] not in next_group['delays']):
-            direct_expected = direct_retry_state = None
-            pvp_cast_deadline = 0.0
+        stale_id = (current_page in runtime_skill_groups
+                    and (not next_group or direct_expected[0] not in next_group.get('delays', {})))
+        if stale_id:
+            # [FIX stale B070 ID] ID không thuộc nhóm F hiện tại — bỏ, không reclick/dừng.
+            stale = direct_expected[0]
+            report('ID=%d không có trong nhóm %s · bỏ ID cũ, lấy skill khác.'
+                   % (stale, current_page or '?'))
+            if auto_pk_running:
+                recover_auto_pk_cast(direct_target, stale,
+                                    'ID=%d không thuộc nhóm %s' % (stale, current_page or '?'))
+            else:
+                direct_expected = direct_retry_state = None
+                pvp_cast_deadline = 0.0
         elif direct_native_exchange and reclick_enabled and direct_retry_state is not None:
             if not retry_direct_native_skill(character):
                 return
         elif direct_native_exchange:
+            # [FIX no B070 hard-stop] Không pause_pvp — chờ/thử lại hoặc sang skill.
             reason = 'chưa có B070 khớp ID=%d' % direct_expected[0]
-            if not recover_auto_pk_cast(direct_target, direct_expected[0], reason):
-                pause_pvp(reason + '; chờ lệnh bắt đầu mới', cancel_action=False)
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, reason)
+            elif not recover_auto_pk_cast(direct_target, direct_expected[0], reason):
+                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
             return
         elif direct_chain_mode:
-            pause_pvp('ID THỬ: hết 6s chưa có B070 cho ID=%d; kết thúc đo, không gửi hủy tác vụ, không gửi lại'%direct_expected[0],cancel_action=False)
+            # Đo chuỗi: vẫn không hard-stop Ghost đang live — bỏ chờ, cast tiếp.
+            report_direct('ID THỬ: hết chờ B070 cho ID=%d · bỏ đo lẻ, cast tiếp.' % direct_expected[0])
+            direct_expected = direct_retry_state = None
+            pvp_cast_deadline = 0.0
             return
         else:
-            pause_pvp('server chưa xác nhận skill ID=%d; không tự bỏ sang skill kế tiếp'%direct_expected[0])
+            reason = 'server chưa xác nhận skill ID=%d' % direct_expected[0]
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, reason)
+            else:
+                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
             return
     if direct_expected is not None:
         report_direct('hết %.1fs chờ 0xB070 cho skill ID=%d.' % (DIRECT_CAST_WAIT, direct_expected[0]))
@@ -3279,7 +3304,7 @@ def view_auto_pk():
             QtBind.setText(gui,auto_pk_enemy_key_field,str(profile.get('target_enemy_key') or ''))
             if math.isfinite(radius) and radius >= 1:
                 QtBind.setText(gui, auto_pk_radius_field, '%g' % min(radius, AUTO_PK_MAX_RADIUS))
-            if page in ('F1','F2'):QtBind.setText(gui,auto_pk_page_field,page)
+            if page in PVP_EDIT_PAGES:QtBind.setText(gui,auto_pk_page_field,page)
             anchor=profile.get('anchor')
             if isinstance(anchor,dict) and all(k in anchor for k in ('x','y','region')):
                 values={k:float(anchor.get(k,0)) for k in ('x','y','z')}
@@ -3305,7 +3330,7 @@ def read_auto_pk_settings():
         radius = AUTO_PK_MAX_RADIUS
         QtBind.setText(gui, auto_pk_radius_field, str(AUTO_PK_MAX_RADIUS))
     page=QtBind.text(gui,auto_pk_page_field)
-    if page not in ('F1','F2'):raise ValueError('Chọn nhóm Auto pk F1 hoặc F2.')
+    if page not in PVP_EDIT_PAGES:raise ValueError('Chọn nhóm Auto pk F1–F3.')
     return owner,radius,page
 
 
@@ -3672,6 +3697,18 @@ def auto_pk_outgoing_selection(data):
         return False
     uid = struct.unpack('<I', data)[0]
     if uid and uid == runtime['requested']:
+        return True
+    # [FIX party sync hook] PartyLeader inject 7045 must not be blocked.
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    if uid and party_uid and uid == party_uid:
+        now = monotonic()
+        runtime.pop('select_in_event', None)
+        runtime.update(requested=uid, select_until=now + AUTO_PK_SELECT_TIMEOUT, native_uid=uid,
+                       target_seen_at=now, target_sent_at=now, native_probe_until=0.0,
+                       native_source='PartyLeader sync')
+        QtBind.setText(gui, auto_pk_status_label,
+                       'PartyLeader sync UID %d · chờ B045.' % uid)
+        pvp_selection_request = direct_select_request = uid
         return True
     if runtime['requested'] or pvp_target or not uid:
         return False
@@ -4791,6 +4828,143 @@ def stop_auto_pk(reason=None):
         report_error(message)
     QtBind.setText(gui, auto_pk_status_label, message)
     QtBind.setText(gui, auto_pk_scan_field, 'Tự quét nhận diện khi bật Auto PK.')
+
+
+def party_sync_apply_page(page):
+    """Áp nhóm F đã chọn trên phụ (compile + use_skill_group)."""
+    global runtime_skill_groups, current_page, direct_expected, direct_retry_state, pvp_cast_deadline
+    global direct_missed_skills, pvp_allowed_pages
+    page = str(page or '').strip().upper()
+    if page not in PVP_EDIT_PAGES:
+        raise ValueError('Nhóm F phải là F1–F3 (nhận %r).' % page)
+    QtBind.setText(gui, auto_pk_page_field, page)
+    groups = compile_skill_groups({page}, allow_empty=True)
+    group = groups.get(page)
+    if not group or not group.get('order'):
+        raise ValueError('Nhóm %s chưa có skill ID — mở AutoGhost kiểm tra bảng F.' % page)
+    runtime_skill_groups = {page: group}
+    pvp_allowed_pages = (page,)
+    use_skill_group(page)
+    use_skill_group(page, runtime=True, index=0)
+    # Drop stale cast state from previous F bar.
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
+    direct_missed_skills.clear()
+    if auto_pk_runtime is not None:
+        auto_pk_runtime['page'] = page
+        auto_pk_runtime.pop('skill_retry_at', None)
+    current_page = page
+    ids = ','.join(str(uid) for uid in group['order'][:8])
+    log('[%s] party_sync: dùng nhóm %s · ID=[%s%s]'
+        % (NAME, page, ids, '…' if len(group['order']) > 8 else ''))
+    return page
+
+
+def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
+    """Hook công khai: PartyLeader bật Auto PK theo nhóm F (F1–F3)."""
+    global auto_pk_owner
+    try:
+        page = str(page or '').strip().upper()
+        if page and page not in PVP_EDIT_PAGES:
+            page = QtBind.text(gui, auto_pk_page_field) or 'F2'
+        if page in PVP_EDIT_PAGES:
+            QtBind.setText(gui, auto_pk_page_field, page)
+        owner = owner_of(get_character_data() or {})
+        if owner and owner != auto_pk_owner:
+            view_auto_pk()
+        if page in PVP_EDIT_PAGES:
+            QtBind.setText(gui, auto_pk_page_field, page)
+        if auto_pk_running:
+            if page in PVP_EDIT_PAGES:
+                try:
+                    party_sync_apply_page(page)
+                except ValueError as error:
+                    log('[%s] party_sync đổi F: %s' % (NAME, error))
+            with pvp_lock:
+                if auto_pk_runtime is not None:
+                    auto_pk_runtime['party_sync_source'] = source
+                    if prefer_uid:
+                        auto_pk_runtime['party_sync_uid'] = int(prefer_uid)
+                        auto_pk_runtime['requested'] = int(prefer_uid)
+            log('[%s] party_sync: Auto PK đã chạy · page=%s · prefer_uid=%s · src=%s'
+                % (NAME, QtBind.text(gui, auto_pk_page_field), prefer_uid, source))
+            if prefer_uid:
+                party_sync_select_uid(prefer_uid, source=source)
+            return True
+        request_auto_pk_arm()
+        if not auto_pk_running:
+            return False
+        if page in PVP_EDIT_PAGES:
+            try:
+                party_sync_apply_page(page)
+            except ValueError as error:
+                log('[%s] party_sync F sau arm: %s' % (NAME, error))
+        with pvp_lock:
+            if auto_pk_runtime is not None:
+                auto_pk_runtime['party_sync_source'] = source
+                if prefer_uid:
+                    auto_pk_runtime['party_sync_uid'] = int(prefer_uid)
+                    auto_pk_runtime['requested'] = int(prefer_uid)
+        log('[%s] party_sync: đã bật Auto PK · nhóm %s · src=%s'
+            % (NAME, QtBind.text(gui, auto_pk_page_field), source))
+        if prefer_uid:
+            party_sync_select_uid(prefer_uid, source=source)
+        return True
+    except Exception as error:
+        log('[%s] party_sync_arm lỗi: %s' % (NAME, error))
+        return False
+
+
+def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
+    """Hook công khai: PartyLeader tắt Auto PK (ks off / dung)."""
+    try:
+        if not auto_pk_running:
+            return True
+        stop_auto_pk(reason=reason or ('dừng bởi %s' % source))
+        return True
+    except Exception as error:
+        log('[%s] party_sync_stop lỗi: %s' % (NAME, error))
+        return False
+
+
+def party_sync_select_uid(uid, source='PartyLeader'):
+    """Hook: đánh dấu UID sync PT rồi inject 7045 (AutoGhost không chặn)."""
+    global pvp_selection_request, direct_select_request
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        return False
+    if uid <= 0:
+        return False
+    now = monotonic()
+    with pvp_lock:
+        runtime = auto_pk_runtime if auto_pk_running else None
+        if runtime is not None and not auto_pk_returning:
+            runtime['party_sync_uid'] = uid
+            runtime['party_sync_source'] = source
+            runtime['requested'] = uid
+            runtime['select_until'] = now + AUTO_PK_SELECT_TIMEOUT
+            runtime['native_uid'] = uid
+            runtime['native_source'] = 'PartyLeader sync'
+            runtime['target_seen_at'] = now
+            runtime['target_sent_at'] = now
+            pvp_selection_request = direct_select_request = uid
+    packet = struct.pack('<I', uid & 0xffffffff)
+    ok = inject_joymax(0x7045, packet, False)
+    if ok is False:
+        # Fallback: encrypted flag (một số Stable build).
+        ok = inject_joymax(0x7045, packet, True)
+    accepted = ok is not False
+    log('[%s] party_sync_select UID=%d · 7045=%r · src=%s · auto_pk=%s'
+        % (NAME, uid, ok, source, auto_pk_running))
+    if accepted:
+        QtBind.setText(gui, auto_pk_status_label,
+                       'PartyLeader sync UID %d · 7045 ok · chờ B045/Ghost.' % uid)
+    else:
+        QtBind.setText(gui, auto_pk_status_label,
+                       'PartyLeader sync UID %d · 7045 từ chối · giữ prefer để Auto PK retry.'
+                       % uid)
+    return accepted
 
 
 def hold_auto_pk(reason, retry_after=0.0):
@@ -6629,6 +6803,24 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
     return True
 
 
+def skip_stale_direct_skill(skill_id, reason):
+    """Bỏ ID lỗi/cũ khỏi vòng cast; giữ Ghost/Auto PK chạy."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline, direct_missed_skills
+    runtime = auto_pk_runtime if auto_pk_running else None
+    if runtime is not None:
+        runtime.setdefault('skill_retry_at', {})[int(skill_id)] = monotonic() + AUTO_PK_CAST_RETRY_DELAY
+    try:
+        direct_missed_skills.add(int(skill_id))
+    except Exception:
+        pass
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
+    message = '[FIX stale B070 ID] %s' % reason
+    QtBind.setText(gui, auto_pk_status_label, message)
+    report(message)
+    return True
+
+
 def recover_auto_pk_cast(target, skill_id, reason):
     global direct_expected, direct_retry_state, pvp_cast_deadline
     runtime = auto_pk_runtime
@@ -6645,26 +6837,68 @@ def recover_auto_pk_cast(target, skill_id, reason):
     return True
 
 
+def soft_wait_b070_without_attempt(skill_id, target, reason):
+    """Tạo lại trạng thái chờ B070 — không dừng Ghost."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    packet = struct.pack('<BBIBI', 1, 4, int(skill_id), 1, int(target))
+    attempt = {
+        'owner': owner_of(get_character_data() or {}),
+        'skill': int(skill_id),
+        'target': int(target),
+        'packet': packet,
+        'retries': 0,
+        'sent_at': monotonic(),
+    }
+    return soft_wait_b070_focus(attempt, reason)
+
+
+def soft_wait_b070_focus(attempt, reason):
+    """HARD RULE: thiếu B070 / mất focus → không dừng Ghost; chờ rồi thử lại mãi."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    client = get_client() or {}
+    background = bool(auto_pk_running and auto_pk_in_background(client))
+    attempt['retries'] = 0
+    attempt['sent_at'] = monotonic()
+    direct_expected = (attempt['skill'], attempt['target'])
+    direct_retry_state = attempt
+    pvp_cast_deadline = monotonic() + (1.8 if background else 1.0)
+    if background:
+        message = ('Chưa B070 ID=%d · đang xem acc/cửa sổ khác · giữ UID %d, '
+                   'chờ foreground rồi cast tiếp (không dừng Auto Ghost).'
+                   % (attempt['skill'], attempt['target']))
+    else:
+        message = ('%s · giữ UID %d / ID=%d · thử lại (không dừng Auto Ghost).'
+                   % (reason, attempt['target'], attempt['skill']))
+    QtBind.setText(gui, auto_pk_status_label, message)
+    QtBind.setText(gui, status_label, message)
+    # Quiet: log once-style via report, never report_error / pause_pvp.
+    report(message)
+    return False
+
+
 def retry_direct_native_skill(character):
     global pvp_cast_deadline, direct_expected, direct_retry_state, direct_recovery_used
     attempt=direct_retry_state
     if (not attempt or attempt['owner']!=owner_of(character)
             or (attempt['skill'],attempt['target'])!=direct_expected):return
+    group = runtime_skill_groups.get(current_page) or {}
+    if attempt['skill'] not in group.get('delays', {}):
+        skip_stale_direct_skill(
+            attempt['skill'],
+            'ID=%d không còn trong nhóm %s · bỏ ID cũ, không reclick.'
+            % (attempt['skill'], current_page or '?'))
+        return False
     if attempt['retries'] >= RECLICK_MAX_RETRIES:
         reason = 'chưa có B070 khớp ID=%d sau %d lần thử lại' % (attempt['skill'], RECLICK_MAX_RETRIES)
-        if not recover_auto_pk_cast(attempt['target'], attempt['skill'], reason):
-            pause_pvp(reason, cancel_action=False)
-        return False
+        # HARD RULE: never pause_pvp / never "Auto Ghost dừng" on missing B070.
+        return soft_wait_b070_focus(attempt, reason)
     attempt['retries']+=1
     pvp_cast_deadline=monotonic()+reclick_wait
     push_trace_mark('Reclick đầu tiên', 'ID=%d' % attempt['skill'])
     report('Reclick ID: skill=%d, thử lại %d/3.'%(attempt['skill'],attempt['retries']))
     if inject_joymax(0x7074,attempt['packet'],False) is False:
-        reason = 'phBot từ chối lần gửi lại'
-        if auto_pk_running:
-            recover_auto_pk_cast(attempt['target'], attempt['skill'], reason)
-        else:
-            pause_pvp('PvP ID/ô số: ' + reason + '; không gửi thêm')
+        # Inject fail (thường do mất focus) — chờ rồi thử lại, không dừng.
+        soft_wait_b070_focus(attempt, 'phBot từ chối lần gửi lại')
 
 
 def confirm_direct_native_skill(skill_id):

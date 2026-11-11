@@ -2,17 +2,18 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
-- v1.0.1: Lấy tên mình = name + job_name (vd. ThienHau, AG_He). Phụ khớp tên
-  và/hoặc nghề; start_trace luôn dùng tên NV (phần trước dấu phẩy).
-- v1.0.0: Chat `ks` → phụ start_trace chủ; `ks off`/`dung` → stop_trace.
-  Sync mục tiêu: B070 khi chủ đánh + broadcast `ks#UID` khi chủ chọn (0x7045).
-  Phụ inject 0x7045 cùng UID. Không ALT.
+- v1.0.2: `ks` → trace + bật AutoGhost Auto PK (nhóm F phụ chọn); `ks off`/`dung`
+  dừng trace + tắt Auto PK nếu plugin này bật. Sync UID qua hook AutoGhost
+  (tránh 7045=False bị Auto PK chặn) + fallback inject.
+- v1.0.1: Lấy tên mình = name + job_name. Phụ khớp tên/nghề; trace dùng tên NV.
+- v1.0.0: Chat ks / sync B070 + ks#UID. Không ALT.
 """
 
 from __future__ import print_function
 
 import json
 import struct
+import sys
 from pathlib import Path
 from threading import RLock
 from time import monotonic
@@ -37,10 +38,9 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 CONFIG_NAME = 'PartyLeader'
 
-# Chat lệnh (không phân biệt hoa thường)
 CMD_FOLLOW = ('ks',)
 CMD_STOP = ('ks off', 'ksoff', 'ks dung', 'dung', 'stopks', 'notrace')
 
@@ -50,6 +50,8 @@ ROLE_LABELS = (
     'Vai trò: Phụ (theo chủ)',
     'Vai trò: Chủ PT',
 )
+# Nhóm Ghost / Auto PK trên phụ (khớp AutoGhost PVP_EDIT_PAGES)
+GHOST_PAGES = ('F1', 'F2', 'F3')
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
 lock = RLock()
@@ -57,9 +59,12 @@ state = {
     'enabled': False,
     'role': ROLE_FOLLOWER,
     'leader_name': '',
+    'ghost_page': 'F2',
     'sync_target': True,
     'broadcast_select': True,
+    'arm_auto_pk': True,
     'following': False,
+    'armed_auto_pk': False,
     'last_uid': 0,
     'last_select_at': 0.0,
     'last_broadcast_uid': 0,
@@ -69,17 +74,23 @@ state = {
 QtBind.createLabel(gui, '%s v%s — PT theo chủ' % (NAME, VERSION), 10, 8)
 enabled_box = QtBind.createCheckBox(gui, 'ui_enabled', 'Bật plugin', 10, 32)
 sync_box = QtBind.createCheckBox(gui, 'ui_sync', 'Đồng bộ mục tiêu (7045 / B070)', 140, 32)
+arm_box = QtBind.createCheckBox(gui, 'ui_arm', 'ks: bật AutoGhost Auto PK', 400, 32)
 broadcast_box = QtBind.createCheckBox(
     gui, 'ui_broadcast', 'Chủ: chat party ks#UID khi chọn (Target / ` )', 10, 56)
 
 QtBind.createLabel(gui, 'Vai trò', 10, 88)
-role_combo = QtBind.createCombobox(gui, 10, 106, 220, 22)
+role_combo = QtBind.createCombobox(gui, 10, 106, 200, 22)
 for label in ROLE_LABELS:
     QtBind.append(gui, role_combo, label)
 
-QtBind.createLabel(gui, 'Tên chủ (name, job_name) — phụ điền đúng / Lấy tên mình', 250, 88)
-leader_field = QtBind.createLineEdit(gui, '', 250, 106, 200, 22)
-QtBind.createButton(gui, 'btn_self', 'Lấy tên mình', 460, 104)
+QtBind.createLabel(gui, 'Nhóm Ghost F (phụ)', 220, 88)
+page_combo = QtBind.createCombobox(gui, 220, 106, 70, 22)
+for page in GHOST_PAGES:
+    QtBind.append(gui, page_combo, page)
+
+QtBind.createLabel(gui, 'Tên chủ (name, job_name)', 300, 88)
+leader_field = QtBind.createLineEdit(gui, '', 300, 106, 180, 22)
+QtBind.createButton(gui, 'btn_self', 'Lấy tên mình', 490, 104)
 
 QtBind.createButton(gui, 'btn_save', 'Lưu cấu hình', 10, 144)
 QtBind.createButton(gui, 'btn_load', 'Tải cấu hình', 140, 144)
@@ -89,16 +100,17 @@ QtBind.createButton(gui, 'btn_stop', 'Dừng theo', 460, 144)
 status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 184)
 QtBind.createLabel(
     gui,
-    'Lệnh chat (party/all… từ chủ):  ks = phụ trace chủ  ·  ks off / dung = dừng trace.\n'
-    'Chủ chọn địch → (tuỳ chọn) party ks#UID · hoặc khi chủ đánh (B070) phụ tự 7045 cùng UID.\n'
-    'Cùng plugin mọi acc: phụ = Bật + ô chủ (name, job_name) · chủ = Lấy tên mình / chat ks.',
+    'Lệnh từ chủ (party):  ks = phụ trace + bật Auto PK (nhóm F)  ·  ks off / dung = dừng.\n'
+    'Chủ chọn/đánh → phụ chọn cùng UID (hook AutoGhost / 7045) rồi Ghost đánh.\n'
+    'Phụ: Bật + tên chủ + chọn F1/F2/F3 + Lưu. Chủ: Lấy tên mình / chat ks.',
     10, 214,
 )
 
-# Defaults
 QtBind.setChecked(gui, sync_box, True)
 QtBind.setChecked(gui, broadcast_box, True)
+QtBind.setChecked(gui, arm_box, True)
 QtBind.setText(gui, role_combo, ROLE_LABELS[ROLE_FOLLOWER])
+QtBind.setText(gui, page_combo, 'F2')
 
 
 def _log(msg):
@@ -125,7 +137,6 @@ def self_job_name():
 
 
 def self_display():
-    """Tên hiển thị cấu hình: 'Name, job_name' (tránh nhầm NV gần giống)."""
     name = self_name()
     job = self_job_name()
     if name and job:
@@ -142,22 +153,13 @@ def self_player_id():
 
 
 def parse_leader_identity(text):
-    """Tách ô Leader → (char_name, job_name, display).
-
-    Chấp nhận: 'ThienHau, AG_He' | 'ThienHau' | chỉ job.
-    """
     raw = ' '.join(str(text or '').strip().split())
     if not raw:
         return '', '', ''
     if ',' in raw:
         left, right = raw.split(',', 1)
-        char_name = left.strip()
-        job_name = right.strip()
-    else:
-        char_name = raw
-        job_name = ''
-    display = raw
-    return char_name, job_name, display
+        return left.strip(), right.strip(), raw
+    return raw, '', raw
 
 
 def identity_tokens(char_name, job_name, display):
@@ -182,6 +184,18 @@ def set_role(index):
     QtBind.setText(gui, role_combo, ROLE_LABELS[index])
 
 
+def ghost_page():
+    page = (QtBind.text(gui, page_combo) or 'F2').strip().upper()
+    return page if page in GHOST_PAGES else 'F2'
+
+
+def set_ghost_page(page):
+    page = str(page or 'F2').strip().upper()
+    if page not in GHOST_PAGES:
+        page = 'F2'
+    QtBind.setText(gui, page_combo, page)
+
+
 def normalize_cmd(msg):
     return ' '.join(str(msg or '').strip().casefold().split())
 
@@ -195,7 +209,6 @@ def is_follow_cmd(norm):
 
 
 def parse_ks_uid(msg):
-    """Parse 'ks#123' / 'ks# 123' / 'ks t 123' → uid or 0."""
     raw = str(msg or '').strip()
     low = raw.casefold()
     if low.startswith('ks#'):
@@ -214,7 +227,6 @@ def parse_ks_uid(msg):
 
 
 def configured_leader():
-    """Chuỗi ô Leader (có thể gồm name, job_name)."""
     name = (QtBind.text(gui, leader_field) or '').strip()
     if name:
         return name
@@ -224,13 +236,11 @@ def configured_leader():
 
 
 def configured_leader_char():
-    """Tên NV dùng cho start_trace (không kèm job)."""
     char_name, _job, _display = parse_leader_identity(configured_leader())
     return char_name
 
 
 def name_is_leader(player):
-    """Khớp chat/party name với ô Leader: full / tên NV / job_name."""
     if not player:
         return False
     leader = configured_leader()
@@ -264,7 +274,6 @@ def i_am_leader():
 
 
 def party_member_name(unique_id):
-    """UID → tên nếu là mình hoặc thành viên party."""
     try:
         uid = int(unique_id)
     except (TypeError, ValueError):
@@ -285,6 +294,78 @@ def party_member_name(unique_id):
     return ''
 
 
+def find_autoghost():
+    for module in list(sys.modules.values()):
+        try:
+            if getattr(module, 'NAME', None) == 'AutoGhost':
+                return module
+        except Exception:
+            continue
+    return None
+
+
+def arm_auto_pk(prefer_uid=0):
+    """Bật AutoGhost Auto PK theo nhóm F đã lưu trên phụ."""
+    if not QtBind.isChecked(gui, arm_box):
+        return False
+    ghost = find_autoghost()
+    if ghost is None:
+        set_status('Không thấy AutoGhost — chỉ trace/sync 7045.')
+        return False
+    page = ghost_page()
+    hook = getattr(ghost, 'party_sync_arm_auto_pk', None)
+    try:
+        if callable(hook):
+            ok = bool(hook(page=page, prefer_uid=int(prefer_uid or 0), source=NAME))
+        else:
+            # Fallback older AutoGhost: set page UI + request_auto_pk_arm
+            field = getattr(ghost, 'auto_pk_page_field', None)
+            gui_ref = getattr(ghost, 'gui', None)
+            if field is not None and gui_ref is not None:
+                QtBind.setText(gui_ref, field, page)
+            arm = getattr(ghost, 'request_auto_pk_arm', None)
+            if not callable(arm):
+                set_status('AutoGhost thiếu request_auto_pk_arm.')
+                return False
+            arm()
+            ok = bool(getattr(ghost, 'auto_pk_running', False))
+    except Exception as error:
+        set_status('Arm Auto PK lỗi: %s' % error)
+        return False
+    with lock:
+        state['armed_auto_pk'] = bool(ok)
+    set_status('Auto PK %s · nhóm %s · API=%r' % (
+        'ON' if ok else 'FAIL', page, ok))
+    return ok
+
+
+def stop_auto_pk_if_ours(reason):
+    with lock:
+        armed = state['armed_auto_pk']
+    if not armed and not QtBind.isChecked(gui, arm_box):
+        return False
+    ghost = find_autoghost()
+    if ghost is None:
+        with lock:
+            state['armed_auto_pk'] = False
+        return False
+    hook = getattr(ghost, 'party_sync_stop_auto_pk', None)
+    try:
+        if callable(hook):
+            hook(reason=reason, source=NAME)
+        else:
+            stop = getattr(ghost, 'stop_auto_pk', None)
+            if callable(stop):
+                stop(reason=reason)
+    except Exception as error:
+        set_status('Stop Auto PK lỗi: %s' % error)
+        return False
+    with lock:
+        state['armed_auto_pk'] = False
+    set_status('[%s] Đã tắt Auto PK.' % reason)
+    return True
+
+
 def inject_select(uid, reason):
     try:
         uid = int(uid)
@@ -298,14 +379,45 @@ def inject_select(uid, reason):
             return True
         state['last_uid'] = uid
         state['last_select_at'] = now
+
+    # Ưu tiên hook AutoGhost (đánh dấu party_sync_uid → không bị chặn 7045).
+    ghost = find_autoghost()
+    if ghost is not None:
+        select_hook = getattr(ghost, 'party_sync_select_uid', None)
+        if callable(select_hook):
+            try:
+                ok = bool(select_hook(uid, source='%s:%s' % (NAME, reason)))
+                set_status('Chọn UID=%d (%s) · AutoGhost hook=%r' % (uid, reason, ok))
+                if ok:
+                    try:
+                        if not get_status():
+                            start_bot()
+                    except Exception:
+                        pass
+                    return True
+            except Exception as error:
+                _log('party_sync_select_uid: %s' % error)
+
     packet = struct.pack('<I', uid & 0xffffffff)
     ok = inject_joymax(0x7045, packet, False)
+    if ok is False:
+        ok = inject_joymax(0x7045, packet, True)
     set_status('Chọn UID=%d (%s) · 7045=%r' % (uid, reason, ok))
     try:
         if not get_status():
             start_bot()
     except Exception:
         pass
+    # Nếu Auto PK đang chạy, vẫn giữ prefer_uid qua arm hook.
+    if ok is False and ghost is not None and getattr(ghost, 'auto_pk_running', False):
+        try:
+            runtime = getattr(ghost, 'auto_pk_runtime', None)
+            if isinstance(runtime, dict):
+                runtime['party_sync_uid'] = uid
+                runtime['requested'] = uid
+                set_status('7045 từ chối · đã gắn prefer UID=%d cho Auto PK retry' % uid)
+        except Exception:
+            pass
     return ok is not False
 
 
@@ -326,6 +438,8 @@ def do_follow(reason):
         state['following'] = bool(ok)
     set_status('[%s] Trace → %r (%s) · API=%r' % (
         reason, leader_char, configured_leader(), ok))
+    # ks: bật Auto PK theo nhóm F trên phụ
+    arm_auto_pk(prefer_uid=0)
     return bool(ok)
 
 
@@ -337,7 +451,8 @@ def do_stop_follow(reason):
         return False
     with lock:
         state['following'] = False
-    set_status('[%s] Đã dừng trace.' % reason)
+    stop_auto_pk_if_ours(reason)
+    set_status('[%s] Đã dừng trace (+ Auto PK nếu do plugin bật).' % reason)
     return True
 
 
@@ -379,8 +494,10 @@ def read_settings():
         'enabled': QtBind.isChecked(gui, enabled_box),
         'role': role_index(),
         'leader_name': (QtBind.text(gui, leader_field) or '').strip(),
+        'ghost_page': ghost_page(),
         'sync_target': QtBind.isChecked(gui, sync_box),
         'broadcast_select': QtBind.isChecked(gui, broadcast_box),
+        'arm_auto_pk': QtBind.isChecked(gui, arm_box),
     }
 
 
@@ -389,14 +506,18 @@ def apply_settings(data):
     QtBind.setChecked(gui, enabled_box, bool(data.get('enabled')))
     set_role(data.get('role', ROLE_FOLLOWER))
     QtBind.setText(gui, leader_field, str(data.get('leader_name') or ''))
+    set_ghost_page(data.get('ghost_page', 'F2'))
     QtBind.setChecked(gui, sync_box, bool(data.get('sync_target', True)))
     QtBind.setChecked(gui, broadcast_box, bool(data.get('broadcast_select', True)))
+    QtBind.setChecked(gui, arm_box, bool(data.get('arm_auto_pk', True)))
     with lock:
         state['enabled'] = bool(data.get('enabled'))
         state['role'] = ROLE_LEADER if int(data.get('role', 0) or 0) == ROLE_LEADER else ROLE_FOLLOWER
         state['leader_name'] = str(data.get('leader_name') or '')
+        state['ghost_page'] = ghost_page()
         state['sync_target'] = bool(data.get('sync_target', True))
         state['broadcast_select'] = bool(data.get('broadcast_select', True))
+        state['arm_auto_pk'] = bool(data.get('arm_auto_pk', True))
 
 
 def btn_save():
@@ -412,7 +533,8 @@ def btn_save():
         path = config_path()
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         apply_settings(data)
-        set_status('Đã lưu %s · Leader=%r' % (path.name, data['leader_name']))
+        set_status('Đã lưu %s · Leader=%r · F=%s' % (
+            path.name, data['leader_name'], data['ghost_page']))
     except (OSError, ValueError, TypeError) as error:
         set_status('Chưa lưu: %s' % error)
 
@@ -468,23 +590,34 @@ def ui_broadcast(checked):
         state['broadcast_select'] = bool(checked)
 
 
+def ui_arm(checked):
+    with lock:
+        state['arm_auto_pk'] = bool(checked)
+
+
 def handle_chat(chat_type, player, msg):
-    """ks / ks off từ chủ; ks#UID broadcast."""
     if not QtBind.isChecked(gui, enabled_box):
         return
-    # Union chat đôi khi kèm "Guild: msg"
     if int(chat_type or 0) == 11 and msg and ': ' in str(msg):
         msg = str(msg).split(': ', 1)[1]
     text = str(msg or '').strip()
     if not text:
         return
-    # Discord / webhook type 100: cho phép không cần tên khớp leader list
     from_leader = name_is_leader(player) or int(chat_type or 0) == 100
     if not from_leader:
         return
 
     uid = parse_ks_uid(text)
     if uid and QtBind.isChecked(gui, sync_box) and not i_am_leader():
+        # Đảm bảo Auto PK đang chạy khi nhận target
+        if QtBind.isChecked(gui, arm_box):
+            with lock:
+                armed = state['armed_auto_pk']
+            if not armed:
+                arm_auto_pk(prefer_uid=uid)
+            else:
+                inject_select(uid, 'chat ks# từ chủ')
+                return
         inject_select(uid, 'chat ks# từ chủ')
         return
 
@@ -495,17 +628,11 @@ def handle_chat(chat_type, player, msg):
         return
     if is_follow_cmd(norm):
         if not i_am_leader():
-            # Trace đúng người gửi lệnh nếu trùng / hoặc tên cấu hình
-            leader = configured_leader() or str(player or '').strip()
-            if player and leader and str(player).casefold() != leader.casefold():
-                # Chủ chat ks nhưng ô Leader khác — ưu tiên tên ô; vẫn trace ô
-                pass
             do_follow('chat ks')
         return
 
 
 def handle_joymax(opcode, data):
-    """Server B070: chủ đánh → phụ chọn cùng target (xTargetSupport-style)."""
     if opcode != 0xB070 or not data:
         return True
     if not QtBind.isChecked(gui, enabled_box):
@@ -521,7 +648,7 @@ def handle_joymax(opcode, data):
     if len(raw) < 15 or raw[0] != 1:
         return True
     skill_type = raw[1]
-    if skill_type != 2:  # attack
+    if skill_type != 2:
         return True
     index = 7
     try:
@@ -532,7 +659,7 @@ def handle_joymax(opcode, data):
             locale = int(get_locale() or 0)
         except Exception:
             locale = 0
-        if locale in (18, 56):  # iSRO / TRSRO
+        if locale in (18, 56):
             index += 4
         if len(raw) < index + 4:
             return True
@@ -543,12 +670,16 @@ def handle_joymax(opcode, data):
     if not attacker_name or not name_is_leader(attacker_name):
         return True
     if target_uid:
+        if QtBind.isChecked(gui, arm_box):
+            with lock:
+                armed = state['armed_auto_pk']
+            if not armed:
+                arm_auto_pk(prefer_uid=target_uid)
         inject_select(target_uid, 'B070 chủ %s đánh' % attacker_name)
     return True
 
 
 def handle_silkroad(opcode, data):
-    """Chủ chọn target (0x7045 outgoing) → broadcast ks#UID cho phụ."""
     if opcode != 0x7045 or not data:
         return True
     if not QtBind.isChecked(gui, enabled_box):
@@ -578,8 +709,7 @@ def joined_game():
 
 
 def teleported():
-    # refresh self id after tele
     pass
 
 
-log('[%s] Đã nạp v%s. Phụ: Bật + tên chủ. Chủ: chat ks · chọn địch (ks#UID / B070).' % (NAME, VERSION))
+log('[%s] Đã nạp v%s. Phụ: tên chủ + nhóm F + Bật. Chủ: chat ks → phụ Auto PK.' % (NAME, VERSION))
