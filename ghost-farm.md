@@ -1,19 +1,23 @@
-# GhostFarm v1.0.6
+# GhostFarm v1.0.7
 
-Standalone phBot farm with **overlapping Ghost interrupt** (AutoGhost-style timing).
+Standalone phBot farm with **overlapping Ghost interrupt** via the proven AutoGhost / GhostNativeProbe `NativeCut` path (`client_7081`).
 
-## Why 1.0.6
+## Why 1.0.7
 
-v1.0.5 waited `ms` **then** installed/verified NativeCut, so `arm(2)` often landed **after** the cast finished (XP already granted). Result: `B074 02 00` without a real skill-reset Ghost feel.
+v1.0.6 rebased the cut timer on **B070**, so with `cfg=1` the log showed `since_7074≈500ms` / `b070+1ms` — cut after the cast window, not a real mid-cast Ghost.
 
-## Timing (AG-like)
+## Timing (exact AG cut body, Farm anchor)
+
+AG client_7081 body: `Timer(delay)` → `queue_interrupt` → `begin_native_cut` → `send_pvp_interrupt` → `bridge.arm(2)`.
+
+Farm difference vs AG PVP: AG starts that Timer on **B070**; Farm starts it on **7074 send** (B070 is log-only — never rebases `cut_at`).
 
 1. **7045** select living monster  
-2. **Pre-warm** NativeCut (arm(1) verify) **before** cast  
+2. **Pre-warm** NativeCut (`arm(1)` → `completed(4)`) **before** cast  
 3. **7074** cast skill on monster  
-4. Prefer **B070** confirm → wait `ms` → **arm(2)** immediately  
-   Fallback: `ms` from 7074 send if no B070 (~1.2s)  
-5. Hook is already ready — cut overlaps the cast (does not wait for cast end / monster death)
+4. **`Timer(cfg_ms)` from 7074** → `bridge.arm(2)` (self UID)  
+5. Success = observed C→S `0x7081` + B074 `02 00`  
+6. Log must show `since_7074≈cfg ms` (not ~500ms)
 
 ## Skill IDs
 
@@ -21,7 +25,7 @@ v1.0.5 waited `ms` **then** installed/verified NativeCut, so `arm(2)` often land
 80031=1;66007=20;54016=0;81019=15
 ```
 
-`skillId=ms` after B070 (preferred) or after 7074 send.
+`skillId=ms` after **7074 send**.
 
 ## Install
 
