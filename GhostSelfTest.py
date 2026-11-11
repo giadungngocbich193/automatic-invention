@@ -2,29 +2,35 @@
 """GhostSelfTest — thử Ghost bản thân (7081 self UID) an toàn trên phBot Stable.
 
 Changelog:
+- v1.0.1: inject_joymax thử encrypted=True rồi fallback False; log cả hai API=
+  kết quả. Gửi từ event_loop (giống AG KIỂM TRA GỬI) thay vì chỉ từ nút UI.
+  Ghi chú: AutoGhost PvP Ghost thật dùng client_7081 (native), không phải inject;
+  đường inject AG hiện tại = 0x7081 + pack('<I',uid) + encrypted=False.
 - v1.0.0: UI Bật/Tắt; gửi 7081 self / 7081×2; hiện self UID; log C→S hex;
   handle_joymax log B074 (02 00 vs từ chối) + B081; tuỳ chọn 7081 target 7045 gần nhất.
   Độc lập — không import AutoGhost / PartyLeader.
 
-Gói giống hiep.txt: inject_joymax(0x7081, struct.pack('<I', uid), False)
-  — hiep dùng Boss UID; plugin này thử cùng format với player_id (bản thân).
+Gói giống hiep.txt / AutoGhost begin_direct_exchange:
+  inject_joymax(0x7081, struct.pack('<I', uid), encrypted)
 """
 
 from __future__ import print_function
 
 import struct
 from threading import RLock
-from time import monotonic, sleep
+from time import monotonic
 
 import QtBind
 from phBot import get_character_data, inject_joymax, log
 
 NAME = 'GhostSelfTest'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 # hiep.txt reference (Boss only — NOT self):
 #   Client 0x7081 Data 13 13 5F 00  → UID 6230803 LE
-# Self experiment uses the SAME 4-byte LE layout with get_character_data()['player_id'].
+# AutoGhost working inject (begin_direct_exchange / KIỂM TRA GỬI):
+#   inject_joymax(0x7081, struct.pack('<I', target), False)  # True historically False on host
+# AutoGhost production Ghost cut: transport=client_7081 (NativeCut), not inject_joymax.
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
 lock = RLock()
@@ -35,7 +41,9 @@ state = {
     'last_send_at': 0.0,
     'last_send_uid': 0,
     'last_send_hex': '',
+    'last_encrypted': None,
     'pending_watch_until': 0.0,
+    'queue': [],  # event_loop inject jobs (match AG probe context)
 }
 
 QtBind.createLabel(gui, '%s v%s — thử Ghost bản thân' % (NAME, VERSION), 10, 8)
@@ -52,9 +60,8 @@ QtBind.createButton(gui, 'btn_send_target', '7081 target hiện tại', 420, 132
 
 QtBind.createLabel(
     gui,
-    'C→S 0x7081 = 4 byte LE UID (giống hiep Boss, nhưng self = player_id). '
-    'Xem log B074 02 00 = ngắt OK / khác = từ chối hoặc không cắt. '
-    'Không sửa AutoGhost.',
+    'C→S 0x7081 = 4 byte LE UID (AG inject path). Thử encrypted=True rồi False; '
+    'gửi từ event_loop. AG Ghost thật = client_7081 native. Xem log B074 02 00.',
     10, 170,
 )
 
@@ -104,9 +111,11 @@ def ui_enabled(checked):
     on = bool(checked)
     with lock:
         state['enabled'] = on
+        if not on:
+            state['queue'] = []
     read_self_uid()
     show_target_uid()
-    set_status('BẬT — sẵn sàng gửi 7081.' if on else 'TẮT.')
+    set_status('BẬT — sẵn sàng gửi 7081 (event_loop).' if on else 'TẮT.')
 
 
 def btn_refresh():
@@ -119,7 +128,46 @@ def _pack_uid(uid):
     return struct.pack('<I', int(uid) & 0xffffffff)
 
 
-def send_7081(uid, label, times=1):
+def _api_ok(result):
+    return result is not False
+
+
+def inject_7081_ag_path(uid, label, seq=1):
+    """Match AutoGhost inject bytes; try encrypted True then False; log both.
+
+    AG production Ghost uses client_7081 (native). AG inject attempts use the
+    same 4-byte LE UID packet; historically True returned False on host so AG
+    settled on False — we still probe True first and fall back.
+    """
+    packet = _pack_uid(uid)
+    hex_out = packet.hex(' ').upper()
+    results = []
+    chosen = None
+    chosen_enc = None
+    for encrypted in (True, False):
+        try:
+            result = inject_joymax(0x7081, packet, encrypted)
+        except Exception as error:
+            result = 'EXC:%s' % error
+        results.append((encrypted, result))
+        _log(
+            'C→S 0x7081 [%s #%d] UID=%d | hex=%s | encrypted=%s | API=%r'
+            % (label, seq, uid, hex_out, encrypted, result))
+        if chosen is None and _api_ok(result):
+            chosen = result
+            chosen_enc = encrypted
+            # Keep probing False for comparison log even if True accepted.
+    summary = ' | '.join('enc=%s API=%r' % (enc, api) for enc, api in results)
+    if chosen_enc is not None:
+        _log('C→S 0x7081 [%s #%d] CHỌN encrypted=%s (AG-style packet) · %s'
+             % (label, seq, chosen_enc, summary))
+        return True, chosen_enc, hex_out, summary
+    _log('C→S 0x7081 [%s #%d] CẢ HAI TỪ CHỐI · %s' % (label, seq, summary))
+    return False, None, hex_out, summary
+
+
+def queue_7081(uid, label, times=1):
+    """Queue inject for event_loop (same context as AG KIỂM TRA GỬI)."""
     if not plugin_enabled():
         set_status('Plugin đang TẮT — bật trước khi gửi.')
         return False
@@ -131,36 +179,74 @@ def send_7081(uid, label, times=1):
     if not 0 < uid <= 0xffffffff:
         set_status('UID trống / không hợp lệ.')
         return False
+    times = max(1, int(times))
+    with lock:
+        state['queue'].append({
+            'uid': uid,
+            'label': label,
+            'times': times,
+            'done': 0,
+            'next_at': monotonic(),
+            'ok_any': False,
+            'last_summary': '',
+            'hex': _pack_uid(uid).hex(' ').upper(),
+        })
+    set_status(
+        'Đã xếp hàng 7081 %s ×%d UID=%d — gửi trên event_loop (True→False).'
+        % (label, times, uid))
+    return True
 
-    packet = _pack_uid(uid)
-    hex_out = packet.hex(' ').upper()
-    ok_all = True
-    for i in range(max(1, int(times))):
-        try:
-            result = inject_joymax(0x7081, packet, False)
-        except Exception as error:
-            set_status('Lỗi inject 7081: %s' % error)
-            return False
-        api_ok = result is not False
-        ok_all = ok_all and api_ok
-        _log(
-            'C→S 0x7081 [%s #%d] UID=%d | hex=%s | encrypted=False | API=%r'
-            % (label, i + 1, uid, hex_out, result))
-        if times > 1 and i + 1 < times:
-            sleep(0.01)
+
+def _finish_job(job):
+    uid = job['uid']
     with lock:
         state['last_send_at'] = monotonic()
         state['last_send_uid'] = uid
-        state['last_send_hex'] = hex_out
+        state['last_send_hex'] = job.get('hex') or ''
+        state['last_encrypted'] = job.get('chosen_enc')
         state['pending_watch_until'] = monotonic() + 3.0
-    if ok_all:
+    if job.get('ok_any'):
         set_status(
-            'Đã gửi 7081 %s ×%d UID=%d · hex %s — chờ B074/B081.'
-            % (label, times, uid, hex_out))
+            'Đã gửi 7081 %s ×%d UID=%d · enc=%s · hex %s — chờ B074/B081.'
+            % (job['label'], job['times'], uid,
+               job.get('chosen_enc'), job.get('hex') or '?'))
     else:
         set_status(
-            'phBot từ chối inject 7081 %s UID=%d (API=False).' % (label, uid))
-    return ok_all
+            'phBot từ chối inject 7081 %s UID=%d (True+False đều API=False). %s'
+            % (job['label'], uid, job.get('last_summary') or ''))
+
+
+def event_loop():
+    """Drain inject queue from phBot callback — mirrors AG transport probe."""
+    if not plugin_enabled():
+        return
+    now = monotonic()
+    with lock:
+        if not state['queue']:
+            return
+        job = state['queue'][0]
+    if now < float(job.get('next_at') or 0):
+        return
+    job['done'] = int(job.get('done') or 0) + 1
+    ok, enc, hex_out, summary = inject_7081_ag_path(
+        job['uid'], job['label'], seq=job['done'])
+    job['hex'] = hex_out
+    job['last_summary'] = summary
+    if ok:
+        job['ok_any'] = True
+        job['chosen_enc'] = enc
+    if job['done'] >= int(job.get('times') or 1):
+        with lock:
+            if state['queue'] and state['queue'][0] is job:
+                state['queue'].pop(0)
+        _finish_job(job)
+    else:
+        job['next_at'] = monotonic() + 0.01
+
+
+def send_7081(uid, label, times=1):
+    """UI entry: queue AG-style inject (True→False) onto event_loop."""
+    return queue_7081(uid, label, times=times)
 
 
 def btn_send_self():
@@ -207,12 +293,13 @@ def handle_joymax(opcode, data):
         watching = monotonic() <= float(state.get('pending_watch_until') or 0)
         last_uid = int(state.get('last_send_uid') or 0)
         last_hex = state.get('last_send_hex') or ''
+        last_enc = state.get('last_encrypted')
     # Always log B074 while enabled; highlight if shortly after our send.
     prefix = 'sau 7081' if watching else 'ngoài cửa sổ 3s'
     if opcode == 0xB074:
         note = _classify_b074(raw)
-        _log('S→C 0xB074 [%s] %s | last C→S UID=%d hex=%s'
-             % (prefix, note, last_uid, last_hex or '?'))
+        _log('S→C 0xB074 [%s] %s | last C→S UID=%d enc=%s hex=%s'
+             % (prefix, note, last_uid, last_enc, last_hex or '?'))
         if watching and raw == b'\x02\x00':
             set_status('B074 02 00 sau 7081 UID=%d — có vẻ NGẮT OK.' % last_uid)
         elif watching and raw[:2] == b'\x03\x00':
@@ -251,6 +338,7 @@ def handle_silkroad(opcode, data):
 try:
     read_self_uid()
     show_target_uid()
-    set_status('Nạp %s v%s — bật rồi thử Gửi 7081 self.' % (NAME, VERSION))
+    set_status('Nạp %s v%s — bật rồi thử Gửi 7081 self (True→False / event_loop).'
+               % (NAME, VERSION))
 except Exception:
     pass
