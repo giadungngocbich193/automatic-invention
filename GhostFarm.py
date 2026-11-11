@@ -2,6 +2,11 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.2: When AutoGhost already owns GetTickCount, reuse/adopt its NativeCut
+  thunk (same THUNK layout) instead of failing “Không xác minh được đích
+  GetTickCount”. close() on adopted hook only arms(0)+CloseHandle (does NOT
+  restore tick — AG still owns it). Hook-conflict errors back off 8s + clear
+  status telling user to unload AG Ghost if adopt fails.
 - v1.0.1: Fix event_loop Exception spam after Start (Self + Target monster).
   Root: except (…, ctypes.WinError) — WinError is not a catchable class; any
   NativeCut error became a second uncaught TypeError every tick. Wrap
@@ -41,7 +46,7 @@ import phBot as phbot_api
 from phBot import get_character_data, get_monsters, get_npcs, get_position, log
 
 NAME = 'GhostFarm'
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -82,6 +87,8 @@ MAX_RADIUS = 200.0
 SCAN_IDLE_SEC = 0.35
 RESEND_GAP_SEC = 0.75
 NO_TARGET_RETRY_SEC = 1.0
+# After GetTickCount / install conflict — do not re-spam NativeCut every 0.75s.
+HOOK_CONFLICT_BACKOFF_SEC = 8.0
 
 user32 = ctypes.WinDLL('user32') if sys.platform == 'win32' else None
 if user32:
@@ -139,9 +146,10 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 214)
 
 QtBind.createLabel(
     gui,
-    'Self = NativeCut self UID khi có quái/NPC trong bán kính (đã chứng minh B074 02 00). '
-    'Target monster = NativeCut UID quái/NPC gần nhất (ưu tiên 7045 nếu còn trong bán kính). '
-    'Không sửa AutoGhost — tránh chạy Ghost cut song song (chung GetTickCount).',
+    'Self = NativeCut self UID khi có quái/NPC trong bán kính. '
+    'Target monster = UID quái/NPC gần nhất (ưu tiên 7045). '
+    'v1.0.2: nếu AutoGhost đang giữ GetTickCount → GhostFarm reuse móc đó; '
+    'nếu không reuse được → tắt Ghost/PvP AG hoặc unload AutoGhost.',
     10, 246,
 )
 
@@ -250,8 +258,33 @@ def kernel_api():
     return api
 
 
+def _autoghost_hint():
+    """Best-effort: AutoGhost loaded in this phBot process?"""
+    for name in list(sys.modules):
+        low = str(name).casefold()
+        if 'autoghost' in low:
+            return True
+    return False
+
+
+def _hook_conflict_message(detail):
+    ag = ' (AutoGhost đang nạp)' if _autoghost_hint() else ''
+    return (
+        '%s%s. GhostFarm sẽ thử reuse móc NativeCut nếu cùng THUNK; '
+        'nếu vẫn lỗi: tắt Ghost/PvP AutoGhost hoặc unload AutoGhost rồi Start lại.'
+        % (detail, ag))
+
+
+def _is_hook_conflict_error(error):
+    text = str(error or '').casefold()
+    keys = (
+        'gettickcount', 'móc', 'nativecut', 'tick', 'thunk',
+        'không xác minh', 'đích gettickcount', 'qua một móc')
+    return any(key in text for key in keys)
+
+
 class NativeCut:
-    """Minimal AutoGhost / GhostNativeProbe NativeCut — install GetTickCount thunk, arm 7081."""
+    """Minimal AutoGhost / GhostNativeProbe NativeCut — install or reuse GetTickCount thunk."""
 
     def __init__(self, job):
         self.api = kernel_api()
@@ -262,6 +295,7 @@ class NativeCut:
             raise OSError('OpenProcess thất bại (Win32=%s).' % err)
         self.page = self.code = self.original = 0
         self.published = False
+        self.adopted = False  # True = reused AG/prior thunk; must NOT restore tick on close
         try:
             self.install(job)
         except Exception:
@@ -292,6 +326,83 @@ class NativeCut:
             raise OSError('Không đổi được quyền trang tại 0x%X.' % address)
         return old.value
 
+    def _mapped_module(self, address, path_buf):
+        """Return casefolded mapped module file name, or None if unmapped (thunk page)."""
+        if not self.api.K32GetMappedFileNameW(
+                self.handle, address, path_buf, len(path_buf)):
+            return None
+        try:
+            return PureWindowsPath(path_buf.value).name.casefold()
+        except Exception:
+            return None
+
+    def _expected_thunk(self, page):
+        return (THUNK
+                .replace(b'DCBa', struct.pack('<I', page))
+                .replace(b'DCBb', struct.pack('<I', page + 12)))
+
+    def _try_adopt_existing(self, job, code, tid, path_buf):
+        """Reuse AutoGhost / prior NativeCut thunk when TICK_SLOT already points at it."""
+        if not code or code < 4096:
+            return False
+        page = (code - 4096) & 0xffffffff
+        try:
+            header = self.read(page, 16)
+        except OSError:
+            return False
+        _state, _old_tid, _old_target, original = struct.unpack('<IIII', header)
+        mapped = self._mapped_module(original, path_buf)
+        if mapped not in ('kernel32.dll', 'kernelbase.dll'):
+            return False
+        expected = self._expected_thunk(page)
+        try:
+            actual = self.read(code, len(expected))
+        except OSError:
+            return False
+        if actual != expected:
+            return False
+        # Shared live hook — retarget UID, keep original GetTickCount pointer.
+        self.page = page
+        self.code = code
+        self.original = original
+        self.published = True
+        self.adopted = True
+        self.write(
+            self.page,
+            struct.pack('<IIII', 0, tid, int(job['target']) & 0xffffffff, original))
+        _log(
+            'NativeCut REUSE móc có sẵn · page=0x%X code=0x%X · UID=%d%s'
+            % (page, code, job['target'],
+               ' · AutoGhost đang nạp' if _autoghost_hint() else ''))
+        return True
+
+    def _install_fresh(self, job, tid, original):
+        self.original = original
+        self.adopted = False
+        self.page = self.api.VirtualAllocEx(
+            self.handle, None, 8192, 0x3000, 0x04) or 0
+        if not self.page or self.page + 8191 > 0xffffffff:
+            raise RuntimeError('Không cấp phát được vùng 32-bit cho lượt thử.')
+        self.code = self.page + 4096
+        thunk = self._expected_thunk(self.page)
+        self.write(
+            self.page,
+            struct.pack('<IIII', 0, tid, int(job['target']) & 0xffffffff, original))
+        self.write(self.code, thunk)
+        self.protect(self.code, 4096, 0x20)
+        if not self.api.FlushInstructionCache(self.handle, self.code, len(thunk)):
+            raise OSError('Không đồng bộ được mã thử với client.')
+        if self.read(TICK_SLOT, 4) != struct.pack('<I', original):
+            raise RuntimeError(
+                _hook_conflict_message(
+                    'GetTickCount vừa đổi trong khi chuẩn bị (plugin khác đang móc)'))
+        old = self.protect(TICK_SLOT, 4, 0x04)
+        try:
+            self.published = True
+            self.write(TICK_SLOT, struct.pack('<I', self.code))
+        finally:
+            self.protect(TICK_SLOT, 4, old)
+
     def install(self, job):
         if not user32:
             raise RuntimeError('Cần Windows + user32 (phBot Stable host).')
@@ -313,36 +424,23 @@ class NativeCut:
             if self.read(address, len(expected)) != expected:
                 raise RuntimeError(
                     'Mã client trong bộ nhớ khác bản đã đối chiếu tại 0x%X.' % address)
-        self.original = struct.unpack('<I', self.read(TICK_SLOT, 4))[0]
-        if not self.api.K32GetMappedFileNameW(
-                self.handle, self.original, path, len(path)):
-            raise RuntimeError('Không xác minh được đích GetTickCount.')
-        if PureWindowsPath(path.value).name.casefold() not in (
-                'kernel32.dll', 'kernelbase.dll'):
-            raise RuntimeError('GetTickCount đang qua một móc khác. Dừng thử.')
-        self.page = self.api.VirtualAllocEx(
-            self.handle, None, 8192, 0x3000, 0x04) or 0
-        if not self.page or self.page + 8191 > 0xffffffff:
-            raise RuntimeError('Không cấp phát được vùng 32-bit cho lượt thử.')
-        self.code = self.page + 4096
-        thunk = (THUNK
-                 .replace(b'DCBa', struct.pack('<I', self.page))
-                 .replace(b'DCBb', struct.pack('<I', self.page + 12)))
-        self.write(
-            self.page,
-            struct.pack('<IIII', 0, tid, job['target'], self.original))
-        self.write(self.code, thunk)
-        self.protect(self.code, 4096, 0x20)
-        if not self.api.FlushInstructionCache(self.handle, self.code, len(thunk)):
-            raise OSError('Không đồng bộ được mã thử với client.')
-        if self.read(TICK_SLOT, 4) != struct.pack('<I', self.original):
-            raise RuntimeError('GetTickCount vừa đổi trong khi chuẩn bị.')
-        old = self.protect(TICK_SLOT, 4, 0x04)
-        try:
-            self.published = True
-            self.write(TICK_SLOT, struct.pack('<I', self.code))
-        finally:
-            self.protect(TICK_SLOT, 4, old)
+
+        current = struct.unpack('<I', self.read(TICK_SLOT, 4))[0]
+        mapped = self._mapped_module(current, path)
+        if mapped in ('kernel32.dll', 'kernelbase.dll'):
+            self._install_fresh(job, tid, current)
+            return
+        # Slot already redirected (AutoGhost NativeCut / leftover Farm) — try reuse.
+        if self._try_adopt_existing(job, current, tid, path):
+            return
+        if mapped is None:
+            raise RuntimeError(
+                _hook_conflict_message(
+                    'Không xác minh được đích GetTickCount — slot đang trỏ vùng không-map '
+                    '(thường = AutoGhost NativeCut) nhưng không khớp THUNK GhostFarm'))
+        raise RuntimeError(
+            _hook_conflict_message(
+                'GetTickCount đang qua móc khác (%s)' % mapped))
 
     def arm(self, value):
         self.write(self.page, struct.pack('<I', value))
@@ -362,6 +460,14 @@ class NativeCut:
             exit_code = wintypes.DWORD()
             if (self.api.GetExitCodeProcess(self.handle, ctypes.byref(exit_code))
                     and exit_code.value != 259):
+                return
+            if self.adopted:
+                # Foreign/shared hook (usually AutoGhost) — disarm only; never restore tick.
+                try:
+                    if self.page:
+                        self.arm(0)
+                except Exception as error:
+                    _log('NativeCut adopt close disarm: %s' % error)
                 return
             if self.published:
                 try:
@@ -488,10 +594,18 @@ def get_or_create_session(uid):
             return session
     close_session('đổi UID/client — tạo NativeCut mới')
     bridge = NativeCut({'pid': key[0], 'window': key[1], 'target': key[2]})
-    session = {'key': key, 'bridge': bridge, 'verified': False}
+    session = {
+        'key': key,
+        'bridge': bridge,
+        'verified': False,
+        'adopted': bool(getattr(bridge, 'adopted', False)),
+    }
     with lock:
         state['session'] = session
-    _log('NativeCut install OK · PID=%d HWND=%s UID=%d' % (key[0], key[1], key[2]))
+    _log(
+        'NativeCut %s OK · PID=%d HWND=%s UID=%d'
+        % ('REUSE' if session['adopted'] else 'install',
+           key[0], key[1], key[2]))
     return session
 
 
@@ -891,16 +1005,22 @@ def _drive_native_queue(now):
         job['error'] = '%s: %s' % (type(error).__name__, error)
         _log_traceback('NativeCut drive TRACE', error)
         close_session(str(error))
+        backoff = (HOOK_CONFLICT_BACKOFF_SEC
+                   if _is_hook_conflict_error(error) else RESEND_GAP_SEC)
         with lock:
             if state['queue'] and state['queue'][0] is job:
                 state['queue'].pop(0)
             state['active'] = None
             state['fail_count'] = int(state.get('fail_count') or 0) + 1
-            state['next_scan_at'] = monotonic() + RESEND_GAP_SEC
+            state['next_scan_at'] = monotonic() + backoff
         set_stats()
+        tip = ''
+        if _is_hook_conflict_error(error):
+            tip = ' · backoff %gs — tắt Ghost AG hoặc unload AutoGhost nếu lặp lại' % (
+                HOOK_CONFLICT_BACKOFF_SEC)
         set_status(
-            'LỖI NativeCut %s UID=%d · %s'
-            % (_safe_text(job.get('label')), uid, job['error']))
+            'LỖI NativeCut %s UID=%d · %s%s'
+            % (_safe_text(job.get('label')), uid, job['error'], tip))
         return
 
 
