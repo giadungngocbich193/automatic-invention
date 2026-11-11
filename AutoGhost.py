@@ -2,6 +2,11 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX hostile filter đỏ/tím+job] List-select chỉ chữ đỏ/tím hoặc cờ nghề
+  đạo tặc↔bảo tiêu/hunter. Không AE_Sro must-attack, không ALT, không player 7045.
+- [FIX camp stand-still] Khi canh không mục tiêu: đứng im tại điểm bật (không
+  move_to trừ Chạy vòng bật, engage địch trong vùng đánh, hoặc quay về khi
+  tự ra ngoài vùng đánh lúc không engage).
 - [FIX widen scan 60m] Player early-scan uses Vùng quét (default 60m), not only
   Vùng đánh (~30–40m). Status reports scan-ring enemies before attack range.
 - [FIX never abort PvP in attack range] Keep casting while engaged player still
@@ -31,9 +36,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.58'
-# raw-main download stamp: 2026-11-11T06:05Z (UTF-8 no BOM/U+200B)
-# [FIX widen scan 60m] + [FIX never abort PvP in attack range] + [FIX no player 7045]
+VERSION = '1.8.59'
+# raw-main download stamp: 2026-11-11T06:25Z (UTF-8 no BOM/U+200B)
+# [FIX hostile filter đỏ/tím+job] + [FIX camp stand-still] + scan 60m + never-abort
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -3519,7 +3524,9 @@ def scan_auto_pk_evidence(runtime=None):
             center = runtime.get('scan_center', anchor)
             scan_radius = runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS)
         players = auto_pk_players()
-        player_id = (get_character_data() or {}).get('player_id')
+        character = get_character_data() or {}
+        player_id = character.get('player_id')
+        monsters = get_monsters() if callable(get_monsters) else None
         now = monotonic()
         rows = []
         for uid, player in (players or {}).items():
@@ -3531,29 +3538,34 @@ def scan_auto_pk_evidence(runtime=None):
             attack_distance = auto_pk_target_distance(player, anchor, runtime)
             unavailable = (auto_pk_target_unavailable(runtime, int(uid), player, now)
                            if runtime is not None and str(uid).isdigit() else None)
+            label, hostile = auto_pk_hostility_label(player, character, uid=int(uid) if str(uid).isdigit() else None,
+                                                    monsters=monsters)
             rows.append(dict(uid=str(uid), name=player.get('name','?'), distance_m=scan_distance,
-                             dead=player.get('dead'), unavailable=unavailable,
+                             dead=player.get('dead'), unavailable=unavailable, hostile=hostile,
+                             hostility=label,
                              in_attack_range=attack_distance is not None and attack_distance <= radius))
-        rows.sort(key=lambda row: row['distance_m'])
+        rows.sort(key=lambda row: (not row['hostile'], row['distance_m']))
         for i, field in enumerate(auto_pk_result_fields):
             row = rows[i] if i<len(rows) else None
-            text = ('%s | UID=%s | %.1f m từ tâm quét | %s' %
-                    (row['name'], row['uid'], row['distance_m'],
+            text = ('%s | UID=%s | %.1f m | %s | %s' %
+                    (row['name'], row['uid'], row['distance_m'], row['hostility'],
                      'đã chết' if row['dead'] else row['unavailable'] or
-                     ('trong vùng đánh' if row['in_attack_range'] else 'chỉ báo'))) if row else ''
+                     ('trong vùng đánh' if row['in_attack_range'] else 'vùng quét'))) if row else ''
             QtBind.setText(gui, field, text)
-        outside = sum(not row['in_attack_range'] for row in rows)
-        message = ('[FIX widen scan 60m] Quét %g m · vùng đánh %g m · %d người · %d ngoài vùng đánh.' %
-                   (scan_radius, radius, len(rows), outside))
+        hostiles = [row for row in rows if row['hostile'] and not row['dead']]
+        outside = sum(not row['in_attack_range'] for row in hostiles)
+        message = ('[FIX hostile filter đỏ/tím+job] Quét %g m · đánh %g m · %d địch / %d thấy.' %
+                   (scan_radius, radius, len(hostiles), len(rows)))
         if not players:
             message += ' Chưa có UID từ phBot (giới hạn client/get_players).'
-        elif rows:
-            # Early report: list nearby players ASAP so Target can engage when they enter.
-            nearest = rows[0]
+        elif hostiles:
+            nearest = hostiles[0]
             if nearest.get('in_attack_range'):
                 message += ' Sẵn sàng Target/Ghost.'
             else:
                 message += ' Địch trong vùng quét · sẵn sàng Target khi vào vùng đánh.'
+        elif rows:
+            message += ' Không có đỏ/tím/job địch trong tầm.'
         QtBind.setText(gui, auto_pk_scan_field, message)
         return {'players': rows}
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as error:
@@ -3696,6 +3708,277 @@ def auto_pk_players():
     except (RuntimeError, OSError):
         return None
     return players if isinstance(players, dict) else None
+
+
+# --- [FIX hostile filter đỏ/tím+job] (1.8.45 style; NO *AE_Sro must-attack, NO ALT) ---
+_HOSTILE_COLOR_KEYS = (
+    'color', 'name_color', 'namecolor', 'colour', 'player_color', 'NameColor',
+    'nameColor', 'Name_Color', 'text_color', 'font_color',
+)
+_HOSTILE_COLOR_WORDS = {
+    'red', 'đỏ', 'do', 'scarlet', 'crimson',
+    'purple', 'tím', 'tim', 'violet', 'magenta', 'fuchsia',
+    'hostile', 'enemy', 'pk', 'war',
+}
+_HOSTILE_COLOR_ENUMS = {3, 4, 5, 6, 7, 8, 9}
+_JOB_FIELD_KEYS = (
+    'job_type', 'jobtype', 'JobType', 'job', 'job_id', 'jobId', 'job_mode',
+    'jobMode', 'job_flag', 'jobflag', 'profession', 'role', 'title', 'job_name',
+    'jobName', 'job_title', 'jobTitle',
+)
+_JOB_THIEF_WORDS = {
+    'thief', 'bandit', 'robber', 'đạo tặc', 'dao tac', 'đạotặc', 'daotac', 'tặc',
+    'cướp', 'cuop', 'cướp chuyên nghiệp', 'cuop chuyen nghiep', 'cướpchuyênnghiệp',
+}
+_JOB_ESCORT_WORDS = {
+    'trader', 'hunter', 'trade', 'merchant', 'caravan',
+    'bảo tiêu', 'bao tieu', 'bảotiêu', 'baotieu',
+    'thương nhân', 'thuong nhan', 'thợ săn', 'tho san',
+    'tiêu thương', 'tieu thuong',
+}
+_JOB_THIEF_ENUMS = {2, 4}
+_JOB_ESCORT_ENUMS = {1, 3}
+
+
+def _auto_pk_color_rgb(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        if value < 0:
+            return None
+        if value <= 0xffffff:
+            return (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff
+        if value <= 0xffffffff:
+            return (value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff
+        return None
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        try:
+            return int(value[0]) & 0xff, int(value[1]) & 0xff, int(value[2]) & 0xff
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, dict):
+        try:
+            if all(k in value for k in ('r', 'g', 'b')):
+                return int(value['r']) & 0xff, int(value['g']) & 0xff, int(value['b']) & 0xff
+            if all(k in value for k in ('R', 'G', 'B')):
+                return int(value['R']) & 0xff, int(value['G']) & 0xff, int(value['B']) & 0xff
+        except (TypeError, ValueError, KeyError):
+            return None
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if text.startswith('#') and len(text) in (4, 7):
+            raw = text[1:]
+            if len(raw) == 3:
+                raw = ''.join(ch * 2 for ch in raw)
+            try:
+                number = int(raw, 16)
+                return (number >> 16) & 0xff, (number >> 8) & 0xff, number & 0xff
+            except ValueError:
+                return None
+        if text.startswith('0x'):
+            try:
+                return _auto_pk_color_rgb(int(text, 16))
+            except ValueError:
+                return None
+        if text.isdigit():
+            try:
+                return _auto_pk_color_rgb(int(text))
+            except ValueError:
+                return None
+    return None
+
+
+def auto_pk_player_color_value(player):
+    if not isinstance(player, dict):
+        return None
+    for key in _HOSTILE_COLOR_KEYS:
+        if key in player and player[key] is not None and player[key] != '':
+            return player[key]
+    return None
+
+
+def auto_pk_hostile_name_color(player):
+    """True=đỏ/tím địch, False=không thù, None=không có field màu (ẩn)."""
+    value = auto_pk_player_color_value(player)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = int(value)
+        if number in _HOSTILE_COLOR_ENUMS:
+            return True
+        if number in (0, 1, 2):
+            return False
+    if isinstance(value, str):
+        text = value.strip().casefold()
+        if not text:
+            return None
+        if text in _HOSTILE_COLOR_WORDS or any(word in text for word in _HOSTILE_COLOR_WORDS):
+            return True
+        if text in ('white', 'blue', 'green', 'yellow', 'gray', 'grey', 'black',
+                    'ally', 'party', 'guild', 'neutral', 'trắng', 'xanh', 'vàng'):
+            return False
+    rgb = _auto_pk_color_rgb(value)
+    if rgb is None:
+        return None
+    red, green, blue = rgb
+    if red >= 200 and green >= 200 and blue >= 200:
+        return False
+    if abs(red - green) <= 25 and abs(green - blue) <= 25 and abs(red - blue) <= 25:
+        return False
+    if red >= 150 and red >= green + 40 and red >= blue + 40:
+        return True
+    if red >= 110 and blue >= 110 and green <= min(red, blue) - 25:
+        return True
+    return False
+
+
+def auto_pk_job_raw(entity):
+    if not isinstance(entity, dict):
+        return None
+    for key in _JOB_FIELD_KEYS:
+        if key in entity and entity[key] is not None and entity[key] != '':
+            return entity[key]
+    return None
+
+
+def _auto_pk_job_side_from_text(text):
+    text = (text or '').strip().casefold()
+    if not text or text in ('0', 'none', 'no', 'off', 'false', '-'):
+        return None
+    # Never treat *AE_Sro / bare display tags as a job side.
+    if 'ae_sro' in text.replace('*', '').replace('[', '').replace(']', ''):
+        return None
+    if text in _JOB_THIEF_WORDS or any(word in text for word in _JOB_THIEF_WORDS):
+        return 'thief'
+    if text in _JOB_ESCORT_WORDS or any(word in text for word in _JOB_ESCORT_WORDS):
+        return 'escort'
+    return None
+
+
+def auto_pk_job_side(entity):
+    """Return 'thief', 'escort' (trader/hunter), or None."""
+    value = auto_pk_job_raw(entity)
+    if value is None or value is False:
+        value = None
+    elif isinstance(value, bool):
+        value = None
+    elif isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, int):
+        if value in _JOB_THIEF_ENUMS:
+            return 'thief'
+        if value in _JOB_ESCORT_ENUMS:
+            return 'escort'
+        value = None
+    elif value is not None:
+        text = str(value).strip().casefold()
+        if text.isdigit():
+            return auto_pk_job_side({'job_type': int(text)})
+        side = _auto_pk_job_side_from_text(text)
+        if side:
+            return side
+    # Only known job title fields — do not scan every string (avoids AE_Sro FPs).
+    if isinstance(entity, dict):
+        for key in ('title', 'job_name', 'jobName', 'job_title', 'jobTitle', 'desc', 'description'):
+            entry = entity.get(key)
+            if isinstance(entry, str):
+                side = _auto_pk_job_side_from_text(entry)
+                if side:
+                    return side
+    return None
+
+
+def auto_pk_job_flag_hostile(self_entity, other_entity):
+    """True when both wear job flags and are thief vs trader/hunter."""
+    mine = auto_pk_job_side(self_entity)
+    theirs = auto_pk_job_side(other_entity)
+    if not mine or not theirs:
+        return False
+    return mine != theirs and {mine, theirs} == {'thief', 'escort'}
+
+
+def auto_pk_dual_listed(uid, monsters=None):
+    """Scarf / opposing-faction players are often also in get_monsters()."""
+    if monsters is None:
+        monsters = get_monsters()
+    if not isinstance(monsters, dict):
+        return False
+    try:
+        return uid in monsters or str(uid) in monsters or int(uid) in monsters
+    except (TypeError, ValueError):
+        return uid in monsters or str(uid) in monsters
+
+
+def auto_pk_monster_entry(uid, monsters=None):
+    if monsters is None:
+        monsters = get_monsters()
+    if not isinstance(monsters, dict):
+        return None
+    if uid in monsters and isinstance(monsters[uid], dict):
+        return monsters[uid]
+    text = str(uid)
+    if text in monsters and isinstance(monsters[text], dict):
+        return monsters[text]
+    try:
+        number = int(uid)
+    except (TypeError, ValueError):
+        return None
+    entry = monsters.get(number)
+    return entry if isinstance(entry, dict) else None
+
+
+def auto_pk_player_view(player, uid=None, monsters=None):
+    """Merge dual-listed monster job/color cues under the player entry."""
+    if not isinstance(player, dict):
+        return {}
+    entry = auto_pk_monster_entry(uid, monsters) if uid is not None else None
+    if not entry:
+        return player
+    merged = dict(entry)
+    merged.update(player)
+    return merged
+
+
+def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid=None,
+                                monsters=None):
+    """List-select hostile: đỏ/tím OR job đạo tặc↔bảo tiêu; optional dual-list if màu ẩn.
+
+    Does NOT auto-attack on *AE_Sro / job-display-name alone. No ALT.
+    """
+    self_entity = get_character_data() or {} if character is None else character
+    view = auto_pk_player_view(player, uid, monsters)
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return True
+    verdict = auto_pk_hostile_name_color(view)
+    if verdict is True:
+        return True
+    if verdict is False:
+        return False
+    # Color hidden: dual-list (khăn/phe địch) only — not display-name tags.
+    if uid is not None and auto_pk_dual_listed(uid, monsters):
+        return True
+    if require_color:
+        return False
+    return False
+
+
+def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
+    view = auto_pk_player_view(player, uid, monsters)
+    self_entity = character or get_character_data() or {}
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return 'địch cờ nghề', True
+    color = auto_pk_hostile_name_color(view)
+    if color is True:
+        return 'chữ đỏ/tím', True
+    if color is False:
+        return 'không thù địch', False
+    if uid is not None and auto_pk_dual_listed(uid, monsters):
+        return 'địch (dual-list/khăn)', True
+    return 'bỏ qua', False
 
 
 def auto_pk_distance(target, anchor):
@@ -3870,14 +4153,11 @@ def auto_pk_patrol_changed(checked):
 
 
 def stop_auto_pk_patrol(runtime):
-    if not runtime or not runtime.pop('patrol_destination', None) or get_status():
+    # [FIX camp stand-still] Clear patrol state only — do NOT move_to (was nudging camp).
+    if not runtime:
         return
-    try:
-        position = current_auto_pk_anchor()
-        if position['region'] == runtime['anchor']['region']:
-            phbot_api.move_to(position['x'], position['y'], position['z'])
-    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-        report('Auto PK không hủy được bước chạy vòng: %s' % error)
+    runtime.pop('patrol_destination', None)
+    runtime.pop('patrol_attempts', None)
 
 
 def tick_auto_pk_patrol(runtime, position, now):
@@ -4242,10 +4522,12 @@ def auto_pk_select(character, runtime, now, from_event=False):
             return
         if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
             return
-        if not tick_auto_pk_patrol(runtime, position, now):
-            QtBind.setText(gui, auto_pk_status_label,
-                           'phBot chưa trả Player list · gán Target Enemy cho địch'
-                           + (' · Đánh quái đang bật.' if farming else '.'))
+        if tick_auto_pk_patrol(runtime, position, now):
+            return
+        # [FIX camp stand-still]
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX camp stand-still] Đứng canh im · thiếu Player list · gán Target Enemy'
+                       + (' · Đánh quái đang bật.' if farming else '.'))
         return
     runtime['retired'] = {uid: until for uid, until in runtime['retired'].items() if until > now}
     # [FIX widen scan 60m] Detect in Vùng quét; Ghost-lock only in Vùng đánh.
@@ -4255,6 +4537,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
         scan_radius = attack_radius
     best_attack = None
     best_scan = None
+    monsters = get_monsters() if callable(get_monsters) else None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
     for raw_uid, target in players.items():
         try:
@@ -4267,6 +4550,10 @@ def auto_pk_select(character, runtime, now, from_event=False):
                 or not isinstance(target, dict)):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
+            continue
+        # [FIX hostile filter đỏ/tím+job] Skip non-hostile list entries (no AE_Sro).
+        if not auto_pk_is_hostile_opponent(target, character, require_color=True,
+                                           uid=uid, monsters=monsters):
             continue
         anchor_distance = auto_pk_scan_distance(target, anchor)
         if anchor_distance is None or anchor_distance > scan_radius:
@@ -4281,7 +4568,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
         elif best_scan is None or candidate < best_scan:
             best_scan = candidate
     if best_attack is None and best_scan is not None:
-        # Early ring: enemy visible in scan, not yet in attack — ready Target only.
+        # Early ring: hostile in scan, not yet in attack — ready Target only.
         stop_auto_pk_patrol(runtime)
         distance, uid, anchor_distance = best_scan
         QtBind.setText(gui, auto_pk_status_label,
@@ -4295,14 +4582,20 @@ def auto_pk_select(character, runtime, now, from_event=False):
         # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
         if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        # Opponent hunt: Target path only (separate from farm).
-        if auto_pk_try_native_enemy_key(runtime, client, now, 'không thấy UID trong Player list'):
+        # No list hostile: Target Enemy still for màu ẩn; then stand still unless Chạy vòng.
+        if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
+                runtime, client, now, 'không thấy đỏ/tím/job địch trong Player list'):
+            if native_expired:
+                runtime['native_misses'] = runtime.get('native_misses', 0) + 1
             return
-        if not tick_auto_pk_patrol(runtime, position, now):
-            QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh đánh %.0f m · quét %.0f m · chờ địch.'
-                           % (attack_radius, scan_radius))
+        if tick_auto_pk_patrol(runtime, position, now):
+            return
+        # [FIX camp stand-still] Idle camp — no move_to.
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX camp stand-still] Đứng canh im · đánh %.0f m · quét %.0f m · chờ đỏ/tím/job địch.'
+                       % (attack_radius, scan_radius))
         return
+    runtime['native_misses'] = 0
     # Opponent in attack radius → drop mob (if any) and Ghost via Target (no player 7045).
     auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
@@ -4461,8 +4754,8 @@ def request_auto_pk_arm():
         show_auto_pk_anchor()
         farm_on = bool(options.get('mob_farm'))
         scan_m = float(options.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
-        message = ('[FIX widen scan 60m] Đã bật vùng đánh %.0f m · vùng quét %.0f m · nhóm %s · '
-                   'buff khi rảnh.' % (radius, scan_m, page))
+        message = ('[FIX hostile filter đỏ/tím+job] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
+                   'đứng canh im · chỉ đỏ/tím/job địch.' % (radius, scan_m, page))
         message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
         if options.get('buffs_enabled') and options.get('buff_ids'):
             message += ' Đang gửi Skill buff…'
@@ -4594,8 +4887,9 @@ def tick_auto_pk(from_event=False):
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
-        # [FIX never abort PvP in attack range] Idle wander only. Engaged player → never camp return here.
-        if distance > runtime['radius'] and not engaged_uid:
+        # [FIX never abort PvP in attack range] + [FIX camp stand-still]
+        # Hysteresis 1.5 m so tiny coord noise does not quay về liên tục.
+        if distance > runtime['radius'] + 1.5 and not engaged_uid:
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
