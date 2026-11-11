@@ -2,6 +2,10 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.5: Skill field `80031=1;66007=20;54016=0` = skillId=ms delay before
+  NativeCut self. Per-skill Ghost timing. If monster dies after SELECT/cast,
+  still wait ms then Ghost self (do not ValueError-skip interrupt). Soft-skip
+  only when no living target at SELECT time.
 - v1.0.4: Combat cycle — EVERY loop: (1) 7045 select living monster in radius
   FIRST (log), (2) cast attack skill 7074 on that UID (skill IDs UI),
   (3) NativeCut self interrupt while casting. Never Ghost without a living
@@ -57,7 +61,7 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -99,7 +103,7 @@ SCAN_IDLE_SEC = 0.35
 RESEND_GAP_SEC = 0.75
 NO_TARGET_RETRY_SEC = 1.0
 SELECT_WAIT_SEC = 0.25  # after 7045 before skill cast
-CAST_WAIT_SEC = 0.30    # cast window before NativeCut self interrupt
+DEFAULT_GHOST_DELAY_MS = 0  # used when skill has no =ms (bare id)
 # After GetTickCount / install conflict — do not re-spam NativeCut every 0.75s.
 HOOK_CONFLICT_BACKOFF_SEC = 8.0
 
@@ -164,9 +168,9 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 236)
 
 QtBind.createLabel(
     gui,
-    'Mỗi vòng: 7045 chọn quái sống trong bán kính → 7074 skill ID lên quái → '
-    'NativeCut self ngắt khi đang cast. Không có mục tiêu = không Ghost. '
-    'Skill IDs ví dụ: 3048,3050 (cách nhau bằng dấu phẩy).',
+    'Mỗi vòng: 7045 chọn quái → 7074 skill → đợi ms → NativeCut self. '
+    'Skill IDs: 80031=1;66007=20;54016=0;81019=15 (skillId=ms trước Ghost). '
+    'Quái chết giữa cast: vẫn Ghost self sau ms. Chỉ bỏ vòng nếu SELECT không có mục tiêu.',
     10, 268,
 )
 
@@ -581,57 +585,85 @@ def read_radius():
     return radius
 
 
-def read_skill_ids():
-    """Parse Skill IDs (F1) field — comma/semicolon/space separated."""
+def read_skill_entries():
+    """Parse Skill IDs field as [(skill_id, ghost_delay_ms), ...].
+
+    Formats:
+      80031=1;66007=20;54016=0;81019=15
+      80031=1,66007=20
+      3048,3050          → delay DEFAULT_GHOST_DELAY_MS
+    """
     raw = (QtBind.text(gui, skill_field) or '').strip()
     if not raw:
         return []
-    for sep in (';', '|', ' '):
-        raw = raw.replace(sep, ',')
-    ids = []
+    for sep in (',', '|', ' '):
+        raw = raw.replace(sep, ';')
+    entries = []
     seen = set()
-    for part in raw.split(','):
+    for part in raw.split(';'):
         part = part.strip()
         if not part:
             continue
-        try:
-            skill_id = int(part)
-        except ValueError:
-            continue
+        delay_ms = DEFAULT_GHOST_DELAY_MS
+        if '=' in part:
+            left, right = part.split('=', 1)
+            left = left.strip()
+            right = right.strip()
+            try:
+                skill_id = int(left)
+            except ValueError:
+                continue
+            try:
+                delay_ms = int(float(right))
+            except ValueError:
+                delay_ms = DEFAULT_GHOST_DELAY_MS
+        else:
+            try:
+                skill_id = int(part)
+            except ValueError:
+                continue
         if skill_id <= 0 or skill_id in seen:
             continue
+        if delay_ms < 0:
+            delay_ms = 0
+        if delay_ms > 10000:
+            delay_ms = 10000
         seen.add(skill_id)
-        ids.append(skill_id)
-    return ids
+        entries.append((skill_id, delay_ms))
+    return entries
+
+
+def read_skill_ids():
+    """Skill id list only (compat for Start checks / status)."""
+    return [skill_id for skill_id, _delay in read_skill_entries()]
 
 
 def next_attack_skill():
-    """Rotate through configured skill IDs; skip can_cast=False when known."""
-    ids = read_skill_ids()
-    if not ids:
-        return 0
+    """Rotate skills; return (skill_id, ghost_delay_ms) or (0, 0)."""
+    entries = read_skill_entries()
+    if not entries:
+        return 0, 0
     skills = {}
     try:
         skills = get_skills() or {}
     except Exception:
         skills = {}
     with lock:
-        start = int(state.get('skill_index') or 0) % len(ids)
-    for offset in range(len(ids)):
-        skill_id = ids[(start + offset) % len(ids)]
+        start = int(state.get('skill_index') or 0) % len(entries)
+    for offset in range(len(entries)):
+        skill_id, delay_ms = entries[(start + offset) % len(entries)]
         data = skills.get(skill_id) or skills.get(str(skill_id))
         if isinstance(data, dict) and data.get('can_cast') is False:
             continue
         with lock:
-            state['skill_index'] = (start + offset + 1) % len(ids)
+            state['skill_index'] = (start + offset + 1) % len(entries)
             state['last_cast_skill'] = skill_id
-        return skill_id
-    # All on cooldown / blocked — still fire first so combat continues.
-    skill_id = ids[start]
+        return skill_id, delay_ms
+    skill_id, delay_ms = entries[start]
     with lock:
-        state['skill_index'] = (start + 1) % len(ids)
+        state['skill_index'] = (start + 1) % len(entries)
         state['last_cast_skill'] = skill_id
-    return skill_id
+    return skill_id, delay_ms
 
 
 def close_session(reason=None):
@@ -806,15 +838,16 @@ def pick_farm_job(rows):
     monster = _pick_monster_row(rows)
     if monster is None:
         return None
-    skill_id = next_attack_skill()
+    skill_id, delay_ms = next_attack_skill()
     if not skill_id:
         return None
     mode = current_mode()
     return {
         'ghost_uid': self_uid,
         'select_uid': int(monster['uid']),
-        'need_select': True,  # always — no target ⇒ no Ghost
+        'need_select': True,  # always — no target at SELECT ⇒ soft-skip
         'skill_id': int(skill_id),
+        'ghost_delay_ms': int(delay_ms),
         'label': monster['name'],
         'kind': monster['kind'],
         'monster_uid': int(monster['uid']),
@@ -830,8 +863,9 @@ def pick_ghost_target(rows):
         return None
     return (
         job['ghost_uid'],
-        '7045#%d→7074#%d→Ghost self' % (
-            job['monster_uid'], job.get('skill_id') or 0),
+        '7045#%d→7074#%d=%dms→Ghost self' % (
+            job['monster_uid'], job.get('skill_id') or 0,
+            job.get('ghost_delay_ms') or 0),
         _safe_text(job.get('kind') or 'monster'),
     )
 
@@ -888,9 +922,10 @@ def btn_start():
     if not self_uid:
         set_status('Chưa có Self UID — vào game rồi Làm mới.')
         return
-    skill_ids = read_skill_ids()
-    if not skill_ids:
-        set_status('Thiếu Skill IDs (F1) — nhập ID skill đánh, ví dụ 3048,3050.')
+    entries = read_skill_entries()
+    if not entries:
+        set_status(
+            'Thiếu Skill IDs — ví dụ 80031=1;66007=20;54016=0 (skillId=ms Ghost).')
         return
     show_client()
     with lock:
@@ -899,9 +934,10 @@ def btn_start():
         state['queue'] = []
         state['active'] = None
         state['skill_index'] = 0
+    preview = ';'.join('%d=%d' % pair for pair in entries[:6])
     set_status(
-        'START farm · r=%gm · skills=%s — mỗi vòng: 7045→7074→Ghost self'
-        % (read_radius(), ','.join(str(s) for s in skill_ids[:8])))
+        'START farm · r=%gm · %s — 7045→7074→đợi ms→Ghost self'
+        % (read_radius(), preview))
 
 
 def btn_stop():
@@ -926,6 +962,7 @@ def queue_native(farm_job):
         ghost_uid = int(farm_job.get('ghost_uid') or 0)
         select_uid = int(farm_job.get('select_uid') or farm_job.get('monster_uid') or 0)
         skill_id = int(farm_job.get('skill_id') or 0)
+        delay_ms = int(farm_job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
     except (TypeError, ValueError):
         set_status('UID/skill không hợp lệ.')
         return False
@@ -938,6 +975,8 @@ def queue_native(farm_job):
     if skill_id <= 0:
         set_status('Thiếu skill ID — không cast / không Ghost.')
         return False
+    if delay_ms < 0:
+        delay_ms = 0
     label = _safe_text(farm_job.get('label') or 'monster')
     kind = _safe_text(farm_job.get('kind') or '?')
     job = {
@@ -946,6 +985,7 @@ def queue_native(farm_job):
         'need_select': True,
         'monster_uid': select_uid,
         'skill_id': skill_id,
+        'ghost_delay_ms': delay_ms,
         'label': label,
         'kind': kind,
         'mode': farm_job.get('mode') or current_mode(),
@@ -973,12 +1013,25 @@ def queue_native(farm_job):
         state['active'] = job
     show_pick(
         ghost_uid,
-        '7045#%d→skill%d→Ghost self · %s' % (select_uid, skill_id, label),
+        '7045#%d→skill%d=%dms→Ghost self · %s'
+        % (select_uid, skill_id, delay_ms, label),
         kind)
     set_status(
-        'Xếp combat · target=%d · skill=%d · rồi Ghost self=%d'
-        % (select_uid, skill_id, ghost_uid))
+        'Xếp combat · target=%d · skill=%d · Ghost sau %dms · self=%d'
+        % (select_uid, skill_id, delay_ms, ghost_uid))
     return True
+
+
+def _soft_skip_job(job, note):
+    """Drop current cycle without fail TRACE — used when SELECT has no target."""
+    with lock:
+        if state['queue'] and state['queue'][0] is job:
+            state['queue'].pop(0)
+        if state.get('active') is job:
+            state['active'] = None
+        state['next_scan_at'] = monotonic() + NO_TARGET_RETRY_SEC
+    set_status(note)
+    _log('SOFT-SKIP: %s' % note)
 
 
 def _classify_b074(data):
@@ -1061,13 +1114,16 @@ def _drive_native_queue(now):
         if phase == 'select':
             select_uid = int(job.get('select_uid') or job.get('monster_uid') or 0)
             if select_uid <= 0:
-                raise ValueError('không có mục tiêu quái — không Ghost.')
-            # Living monster MUST still be in radius — never Ghost without target.
+                _soft_skip_job(job, 'SELECT: không có UID quái — bỏ vòng (không Ghost).')
+                return
+            # Soft-skip ONLY here if target not alive in radius.
             rows = scan_nearby(read_radius())
             if not any(row['uid'] == select_uid for row in rows):
-                raise ValueError(
-                    'quái/NPC UID=%d không còn trong bán kính — không Ghost.'
+                _soft_skip_job(
+                    job,
+                    'SELECT: quái #%d không còn trong bán kính — bỏ vòng.'
                     % select_uid)
+                return
             packet = _pack_uid(select_uid)
             try:
                 api = inject_joymax(0x7045, packet, False)
@@ -1094,9 +1150,10 @@ def _drive_native_queue(now):
             if (job.get('select_observed')
                     or now >= float(job.get('select_deadline') or 0)):
                 _log(
-                    '7045 select UID=%d · observed=%s → cast 7074 skill=%d'
+                    '7045 select UID=%d · observed=%s → cast 7074 skill=%d delay=%dms'
                     % (select_uid, bool(job.get('select_observed')),
-                       int(job.get('skill_id') or 0)))
+                       int(job.get('skill_id') or 0),
+                       int(job.get('ghost_delay_ms') or 0)))
                 job['phase'] = 'cast'
                 job['next_at'] = now
                 return
@@ -1106,12 +1163,24 @@ def _drive_native_queue(now):
         if phase == 'cast':
             select_uid = int(job.get('select_uid') or job.get('monster_uid') or 0)
             skill_id = int(job.get('skill_id') or 0)
-            if select_uid <= 0 or skill_id <= 0:
-                raise ValueError('thiếu target/skill — không Ghost.')
+            delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
+            if skill_id <= 0:
+                raise ValueError('thiếu skill — không cast/Ghost.')
             rows = scan_nearby(read_radius())
-            if not any(row['uid'] == select_uid for row in rows):
-                raise ValueError(
-                    'mất mục tiêu UID=%d trước khi cast — không Ghost.' % select_uid)
+            alive = select_uid > 0 and any(row['uid'] == select_uid for row in rows)
+            if not alive:
+                # Monster died after SELECT — still wait ms then Ghost self.
+                _log(
+                    'CAST: quái #%d đã chết/mất — bỏ 7074, vẫn đợi %dms rồi Ghost self=%d'
+                    % (select_uid, delay_ms, uid))
+                job['cast_sent'] = True
+                job['cast_api'] = 'skipped_dead_target'
+                job['phase'] = 'cast_wait'
+                job['cast_deadline'] = now + (delay_ms / 1000.0)
+                job['next_at'] = now + 0.05
+                set_status(
+                    'Quái #%d chết — vẫn Ghost self sau %dms' % (select_uid, delay_ms))
+                return
             # AG attack packet: 01 04 <skill> 01 <target>
             packet = struct.pack('<BBIBI', 1, 4, skill_id, 1, select_uid)
             try:
@@ -1121,25 +1190,27 @@ def _drive_native_queue(now):
             job['cast_sent'] = True
             job['cast_api'] = api
             _log(
-                'C→S 0x7074 CAST · skill=%d · target UID=%d · hex=%s · API=%r'
-                % (skill_id, select_uid, _hex_bytes(packet), api))
+                'C→S 0x7074 CAST · skill=%d · target UID=%d · delay=%dms · hex=%s · API=%r'
+                % (skill_id, select_uid, delay_ms, _hex_bytes(packet), api))
             if api is False:
-                raise RuntimeError(
-                    'phBot từ chối 7074 skill=%d target=%d — không Ghost.'
-                    % (skill_id, select_uid))
+                # Still interrupt after delay — combat may have started client-side.
+                _log(
+                    '7074 API=False skill=%d target=%d — vẫn đợi %dms rồi Ghost self'
+                    % (skill_id, select_uid, delay_ms))
             job['phase'] = 'cast_wait'
-            job['cast_deadline'] = now + CAST_WAIT_SEC
+            job['cast_deadline'] = now + (delay_ms / 1000.0)
             job['next_at'] = now + 0.05
             set_status(
-                'Đã cast skill %d lên #%d — NativeCut self khi đang cast'
-                % (skill_id, select_uid))
+                'Cast skill %d lên #%d — Ghost self sau %dms'
+                % (skill_id, select_uid, delay_ms))
             return
 
         if phase == 'cast_wait':
             if now >= float(job.get('cast_deadline') or 0):
+                delay_ms = int(job.get('ghost_delay_ms') or 0)
                 _log(
-                    'cast window xong · skill=%d target=%d → NativeCut self=%d'
-                    % (int(job.get('skill_id') or 0),
+                    'delay %dms xong · skill=%d target=%d → NativeCut self=%d'
+                    % (delay_ms, int(job.get('skill_id') or 0),
                        int(job.get('select_uid') or 0), uid))
                 job['phase'] = 'ensure'
                 job['next_at'] = now
@@ -1148,15 +1219,17 @@ def _drive_native_queue(now):
             return
 
         if phase == 'ensure':
-            # Gate: only Ghost while the selected living monster remains in radius.
-            rows = scan_nearby(read_radius())
-            select_uid = int(job.get('select_uid') or job.get('monster_uid') or 0)
-            if not select_uid or not any(row['uid'] == select_uid for row in rows):
-                raise ValueError(
-                    'không còn mục tiêu sống trong bán kính — không Ghost.')
+            # Ghost is self-UID interrupt — dead monster must NOT block this.
             if not job.get('select_sent') or not job.get('cast_sent'):
                 raise ValueError(
-                    'chưa 7045+7074 — từ chối Ghost không combat.')
+                    'chưa 7045+cast phase — từ chối Ghost không combat.')
+            select_uid = int(job.get('select_uid') or 0)
+            rows = scan_nearby(read_radius())
+            alive = select_uid > 0 and any(row['uid'] == select_uid for row in rows)
+            if not alive:
+                _log(
+                    'ENSURE: quái #%d đã chết — vẫn NativeCut self=%d (interrupt)'
+                    % (select_uid, uid))
             session = get_or_create_session(uid)
             if session['verified']:
                 job['phase'] = 'arm'
@@ -1408,7 +1481,7 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — nhập Skill IDs; mỗi vòng 7045→7074→Ghost self.'
+        'Nạp %s v%s — Skill IDs dạng 80031=1;66007=20 (ms trước Ghost).'
         % (NAME, VERSION))
 except Exception as error:
     try:

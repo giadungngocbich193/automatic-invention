@@ -1,27 +1,26 @@
-# GhostFarm v1.0.4
+# GhostFarm v1.0.5
 
-Standalone phBot farm: **select → cast → Ghost interrupt**. Does **not** modify AutoGhost / PartyLeader.
+Standalone phBot farm: **7045 select → 7074 cast → wait ms → NativeCut self**.
 
-## Combat loop (every cycle)
+## Skill IDs (per-skill Ghost delay)
 
-1. **7045** select a living monster/NPC in radius (logged) — **required**
-2. **7074** cast attack skill ID on that UID (`01 04 <skill> 01 <target>`)
-3. **NativeCut self** interrupt while casting (proven `B074 02 00`)
+```text
+80031=1;66007=20;54016=0;81019=15
+```
 
-**Never Ghost** if there is no living in-range target, no Self UID, or no Skill IDs.
+`skillId=ms` = milliseconds to wait after cast before NativeCut self interrupt.
+Bare ids (`3048,3050`) use delay `0`.
 
-## UI
+## Loop
 
-| Control | Action |
-|---------|--------|
-| Bán kính (m) | Scan radius (default 50) |
-| Skill IDs (F1) | Comma-separated skill IDs, e.g. `3048,3050` |
-| Start farm | Begin combat loop |
-| Stop / Tháo móc | Stop + close NativeCut session |
+1. **SELECT** living monster in radius (7045) — if none, soft-skip cycle (no Ghost)
+2. **CAST** 7074 skill on that UID
+3. **WAIT** the skill’s ms
+4. **NativeCut self** — even if the monster died mid-cast (Ghost is self-UID)
 
 ## Install
 
-Copy `GhostFarm.py` into phBot `Plugins/`, reload. Prefer not double-hooking GetTickCount with AG Ghost cut (v1.0.2 can reuse AG’s thunk).
+Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 ## jsDelivr
 
