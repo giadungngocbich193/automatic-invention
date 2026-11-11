@@ -2,6 +2,7 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.11: Prefer backoff ≥1.5s after AG B074 refuse same UID (stop re-arm spam).
 - v1.0.10: Trace AG_He/*AG_He hard-allow; >10m clear prefer+chase; persist
   restore on load/joined/deferred; label “tên Leader cần theo”; AG≥1.8.70.
 - v1.0.9: Trace AG_He luôn OK (Phụ role authoritative); AG≥1.8.69 prefer cast.
@@ -51,7 +52,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.10'
+VERSION = '1.0.11'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -823,6 +824,10 @@ def inject_select(uid, reason):
         # Strong debounce — B070 fires every cast; one prefer per UID/1.5s.
         if uid == state['last_uid'] and (now - state['last_select_at']) < 1.5:
             return True
+        # AG reported B074 refuse → back off Prefer spam for that UID.
+        if (uid == int(state.get('refuse_uid') or 0)
+                and now < float(state.get('refuse_backoff_until') or 0)):
+            return True
         state['last_uid'] = uid
         state['last_select_at'] = now
         state['fight_held'] = False
@@ -832,12 +837,41 @@ def inject_select(uid, reason):
 
     ghost = find_autoghost()
     if ghost is not None:
+        # Mirror AG B074 backoff so Prefer does not re-arm forever.
+        try:
+            runtime = getattr(ghost, 'auto_pk_runtime', None)
+            if isinstance(runtime, dict):
+                b074_until = float(runtime.get('party_b074_backoff_until') or 0)
+                b074_uid = int(runtime.get('party_b074_uid') or 0)
+                if uid == b074_uid and monotonic() < b074_until:
+                    with lock:
+                        state['refuse_uid'] = uid
+                        state['refuse_backoff_until'] = b074_until
+                    return True
+        except Exception:
+            pass
         select_hook = getattr(ghost, 'party_sync_select_uid', None)
         if callable(select_hook):
             try:
                 ok = bool(select_hook(uid, source='%s:%s' % (NAME, reason)))
+                # After select, if AG set B074 backoff — mirror it locally.
+                try:
+                    runtime = getattr(ghost, 'auto_pk_runtime', None)
+                    if isinstance(runtime, dict):
+                        b074_until = float(runtime.get('party_b074_backoff_until') or 0)
+                        b074_uid = int(runtime.get('party_b074_uid') or 0)
+                        if uid == b074_uid and monotonic() < b074_until:
+                            with lock:
+                                state['refuse_uid'] = uid
+                                state['refuse_backoff_until'] = b074_until
+                except Exception:
+                    pass
                 # F4 may have stopped Auto PK — re-arm then prefer again.
+                # Never re-arm during B074 refuse backoff.
                 if not ok:
+                    if uid == int(state.get('refuse_uid') or 0) and monotonic() < float(
+                            state.get('refuse_backoff_until') or 0):
+                        return True
                     arm_ok = arm_auto_pk(prefer_uid=uid)
                     ok = bool(select_hook(uid, source='%s:%s:rearm' % (NAME, reason))) if arm_ok else False
                 if not quiet:
@@ -847,6 +881,12 @@ def inject_select(uid, reason):
                 _log('party_sync_select_uid: %s' % error)
         # Fallback: re-arm + set prefer dict fields without 7045.
         try:
+            runtime = getattr(ghost, 'auto_pk_runtime', None)
+            if isinstance(runtime, dict):
+                b074_until = float(runtime.get('party_b074_backoff_until') or 0)
+                b074_uid = int(runtime.get('party_b074_uid') or 0)
+                if uid == b074_uid and monotonic() < b074_until:
+                    return True
             if not getattr(ghost, 'auto_pk_running', False):
                 arm_auto_pk(prefer_uid=uid)
             runtime = getattr(ghost, 'auto_pk_runtime', None)

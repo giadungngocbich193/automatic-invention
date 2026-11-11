@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party B074 loop v1.8.72] prefer UID: B074 = retry next skill (giữ prefer);
+  không soft-clear; Prefer re-arm debounce ≥1.5s after B074.
 - [FIX camp return v1.8.71] UID ra vùng đánh → bỏ khóa + quay về điểm chờ;
   debounce log ≤1/2s; party prefer unreachable soft-clear (no forever cast).
 - [FIX ally Party+Guild only v1.8.70] exclude ONLY same party / same guild;
@@ -47,9 +49,10 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.71'
+VERSION = '1.8.72'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + camp return when target leaves attack radius
+# baseline 2600 + party prefer B074 keep+retry (no clear loop)
+PARTY_PREFER_B074_BACKOFF = 1.5
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -5225,6 +5228,7 @@ def party_sync_select_uid(uid, source='PartyLeader'):
 
     Never skill_probe / never retire this UID. B070 miss → soft-wait + retry.
     If Auto PK was F4-stopped, re-arm first then prefer (no UI click needed).
+    After B074: ignore Prefer same UID for ≥PARTY_PREFER_B074_BACKOFF if armed.
     """
     global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
     global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
@@ -5247,6 +5251,14 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         runtime = auto_pk_runtime if auto_pk_running else None
         if runtime is None:
             return False
+        # Prefer re-arm debounce after B074: same UID already armed → ignore ≥1.5s.
+        b074_until = float(runtime.get('party_b074_backoff_until') or 0)
+        b074_uid = int(runtime.get('party_b074_uid') or 0)
+        armed_same = (pvp_armed and not pvp_paused
+                      and int(runtime.get('party_sync_uid') or 0) == uid
+                      and (pvp_target == uid or direct_target == uid))
+        if armed_same and uid == b074_uid and now < b074_until:
+            return True
         last_at = float(runtime.get('party_sync_select_at') or 0)
         last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
         if (uid == last_uid and (now - last_at) < 0.35
@@ -5524,22 +5536,67 @@ def _auto_pk_debounced_log(runtime, key, message, interval=None, error=False):
 
 
 def _party_prefer_unreachable_reason(reason):
+    """True only for truly gone targets — NEVER B074 skill refuse."""
     text = str(reason or '').casefold()
     if reason == AUTO_PK_OUTSIDE_TARGET:
         return True
+    # Explicitly ignore B074 / từ chối đánh — those are skill fails, keep prefer.
+    if 'b074' in text or 'từ chối đánh' in text:
+        return False
     return any(token in text for token in (
-        'b074', 'từ chối đánh', 'ra vùng', 'vượt bán kính',
-        'biến mất', 'không còn hợp lệ', 'đã chết', 'protected',
+        'ra vùng', 'vượt bán kính',
+        'biến mất', 'không còn hợp lệ', 'đã chết',
         AUTO_PK_PROTECTED.casefold(),
     ))
 
 
+def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đánh (B074)'):
+    """B074 on party prefer = skill fail → cooldown skill, rotate next, KEEP prefer."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    runtime = auto_pk_runtime
+    if not isinstance(runtime, dict):
+        return False
+    now = monotonic()
+    try:
+        skill_id = int((attempt or {}).get('skill') or 0)
+    except (TypeError, ValueError):
+        skill_id = 0
+    try:
+        uid = int((attempt or {}).get('target') or pvp_target or runtime.get('party_sync_uid') or 0)
+    except (TypeError, ValueError):
+        uid = int(runtime.get('party_sync_uid') or 0)
+    # Keep prefer locked; block Prefer re-arm spam from PartyLeader.
+    runtime['party_b074_backoff_until'] = now + PARTY_PREFER_B074_BACKOFF
+    runtime['party_b074_uid'] = uid
+    runtime['party_hold_fight'] = False
+    runtime['party_lock'] = True
+    runtime['party_follow_mode'] = True
+    if uid:
+        runtime['party_sync_uid'] = uid
+        runtime['requested'] = uid
+    if skill_id:
+        retries = runtime.setdefault('skill_retry_at', {})
+        retries[skill_id] = now + 0.75
+    # Clear expect so rotate_direct can fire next Ghost skill.
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = now + 0.35
+    _auto_pk_debounced_log(
+        runtime, 'party_b074_log_at',
+        'Party prefer UID %d · B074 skill %s · retry next Ghost (giữ prefer · backoff %.1fs)'
+        % (uid, skill_id or '?', PARTY_PREFER_B074_BACKOFF),
+        interval=2.0)
+    return True
+
+
 def soft_clear_party_prefer(runtime, uid, reason):
-    """Party prefer UID unreachable → clear prefer lock (no forever Ghost cast)."""
+    """Clear prefer only for real leave/F4/>10m/new clear — not B074."""
     global direct_target, direct_select_request, active_sequence, sequence_index
     global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
     if not isinstance(runtime, dict):
         return False
+    if 'b074' in str(reason or '').casefold() or 'từ chối đánh' in str(reason or '').casefold():
+        return party_prefer_handle_b074_refuse(
+            {'skill': (direct_expected or (0, 0))[0], 'target': uid}, reason)
     try:
         uid = int(uid or 0)
     except (TypeError, ValueError):
@@ -5580,10 +5637,16 @@ def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY,
     except (TypeError, ValueError):
         return False
     if is_party_sync_prefer_uid(uid, runtime):
-        # Unreachable / left vùng đánh / B074 refuse → soft-clear prefer.
+        # B074 / skill refuse → keep prefer, retry next skill (never soft-clear).
+        text = str(reason or '').casefold()
+        if 'b074' in text or 'từ chối đánh' in text:
+            skill = (direct_expected or (0, uid))[0]
+            return party_prefer_handle_b074_refuse(
+                {'skill': skill, 'target': uid}, reason)
+        # Real leave / dead / allow_party_clear (F4, >10m) → soft-clear.
         if allow_party_clear or _party_prefer_unreachable_reason(reason):
             return soft_clear_party_prefer(runtime, uid, reason)
-        # Transient B070 miss only — soft-wait, keep prefer.
+        # Transient B070 miss — soft-wait, keep prefer.
         now = monotonic()
         runtime['party_hold_fight'] = False
         runtime.pop('missing_since', None)
@@ -7272,7 +7335,12 @@ def observe_push_packet(outgoing, opcode, data):
                     and attempt['target'] == pvp_target and now < pvp_cast_deadline
                     and attempt.get('first_reply') == raw and not attempt.get('reply_ambiguous')
                     and not attempt.get('push_rejected')):
-                release_auto_pk_target(pvp_target, 'server từ chối đánh (B074)', AUTO_PK_PROTECTION_DELAY)
+                # Party prefer: B074 = skill interrupt → retry next skill, keep prefer.
+                if is_party_sync_prefer_uid(pvp_target):
+                    party_prefer_handle_b074_refuse(attempt, 'server từ chối đánh (B074)')
+                else:
+                    release_auto_pk_target(
+                        pvp_target, 'server từ chối đánh (B074)', AUTO_PK_PROTECTION_DELAY)
         action = push_action(opcode, raw, player_id) if not outgoing else None
         if action is not None:
             new_push = live and direct_target == pvp_target and action != pvp_push_action
