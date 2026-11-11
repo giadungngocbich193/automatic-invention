@@ -2,6 +2,7 @@
 """BossHunt — săn Unique Boss cho phBot Stable.
 
 Changelog:
+- v1.0.1: Chỉ dùng bùa Reverse chỉ định (zone / party). Bỏ Return cuối, chết cuối, Return Scroll.
 - v1.0.0: Nghe spawn Unique (handle_event t=0 + notice 0x300C), reverse/tele,
   set training + start_bot, chọn boss bằng 7045 (monster). Không ALT, không 7045 player.
 """
@@ -30,7 +31,6 @@ from phBot import (
     set_training_radius,
     start_bot,
     stop_bot,
-    use_return_scroll,
 )
 
 try:
@@ -39,22 +39,18 @@ except ImportError:
     set_training_area = None
 
 NAME = 'BossHunt'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 CONFIG_NAME = 'BossHunt'
 
 # phBot handle_event: t=0 Unique spawn/near (xChat / JellyDix).
 EVENT_UNIQUE = 0
-# reverse_return types (xControl)
-REV_LAST_RETURN = 0
-REV_LAST_DEATH = 1
-REV_PLAYER = 2
-REV_ZONE = 3
+# reverse_return — chỉ các type CHỈ ĐỊNH (xControl / Stable API)
+REV_PLAYER = 2  # đích = tên NV party
+REV_ZONE = 3    # đích = tên Zone / map đã chỉ định
 
-REVERSE_LABELS = (
-    'Reverse: điểm Return cuối (mặc định)',
-    'Reverse: điểm chết cuối',
-    'Reverse: theo tên Zone',
-    'Return Scroll (về thành)',
+DESIGNATE_LABELS = (
+    'Reverse chỉ định: Zone (map)',
+    'Reverse chỉ định: Party (tên NV)',
 )
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
@@ -77,13 +73,13 @@ enabled_box = QtBind.createCheckBox(gui, 'ui_enabled', 'Bật săn Boss', 10, 32
 QtBind.createLabel(gui, 'Tên Boss (cách nhau ; hoặc ,) — khớp một phần tên spawn', 10, 58)
 boss_names_field = QtBind.createLineEdit(gui, '', 10, 76, 520, 22)
 
-QtBind.createLabel(gui, 'Cách dịch chuyển', 10, 108)
-reverse_combo = QtBind.createCombobox(gui, 10, 126, 280, 22)
-for label in REVERSE_LABELS:
-    QtBind.append(gui, reverse_combo, label)
+QtBind.createLabel(gui, 'Bùa Reverse chỉ định (bắt buộc)', 10, 108)
+designate_combo = QtBind.createCombobox(gui, 10, 126, 280, 22)
+for label in DESIGNATE_LABELS:
+    QtBind.append(gui, designate_combo, label)
 
-QtBind.createLabel(gui, 'Tên Zone (chỉ khi Reverse Zone)', 300, 108)
-zone_field = QtBind.createLineEdit(gui, '', 300, 126, 230, 22)
+QtBind.createLabel(gui, 'Đích chỉ định (tên Zone hoặc tên NV party)', 300, 108)
+dest_field = QtBind.createLineEdit(gui, '', 300, 126, 230, 22)
 
 QtBind.createLabel(gui, 'Tọa độ săn Boss sau khi tele (region / x / y / z)', 10, 158)
 region_field = QtBind.createLineEdit(gui, '0', 10, 176, 70, 22)
@@ -107,8 +103,8 @@ QtBind.createButton(gui, 'btn_test', 'Thử săn ngay (tên ô trên)', 280, 290
 status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 330)
 QtBind.createLabel(
     gui,
-    'Gợi ý: Reverse mặc định = điểm Return Scroll cuối. Điểm săn = region/x/y gần Boss. '
-    'Khi spawn khớp tên → tele → chờ delay → set train + start_bot + chọn Boss (7045).',
+    'Chỉ dùng Reverse chỉ định (zone/party). Trong game hãy gắn điểm chỉ định / đứng party gần Boss. '
+    'Spawn khớp tên → reverse_return → chờ delay → set train + start_bot + chọn Boss (7045).',
     10, 358,
 )
 
@@ -126,17 +122,17 @@ def config_path():
     return Path(get_config_dir()) / (CONFIG_NAME + '.json')
 
 
-def reverse_mode_index():
-    text = (QtBind.text(gui, reverse_combo) or '').strip()
-    for i, label in enumerate(REVERSE_LABELS):
+def designate_mode_index():
+    text = (QtBind.text(gui, designate_combo) or '').strip()
+    for i, label in enumerate(DESIGNATE_LABELS):
         if label == text:
             return i
     return 0
 
 
-def set_reverse_mode(index):
-    index = max(0, min(int(index), len(REVERSE_LABELS) - 1))
-    QtBind.setText(gui, reverse_combo, REVERSE_LABELS[index])
+def set_designate_mode(index):
+    index = max(0, min(int(index), len(DESIGNATE_LABELS) - 1))
+    QtBind.setText(gui, designate_combo, DESIGNATE_LABELS[index])
 
 
 def parse_names(text):
@@ -159,6 +155,9 @@ def read_settings():
     names = parse_names(QtBind.text(gui, boss_names_field))
     if not names:
         raise ValueError('Nhập ít nhất một tên Boss.')
+    dest = (QtBind.text(gui, dest_field) or '').strip()
+    if not dest:
+        raise ValueError('Nhập đích Reverse chỉ định (tên Zone hoặc tên NV party).')
     try:
         region = int(float((QtBind.text(gui, region_field) or '0').strip()))
         x = float((QtBind.text(gui, x_field) or '0').strip().replace(',', '.'))
@@ -172,11 +171,15 @@ def read_settings():
         raise ValueError('Bán kính train cần ≥ 5 m.')
     if not math.isfinite(delay) or delay < 0:
         raise ValueError('Delay sau tele không hợp lệ.')
+    mode = designate_mode_index()
     return {
         'enabled': QtBind.isChecked(gui, enabled_box),
         'boss_names': names,
-        'reverse_mode': reverse_mode_index(),
-        'zone_name': (QtBind.text(gui, zone_field) or '').strip(),
+        'designate_mode': mode,  # 0=zone, 1=party
+        'dest_name': dest,
+        # legacy keys kept for older configs / clarity
+        'zone_name': dest if mode == 0 else '',
+        'party_name': dest if mode == 1 else '',
         'region': region,
         'x': x,
         'y': y,
@@ -187,11 +190,40 @@ def read_settings():
     }
 
 
+def _migrate_legacy_settings(data):
+    """Map v1.0.0 reverse_mode/zone_name → designate-only fields."""
+    out = dict(data or {})
+    if out.get('dest_name'):
+        return out
+    legacy_mode = out.get('reverse_mode')
+    zone = (out.get('zone_name') or '').strip()
+    party = (out.get('party_name') or '').strip()
+    if party:
+        out['designate_mode'] = 1
+        out['dest_name'] = party
+    elif zone:
+        out['designate_mode'] = 0
+        out['dest_name'] = zone
+    elif legacy_mode == 2 and zone:
+        out['designate_mode'] = 0
+        out['dest_name'] = zone
+    else:
+        # Old default was last-return — force empty dest so user must set chỉ định.
+        out.setdefault('designate_mode', 0)
+        out['dest_name'] = ''
+    return out
+
+
 def apply_settings(data):
+    data = _migrate_legacy_settings(data)
     QtBind.setChecked(gui, enabled_box, bool(data.get('enabled')))
     QtBind.setText(gui, boss_names_field, '; '.join(data.get('boss_names') or []))
-    set_reverse_mode(data.get('reverse_mode', 0))
-    QtBind.setText(gui, zone_field, str(data.get('zone_name') or ''))
+    set_designate_mode(data.get('designate_mode', 0))
+    dest = (data.get('dest_name')
+            or data.get('zone_name')
+            or data.get('party_name')
+            or '')
+    QtBind.setText(gui, dest_field, str(dest))
     QtBind.setText(gui, region_field, str(int(data.get('region', 0) or 0)))
     QtBind.setText(gui, x_field, '%g' % float(data.get('x', 0) or 0))
     QtBind.setText(gui, y_field, '%g' % float(data.get('y', 0) or 0))
@@ -210,7 +242,8 @@ def btn_save():
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         with lock:
             state['enabled'] = data['enabled']
-        set_status('Đã lưu %s · Boss=%s' % (path.name, ', '.join(data['boss_names'])))
+        set_status('Đã lưu %s · Boss=%s · đích=%r' % (
+            path.name, ', '.join(data['boss_names']), data['dest_name']))
     except (OSError, ValueError, TypeError) as error:
         set_status('Chưa lưu: %s' % error)
 
@@ -261,26 +294,18 @@ def configured_match(spawn_text, settings):
 
 
 def do_teleport(settings):
-    mode = int(settings.get('reverse_mode', 0))
-    if mode == 0:
-        ok = reverse_return(REV_LAST_RETURN, '')
-        set_status('Reverse → điểm Return cuối · API=%r' % ok)
-        return bool(ok)
+    """Chỉ bùa Reverse chỉ định — reverse_return(2|3, dest). Không Return cuối / Return Scroll."""
+    dest = (settings.get('dest_name') or '').strip()
+    if not dest:
+        set_status('Thiếu đích Reverse chỉ định.')
+        return False
+    mode = int(settings.get('designate_mode', 0))
     if mode == 1:
-        ok = reverse_return(REV_LAST_DEATH, '')
-        set_status('Reverse → điểm chết cuối · API=%r' % ok)
+        ok = reverse_return(REV_PLAYER, dest)
+        set_status('Reverse chỉ định → party %r · API=%r' % (dest, ok))
         return bool(ok)
-    if mode == 2:
-        zone = settings.get('zone_name') or ''
-        if not zone:
-            set_status('Chọn Reverse Zone nhưng chưa nhập tên Zone.')
-            return False
-        ok = reverse_return(REV_ZONE, zone)
-        set_status('Reverse → zone %r · API=%r' % (zone, ok))
-        return bool(ok)
-    # mode 3: return scroll to town
-    ok = use_return_scroll()
-    set_status('Return Scroll · API=%r' % ok)
+    ok = reverse_return(REV_ZONE, dest)
+    set_status('Reverse chỉ định → zone %r · API=%r' % (dest, ok))
     return bool(ok)
 
 
@@ -307,7 +332,7 @@ def begin_hunt(spawn_text, matched, settings, source):
     if not do_teleport(settings):
         with lock:
             state['phase'] = 'idle'
-        set_status('Tele thất bại — kiểm tra reverse scroll / zone.')
+        set_status('Tele thất bại — kiểm tra bùa Reverse chỉ định / đích.')
         return
     with lock:
         state['phase'] = 'wait'
@@ -426,12 +451,10 @@ def tick():
                     state['phase'] = 'attack'
                     state['attack_uid'] = uid
             return
-        # Re-push train / move occasionally
         if now - state.get('search_at', now) > 12.0:
             with lock:
                 state['search_at'] = now
             go_train_and_search(settings)
-        # Timeout 8 minutes
         if now - state.get('started_at', now) > 480:
             with lock:
                 state['phase'] = 'idle'
@@ -446,7 +469,6 @@ def tick():
                 state['attack_uid'] = 0
             set_status('Boss hết / ra xa · săn xong.')
             return
-        # Keep bot running
         try:
             if not get_status():
                 start_bot()
@@ -476,7 +498,6 @@ def handle_event(t, data):
 
 
 def handle_joymax(opcode, data):
-    # Backup: server notice often carries unique text (0x300C on many privates).
     if opcode != 0x300C or not data:
         return True
     with lock:
@@ -511,6 +532,5 @@ def joined_game():
     btn_load()
 
 
-# Load defaults into combo
-set_reverse_mode(0)
-log('[%s] Đã nạp thành công v%s. Điền tên Boss → Lấy tọa độ → Lưu → Bật săn Boss.' % (NAME, VERSION))
+set_designate_mode(0)
+log('[%s] Đã nạp thành công v%s. Điền đích Reverse chỉ định + tên Boss → Lưu → Bật.' % (NAME, VERSION))
