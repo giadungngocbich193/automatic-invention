@@ -2,6 +2,8 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.1.0: Primary Leader→Phụ = F1/F2/key3 (Ghost PvP-style toggle arm/stop);
+  Prefer UID sync kept; ks chat secondary; per-char config; Trace move_to.
 - v1.0.14: Config PER character PartyLeader_<char>.json (fix shared Chủ);
   Trace AG_He False → silent move_to Leader; Prefer same UID silent.
 - v1.0.13: Trace AG_He job nick candidates; Prefer silent set_status.
@@ -24,6 +26,7 @@ Changelog:
 
 from __future__ import print_function
 
+import ctypes
 import json
 import math
 import re
@@ -61,8 +64,13 @@ try:
 except ImportError:
     phBotChat = None
 
+try:
+    user32 = ctypes.windll.user32
+except Exception:
+    user32 = None
+
 NAME = 'PartyLeader'
-VERSION = '1.0.14'
+VERSION = '1.1.0'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -74,6 +82,14 @@ ROLE_FOLLOWER = 0
 ROLE_LEADER = 1
 # Nhóm Ghost / Auto PK trên phụ (khớp AutoGhost PVP_EDIT_PAGES)
 GHOST_PAGES = ('F1', 'F2', 'F3')
+# Leader combat keys (mirror AutoGhost Ghost PvP): F1, F2, digit 3.
+LEADER_FIGHT_KEYS = {
+    'F1': 0x70,
+    'F2': 0x71,
+    '3': ord('3'),
+}
+# Party chat protocol: ag#F1#UID | ag#F1#stop | ag#3#UID | ag#3#stop
+AG_FIGHT_PREFIX = 'ag#'
 # HARD: phụ dừng đánh + trace khi chủ xa hơn khoảng này (mét) — mặc định 10.
 LEADER_FOLLOW_DISTANCE = 10.0
 # Sau Bật plugin / ks / arm: chưa áp khoảng cách (tránh clear storm lúc enable Phụ).
@@ -108,6 +124,11 @@ state = {
     'last_trace_fail_at': 0.0,
     'last_trace_fail_msg': '',
     'last_trace_ok_name': '',
+    # Leader F1/F2/3 combat command (Ghost PvP-style toggle).
+    'leader_cmd_page': None,  # 'F1' | 'F2' | '3' while party fight armed
+    'leader_keys_held': set(),
+    'leader_three_held': False,
+    'last_fight_cmd_at': 0.0,
 }
 
 _ui_applying = False  # True while restore — skip checkbox side-effects
@@ -115,10 +136,10 @@ _persist_synced = False
 
 QtBind.createLabel(gui, '%s v%s — PT theo Leader' % (NAME, VERSION), 10, 8)
 enabled_box = QtBind.createCheckBox(gui, 'ui_enabled', 'Bật plugin', 10, 32)
-sync_box = QtBind.createCheckBox(gui, 'ui_sync', 'Đồng bộ mục tiêu (7045 / B070)', 140, 32)
-arm_box = QtBind.createCheckBox(gui, 'ui_arm', 'ks: bật AutoGhost Auto PK', 400, 32)
+sync_box = QtBind.createCheckBox(gui, 'ui_sync', 'Đồng bộ mục tiêu (Prefer UID)', 140, 32)
+arm_box = QtBind.createCheckBox(gui, 'ui_arm', 'Phụ: cho phép AutoGhost Auto PK', 400, 32)
 broadcast_box = QtBind.createCheckBox(
-    gui, 'ui_broadcast', 'Chủ: chat party ks#UID khi chọn (Target / ` )', 10, 56)
+    gui, 'ui_broadcast', 'Chủ: F1/F2/3 + sync target (party)', 10, 56)
 
 QtBind.createLabel(gui, 'Vai trò', 10, 88)
 role_leader_box = QtBind.createCheckBox(gui, 'ui_role_leader', 'Chủ', 10, 106)
@@ -142,9 +163,9 @@ QtBind.createButton(gui, 'btn_stop', 'Dừng theo', 460, 144)
 status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 184)
 QtBind.createLabel(
     gui,
-    'ks = phụ trace + Auto PK · ks off = dừng. Leader chọn/đánh → phụ cùng UID.\n'
-    'HARD Phụ: chỉ UID Leader · >10m soft-stop + Trace AG_He OK · Lưu/Tải giữ ticks.\n'
-    'Phụ: tick Phụ + điền tên Leader cần theo / Lấy tên chủ PT + F + Lưu.',
+    'Chủ: F1 / F2 / phím 3 = bật Ghost phụ (cùng target) · bấm lại = dừng (như Ghost PvP).\n'
+    'Phụ: chọn nhóm F + tên Leader · Prefer UID sync · >10m Trace/move_to · config theo CharName.\n'
+    'ks chat chỉ phụ (tuỳ chọn).',
     10, 214,
 )
 
@@ -1023,7 +1044,228 @@ def party_chat(msg):
         return False
 
 
+def leader_current_target_uid():
+    """Leader's current Ghost/Auto PK target UID (no 7045)."""
+    ghost = find_autoghost()
+    if ghost is not None:
+        for attr in ('pvp_target', 'direct_target'):
+            try:
+                uid = int(getattr(ghost, attr, 0) or 0)
+            except (TypeError, ValueError):
+                uid = 0
+            if uid > 0:
+                return uid
+    with lock:
+        try:
+            return int(state.get('last_uid') or state.get('last_broadcast_uid') or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
+def _game_window_foreground():
+    """True when game client is focused (mirror AutoGhost)."""
+    if user32 is None:
+        return True
+    ghost = find_autoghost()
+    window = None
+    if ghost is not None:
+        get_client = getattr(ghost, 'get_client', None)
+        if callable(get_client):
+            try:
+                window = (get_client() or {}).get('window')
+            except Exception:
+                window = None
+    if not window:
+        return True
+    try:
+        return bool(user32.GetForegroundWindow() == window)
+    except Exception:
+        return True
+
+
+def parse_ag_fight_cmd(text):
+    """Parse ag#F1#UID | ag#F1#stop | ag#3#123 → (page, action, uid)."""
+    raw = str(text or '').strip()
+    low = raw.casefold()
+    if not low.startswith(AG_FIGHT_PREFIX):
+        return None
+    body = raw[len(AG_FIGHT_PREFIX):]
+    parts = body.replace(':', '#').split('#')
+    if not parts:
+        return None
+    page = str(parts[0] or '').strip().upper()
+    if page == '3':
+        page = '3'
+    elif page not in GHOST_PAGES[:2]:  # F1 / F2 primary; F3 via digit-3 path
+        if page in GHOST_PAGES:
+            pass
+        else:
+            return None
+    action = 'arm'
+    uid = 0
+    if len(parts) >= 2:
+        token = str(parts[1] or '').strip()
+        if token.casefold() in ('stop', '0', 'off', 'dung', 'dừng'):
+            action = 'stop'
+        else:
+            try:
+                uid = int(token)
+            except (TypeError, ValueError):
+                uid = 0
+            if uid <= 0:
+                action = 'stop'
+    return page, action, uid
+
+
+def leader_broadcast_fight_cmd(page, action, uid=0):
+    """Broadcast F1/F2/3 arm|stop to party (primary Leader→Phụ control)."""
+    if not QtBind.isChecked(gui, enabled_box):
+        return False
+    if not i_am_leader():
+        return False
+    if not QtBind.isChecked(gui, broadcast_box):
+        return False
+    page = str(page or '').strip().upper()
+    if page not in ('F1', 'F2', 'F3', '3'):
+        return False
+    action = 'stop' if str(action).casefold() in ('stop', '0', 'off') else 'arm'
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    with lock:
+        now = monotonic()
+        if (now - float(state.get('last_fight_cmd_at') or 0)) < 0.25:
+            return False
+        state['last_fight_cmd_at'] = now
+        if action == 'arm':
+            state['leader_cmd_page'] = page
+            state['fight_held'] = False
+            if uid > 0:
+                state['last_broadcast_uid'] = uid
+                state['last_uid'] = uid
+        else:
+            state['leader_cmd_page'] = None
+    payload = '%s%s#%s' % (AG_FIGHT_PREFIX, page, 'stop' if action == 'stop' else uid)
+    if party_chat(payload):
+        set_status('Chủ %s %s%s' % (
+            'ARM' if action == 'arm' else 'STOP', page,
+            (' · UID %d' % uid) if action == 'arm' and uid else ''))
+        return True
+    return False
+
+
+def leader_toggle_fight_key(page, source='key'):
+    """Ghost PvP-style: same F1/F2/3 again → stop; else arm on current target."""
+    page = str(page or '').strip().upper()
+    if page not in ('F1', 'F2', 'F3', '3'):
+        return False
+    with lock:
+        active = state.get('leader_cmd_page')
+    if active == page:
+        return leader_broadcast_fight_cmd(page, 'stop', 0)
+    uid = leader_current_target_uid()
+    return leader_broadcast_fight_cmd(page, 'arm', uid)
+
+
+def leader_poll_fight_keys():
+    """Detect Leader F1/F2/digit-3 like AutoGhost Ghost PvP (GetAsyncKeyState)."""
+    if user32 is None:
+        return
+    if not QtBind.isChecked(gui, enabled_box) or not i_am_leader():
+        return
+    if not QtBind.isChecked(gui, broadcast_box):
+        return
+    # Ignore while Alt/Ctrl/Shift held (same as AutoGhost).
+    try:
+        if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12)):
+            with lock:
+                state['leader_keys_held'] = set()
+                state['leader_three_held'] = bool(user32.GetAsyncKeyState(ord('3')) & 0x8000)
+            return
+    except Exception:
+        return
+    foreground = _game_window_foreground()
+    held = set()
+    for page, vk in (('F1', 0x70), ('F2', 0x71)):
+        try:
+            if user32.GetAsyncKeyState(vk) & 0x8000:
+                held.add(page)
+        except Exception:
+            pass
+    try:
+        three = bool(user32.GetAsyncKeyState(ord('3')) & 0x8000)
+    except Exception:
+        three = False
+    with lock:
+        prev = set(state.get('leader_keys_held') or ())
+        prev_three = bool(state.get('leader_three_held'))
+        state['leader_keys_held'] = held
+        state['leader_three_held'] = three
+    if not foreground:
+        return
+    fresh = held - prev
+    if len(fresh) == 1:
+        leader_toggle_fight_key(next(iter(fresh)), source='key')
+        return
+    if three and not prev_three and not fresh:
+        leader_toggle_fight_key('3', source='key3')
+
+
+def on_leader_ghost_page(page, action='arm'):
+    """Hook from AutoGhost when Leader presses F1/F2/3 or toggles stop."""
+    if not i_am_leader():
+        return False
+    page = str(page or '').strip().upper()
+    action = str(action or 'arm').casefold()
+    if action in ('stop', 'pause', 'off'):
+        return leader_broadcast_fight_cmd(page if page in ('F1', 'F2', 'F3', '3') else '3', 'stop', 0)
+    if page == '3' or page in GHOST_PAGES:
+        # Prefer explicit arm from AG with current target (don't double-toggle).
+        uid = leader_current_target_uid()
+        with lock:
+            state['leader_cmd_page'] = page
+        return leader_broadcast_fight_cmd(page, 'arm', uid)
+    return False
+
+
+def follower_page_matches_cmd(page):
+    """Phụ responds if cmd page matches configured F, or cmd is digit-3 (any F)."""
+    page = str(page or '').strip().upper()
+    if page == '3':
+        return True
+    return page == ghost_page()
+
+
+def follower_apply_fight_cmd(page, action, uid, reason='ag#'):
+    """Phụ: arm Auto PK + Prefer UID, or stop like F4."""
+    if i_am_leader():
+        return False
+    if not follower_page_matches_cmd(page):
+        return False
+    if action == 'stop':
+        stop_auto_pk_if_ours('%s stop %s' % (reason, page))
+        _soft_hold_autoghost('%s stop %s' % (reason, page))
+        with lock:
+            state['fight_held'] = True
+            state['prefer_silent_uid'] = 0
+        set_status('[%s] STOP Ghost/Auto PK (Chủ %s)' % (reason, page))
+        return True
+    if not QtBind.isChecked(gui, arm_box):
+        set_status('[%s] Bỏ qua ARM — tắt “cho phép Auto PK”.' % reason, silent=True)
+        return False
+    with lock:
+        state['fight_held'] = False
+    ok = arm_auto_pk(prefer_uid=int(uid or 0))
+    if uid:
+        inject_select(uid, '%s ARM %s' % (reason, page))
+    set_status('[%s] ARM %s%s · AutoPK=%r' % (
+        reason, page, (' · UID %d' % uid) if uid else '', ok))
+    return bool(ok)
+
+
 def leader_broadcast_uid(uid):
+    """Secondary: Prefer-only sync (target select). Primary arm is F1/F2/3."""
     if not QtBind.isChecked(gui, broadcast_box):
         return
     if not i_am_leader():
@@ -1040,9 +1282,11 @@ def leader_broadcast_uid(uid):
             return
         state['last_broadcast_uid'] = uid
         state['last_broadcast_at'] = now
+        state['last_uid'] = uid
         state['fight_held'] = False
-    if party_chat('ks#%d' % uid):
-        set_status('Chủ broadcast ks#%d (party)' % uid)
+    # Prefer sync without forcing arm — followers Prefer UID; F1/F2/3 starts fight.
+    if party_chat('ag#prefer#%d' % uid):
+        set_status('Chủ sync target UID %d (prefer)' % uid, silent=True)
 
 
 def leader_broadcast_clear_target(reason='bỏ target'):
@@ -1057,8 +1301,8 @@ def leader_broadcast_clear_target(reason='bỏ target'):
             return False
         state['last_clear_at'] = now
         state['last_broadcast_uid'] = 0
-    if party_chat('ks#0'):
-        set_status('[%s] Chủ broadcast clear target (ks#0).' % reason)
+    if party_chat('ag#prefer#0'):
+        set_status('[%s] Chủ clear target (ag#prefer#0).' % reason)
         return True
     return False
 
@@ -1074,14 +1318,17 @@ def leader_broadcast_stop_fight(reason='F4/dừng Ghost'):
         if (now - state['last_stop_fight_at']) < 0.35:
             return False
         state['last_stop_fight_at'] = now
-    if party_chat('dungdanh'):
-        set_status('[%s] Chủ broadcast dungdanh → phụ stop + trace.' % reason)
-        return True
-    return False
+        active = state.get('leader_cmd_page') or '3'
+        state['leader_cmd_page'] = None
+    # Primary stop via ag# + legacy dungdanh for old phụ.
+    leader_broadcast_fight_cmd(active, 'stop', 0)
+    party_chat('dungdanh')
+    set_status('[%s] Chủ STOP Ghost phụ.' % reason)
+    return True
 
 
 def on_leader_ghost_stop(reason=None):
-    """Hook từ AutoGhost (F4 / pause Ghost) trên máy chủ."""
+    """Hook từ AutoGhost (F4 / pause Ghost / same-F toggle) trên máy chủ."""
     leader_broadcast_stop_fight(reason or 'Ghost dừng')
 
 
@@ -1691,18 +1938,42 @@ def handle_chat(chat_type, player, msg):
     if not from_leader:
         return
 
+    # Primary: ag#F1#UID / ag#F1#stop / ag#3#UID / ag#prefer#UID
+    fight = parse_ag_fight_cmd(text)
+    if fight and not i_am_leader():
+        page, action, uid = fight
+        follower_apply_fight_cmd(page, action, uid, reason='Chủ F-cmd')
+        return
+    low = text.casefold()
+    if low.startswith('ag#prefer#'):
+        if not i_am_leader() and QtBind.isChecked(gui, sync_box):
+            token = text.split('#', 2)[-1] if text.count('#') >= 2 else ''
+            if str(token).strip() in ('0', 'stop', ''):
+                follower_clear_target('ag#prefer#0')
+            else:
+                try:
+                    uid = int(token)
+                except (TypeError, ValueError):
+                    uid = 0
+                if uid > 0:
+                    with lock:
+                        state['fight_held'] = False
+                    inject_select(uid, 'ag#prefer từ chủ')
+        return
+
     norm = normalize_cmd(text)
-    # HARD: chủ F4/dừng → phụ dừng cast + trace theo chủ ngay.
+    # Legacy: chủ F4/dừng → phụ dừng cast + trace theo chủ ngay.
     if is_stop_fight_cmd(norm):
         if not i_am_leader():
             follower_stop_and_follow('chat dungdanh / F4')
         return
-    # HARD: chủ clear target → phụ clear.
+    # Legacy clear.
     if is_clear_target_cmd(norm):
         if not i_am_leader():
             follower_clear_target('chat clear')
         return
 
+    # Secondary: old ks#UID prefer/arm (optional).
     uid = parse_ks_uid(text)
     if uid == 0 and text.casefold().startswith('ks#'):
         if not i_am_leader():
@@ -1711,15 +1982,6 @@ def handle_chat(chat_type, player, msg):
     if uid and QtBind.isChecked(gui, sync_box) and not i_am_leader():
         with lock:
             state['fight_held'] = False
-        # Đảm bảo Auto PK đang chạy khi nhận target
-        if QtBind.isChecked(gui, arm_box):
-            with lock:
-                armed = state['armed_auto_pk']
-            if not armed:
-                arm_auto_pk(prefer_uid=uid)
-            else:
-                inject_select(uid, 'chat ks# từ chủ')
-                return
         inject_select(uid, 'chat ks# từ chủ')
         return
 
@@ -1780,12 +2042,17 @@ def handle_joymax(opcode, data):
             state['last_b070_uid'] = target_uid
             state['last_b070_at'] = now
             state['fight_held'] = False
+        # Prefer UID sync only — ARM comes from Chủ F1/F2/3 (not auto-arm on B070).
         if QtBind.isChecked(gui, arm_box):
             with lock:
                 armed = state['armed_auto_pk']
-            if not armed:
-                arm_auto_pk(prefer_uid=target_uid)
-        inject_select(target_uid, 'B070 chủ %s đánh' % attacker_name)
+                cmd_on = bool(state.get('leader_cmd_page'))
+            if armed or cmd_on:
+                inject_select(target_uid, 'B070 chủ %s đánh' % attacker_name)
+            elif QtBind.isChecked(gui, sync_box):
+                inject_select(target_uid, 'B070 prefer %s' % attacker_name)
+        elif QtBind.isChecked(gui, sync_box):
+            inject_select(target_uid, 'B070 prefer %s' % attacker_name)
     return True
 
 
@@ -1884,7 +2151,7 @@ def _ensure_persist_ui():
 
 
 def event_loop():
-    """Phụ: Leader >10m → dừng đánh + trace. First ticks re-sync persist UI."""
+    """Chủ: poll F1/F2/3. Phụ: Leader >10m → soft-stop + Trace. Persist re-sync."""
     global _persist_synced
     if not _persist_synced:
         try:
@@ -1892,7 +2159,6 @@ def event_loop():
         except Exception as error:
             _persist_synced = True
             _log('persist sync: %s' % error)
-    # Prefer state.enabled if UI checkbox failed to restore.
     enabled = QtBind.isChecked(gui, enabled_box)
     with lock:
         if state.get('enabled') and not enabled:
@@ -1900,6 +2166,10 @@ def event_loop():
     if not enabled:
         return
     if i_am_leader():
+        try:
+            leader_poll_fight_keys()
+        except Exception as error:
+            _log('leader key poll: %s' % error)
         return
     with lock:
         now = monotonic()
@@ -1975,5 +2245,5 @@ for _delay in (0.5, 1.5, 3.0, 6.0):
     except Exception:
         pass
 
-log('[%s] Đã nạp v%s. Config theo CharName · Trace move_to fallback · Prefer silent.'
+log('[%s] Đã nạp v%s. Chủ F1/F2/3 arm·stop · Prefer sync · per-char config · Trace move_to.'
     % (NAME, VERSION))

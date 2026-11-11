@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party F1/F2/3 sync v1.8.77] notify PartyLeader on Ghost F1/F2/3 arm/stop
+  (Leader→Phụ primary combat command).
 - [FIX prefer cast no-players v1.8.76] Prefer UID cast Ghost F even when
   get_players() thiếu UID (phe địch); no stall “Giữ UID · Player list thiếu”.
 - [FIX prefer silent locked v1.8.75] same UID after first cast: absolute silent
@@ -58,9 +60,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.76'
+VERSION = '1.8.77'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + prefer cast when get_players missing UID
+# baseline 2600 + PartyLeader F1/F2/3 combat notify
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
@@ -811,7 +813,7 @@ def status_blocks_auto_pk(status=None):
 
 
 def notify_party_leader_ghost_stop(reason):
-    """Chủ F4 / dừng Ghost → PartyLeader broadcast dungdanh cho phụ."""
+    """Chủ F4 / dừng Ghost → PartyLeader broadcast stop cho phụ."""
     for module in list(sys.modules.values()):
         try:
             if getattr(module, 'NAME', None) != 'PartyLeader':
@@ -819,6 +821,21 @@ def notify_party_leader_ghost_stop(reason):
             hook = getattr(module, 'on_leader_ghost_stop', None)
             if callable(hook):
                 hook(reason)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def notify_party_leader_fight_page(page, action='arm'):
+    """Chủ bấm F1/F2/3 (hoặc toggle stop) → PartyLeader broadcast arm/stop phụ."""
+    for module in list(sys.modules.values()):
+        try:
+            if getattr(module, 'NAME', None) != 'PartyLeader':
+                continue
+            hook = getattr(module, 'on_leader_ghost_page', None)
+            if callable(hook):
+                hook(page, action)
                 return True
         except Exception:
             continue
@@ -1142,6 +1159,7 @@ def pvp_gate_tick(client, character):
               and (pvp_armed or (pvp_activation and not pvp_activation.get('gear_only'))
                    or (not pvp_trigger_mode and not pvp_paused))):
             pause_pvp('bấm %s lần nữa' % page, notify=False)
+            notify_party_leader_fight_page(page, 'stop')
             f_keys_held = held
         elif not pvp_trigger_mode:
             pvp_paused = False
@@ -1149,6 +1167,8 @@ def pvp_gate_tick(client, character):
             f_keys_held = held
         elif page in pvp_allowed_pages:
             request_pvp_page(page, physical=True)
+            if page in ('F1', 'F2', 'F3'):
+                notify_party_leader_fight_page(page, 'arm')
         else:
             if pvp_trigger_mode:
                 pause_pvp('trang %s chưa bật cho Ghost' % page, cancel_action=False)
@@ -1162,6 +1182,7 @@ def pvp_gate_tick(client, character):
             and current_page in pvp_allowed_pages
             and (pvp_selection_request or pvp_person_target(pvp_target, character))):
         request_pvp_page(current_page,physical=True)
+        notify_party_leader_fight_page('3', 'arm')
     if pvp_activation is not None and pvp_activation.get('gear_only'):
         prepare_pvp_page(client)
         return False
