@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party force F v2.3.2] party prefer: Target Enemy + force Ghost F key before
+  arm/cast (fix “Ghost chưa ở chế độ Chọn người → bấm F” on Phụ).
 - [FIX party B070 rotate v2.3.1] after B070 miss on a skill (e.g. 54016): ≤2 soft
   retries then cooldown+7081 cut+next Ghost F skill (never infinite “chưa nhận B070”).
 - [FIX party prefer cast v2.3] B074 03 00 04 40 = ActionRefusal (thường OOR/busy):
@@ -54,9 +56,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '2.3.1'
-# raw-main download stamp: 2026-11-11T13:45Z (UTF-8 no BOM/U+200B)
-# baseline 2.3 + B070 miss → rotate next Ghost F (no forever soft-wait)
+VERSION = '2.3.2'
+# raw-main download stamp: 2026-11-11T16:00Z (UTF-8 no BOM/U+200B)
+# baseline 2.3.1 + party force Target Enemy + Ghost F before cast
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
@@ -5227,6 +5229,99 @@ def party_sync_apply_page(page):
     return page
 
 
+def party_sync_force_engage(page, uid, client=None, reason='party prefer'):
+    """Before party Ghost cast: Target Enemy (player select) + force Ghost F key.
+
+    Solo Ghost needs “Chọn người → bấm F”. Party sync skipped F when native
+    (page_sent=True). Force both so Phụ actually enters combat mode.
+    Returns True when Ghost armed or activation is in progress.
+    """
+    global pvp_activation, pvp_armed, pvp_paused, pvp_target, direct_target
+    global current_page, exchange_key, pvp_first_skill, direct_index, direct_blocked_target
+    client = client or get_client() or {}
+    page = str(page or '').strip().upper()
+    if page not in PVP_EDIT_PAGES:
+        page = QtBind.text(gui, auto_pk_page_field) or 'F2'
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    runtime = auto_pk_runtime if auto_pk_running else None
+    now = monotonic()
+    # 1) Target Enemy / player-select key (Home/End/Insert/…) when configured.
+    enemy_fired = False
+    if runtime is not None:
+        key = int(runtime.get('native_key') or 0)
+        if not key:
+            try:
+                _, key = read_auto_pk_enemy_key()
+                runtime['native_key'] = int(key or 0)
+            except ValueError:
+                key = 0
+        if key:
+            window = client.get('window')
+            enemy_fired = bool(post_game_key(key, window) if window else False)
+            if not enemy_fired:
+                enemy_fired = bool(auto_pk_try_native_enemy_key(
+                    runtime, client, now, '%s Target Enemy' % reason))
+            if enemy_fired:
+                runtime['native_uid'] = uid or runtime.get('native_uid') or 0
+                runtime['native_source'] = 'party Target Enemy'
+    # 2) Soft-lock UID then request Ghost page — force F key (page_sent=False).
+    if uid > 0:
+        pvp_target = direct_target = uid
+        pvp_paused = False
+    if page not in (pvp_allowed_pages or ()):
+        try:
+            party_sync_apply_page(page)
+        except ValueError as error:
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Phụ chưa đánh: %s' % error)
+            log('[%s] party force engage: %s' % (NAME, error))
+            return False
+    request_pvp_page(page, physical=False)
+    if pvp_activation is None:
+        # pvp_person_target may have refused — still force activation for party UID.
+        if uid > 0 and page in (pvp_allowed_pages or (page,)):
+            clear_pending()
+            pvp_paused = False
+            pvp_armed = False
+            pvp_first_skill = True
+            current_page = page
+            if runtime_skill_groups:
+                use_skill_group(page, runtime=True)
+            if direct_skills:
+                direct_index = 0
+                direct_blocked_target = 0
+            slot = pvp_page_exchanges.get(page)
+            exchange_key = ord(slot) if slot else None
+            pvp_activation = {
+                'page': page, 'target': uid, 'page_sent': False,
+                'ready_at': now, 'move': None, 'gear_only': False,
+                'party_force_f': True,
+            }
+        else:
+            QtBind.setText(
+                gui, auto_pk_status_label,
+                'Phụ chưa đánh: Ghost chưa ở chế độ Chọn người → bấm F · nhóm %s.'
+                % page)
+            return False
+    else:
+        pvp_activation['page_sent'] = False  # force press_pvp_key / PostMessage F
+        pvp_activation['party_force_f'] = True
+        pvp_activation['target'] = uid or pvp_activation.get('target')
+    # 3) Prepare: posts F key, then gear, then pvp_armed.
+    prepare_pvp_page(client)
+    if not pvp_armed and pvp_activation is not None:
+        prepare_pvp_page(client)
+    status = ('Party engage %s · UID %s · TargetEnemy=%s · Ghost=%s'
+              % (page, uid or '-', 'OK' if enemy_fired else 'skip',
+                 'ON' if pvp_armed else 'đang F/đổi đồ'))
+    QtBind.setText(gui, auto_pk_status_label, status)
+    log('[%s] %s' % (NAME, status))
+    return bool(pvp_armed or pvp_activation is not None)
+
+
 def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
     """Hook công khai: PartyLeader bật Auto PK theo nhóm F (F1–F3)."""
     global auto_pk_owner
@@ -5256,6 +5351,8 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
                 % (NAME, QtBind.text(gui, auto_pk_page_field), prefer_uid, source))
             if prefer_uid:
                 party_sync_select_uid(prefer_uid, source=source)
+            elif page in PVP_EDIT_PAGES:
+                party_sync_force_engage(page, 0, reason='party arm')
             return True
         request_auto_pk_arm()
         if not auto_pk_running:
@@ -5273,6 +5370,8 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
             % (NAME, QtBind.text(gui, auto_pk_page_field), source))
         if prefer_uid:
             party_sync_select_uid(prefer_uid, source=source)
+        elif page in PVP_EDIT_PAGES:
+            party_sync_force_engage(page, 0, reason='party arm')
         return True
     except Exception as error:
         log('[%s] party_sync_arm lỗi: %s' % (NAME, error))
@@ -5377,17 +5476,17 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         pvp_target = direct_target = uid
         pvp_paused = False
         page = runtime.get('page') or QtBind.text(gui, auto_pk_page_field) or 'F2'
-        request_pvp_page(page)
-        if pvp_activation is not None:
-            prepare_pvp_page(get_client() or {})
-        if pvp_target != uid or (not pvp_armed and pvp_activation is None):
-            report_error('Đã nhận UID %d nhưng chưa kích hoạt được Ghost %s; xem trạng thái nhóm/vũ khí.' %
-                         (uid, page))
+        client = get_client() or {}
+        engaged = party_sync_force_engage(page, uid, client=client, reason=source)
+        if pvp_target != uid or (not engaged and not pvp_armed and pvp_activation is None):
+            report_error(
+                'Phụ chưa đánh: Ghost chưa ở chế độ Chọn người → bấm F · UID %d · nhóm %s.'
+                % (uid, page))
             return False
         if pvp_armed:
             rotate_direct(get_character_data() or {}, gate_checked=True)
         log('[%s] Party UID %d · Ghost %s · %s.' %
-            (NAME, uid, page, 'đã kích hoạt' if pvp_armed else 'đang chuẩn bị nhóm/vũ khí'))
+            (NAME, uid, page, 'đã kích hoạt' if pvp_armed else 'đang F/đổi đồ (party force)'))
         return True
 
 
