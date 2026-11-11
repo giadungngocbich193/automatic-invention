@@ -22,8 +22,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.56'
-# raw-main download stamp: 2026-11-11T01:35Z (UTF-8 no BOM/U+200B) · no radius-return while fight/farm
+VERSION = '1.8.57'
+# raw-main download stamp: 2026-11-11T01:45Z (UTF-8 no BOM/U+200B)
+# [FIX never abort PvP in attack range] refuse camp return while engaged player still in vùng đánh
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -696,11 +697,12 @@ def pause_pvp(reason, clear_target=False, cancel_action=True, notify=True):
             auto_pk_runtime.pop('select_in_event', None)
             auto_pk_runtime.pop('target_outside', None)
             auto_pk_runtime.update(requested=0, select_until=0.0, native_probe_until=0.0, skill_probe_uid=0)
+        # [FIX never abort PvP in attack range] clear_target must NOT start camp return.
+        # Only force_auto_pk_return / hold_auto_pk may set auto_pk_returning.
         if (not auto_pk_returning and auto_pk_runtime is not None and pvp_target and pvp_armed
                 and direct_exchange_wait is None and not auto_pk_in_background(get_client() or {})):
             auto_pk_runtime['withdraw']={'target':pvp_target,'sent':False,'observed':False,
                                          'deadline':monotonic()+2.0}
-        auto_pk_returning=True
     pvp_resume_page = None
     was_active = (pvp_armed or key_attempt is not None or pending is not None or direct_expected is not None
                   or (pvp_activation and pvp_activation.get('emergency'))
@@ -3703,17 +3705,16 @@ def auto_pk_target_distance(target, center, runtime):
     return auto_pk_distance(target, center)
 
 
-def auto_pk_radius_check(uid):
-    runtime = auto_pk_runtime
-    if not runtime:
-        return False, 'chưa bật Auto PK'
+def auto_pk_player_attack_range(uid, runtime=None):
+    """True when PLAYER uid is still inside attack radius (vùng đánh) from camp anchor.
+
+    [FIX never abort PvP in attack range] Self can be outside while target stays inside —
+    that must NOT count as leave-range.
+    """
+    runtime = runtime if runtime is not None else auto_pk_runtime
+    if not runtime or not uid:
+        return False, 'chưa bật Auto PK / thiếu UID'
     anchor = runtime['anchor']
-    position = get_position() or {}
-    own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
-    if own_distance is None:
-        return False, 'thiếu tọa độ hoặc đã đổi vùng'
-    if own_distance > runtime['radius']:
-        return False, AUTO_PK_OUTSIDE_SELF
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
     if not isinstance(target, dict):
@@ -3726,7 +3727,34 @@ def auto_pk_radius_check(uid):
         return False, 'tạm thiếu dữ liệu Player'
     if distance > runtime['radius']:
         return False, AUTO_PK_OUTSIDE_TARGET
-    return True, 'mục tiêu cách điểm chờ %.1f m' % distance
+    return True, 'mục tiêu trong vùng đánh %.1f m' % distance
+
+
+def auto_pk_radius_check(uid):
+    runtime = auto_pk_runtime
+    if not runtime:
+        return False, 'chưa bật Auto PK'
+    # [FIX never abort PvP in attack range] Target still in vùng đánh wins over self-outside.
+    in_attack, attack_detail = auto_pk_player_attack_range(uid, runtime)
+    if in_attack:
+        return True, attack_detail
+    if attack_detail == AUTO_PK_OUTSIDE_TARGET:
+        return False, AUTO_PK_OUTSIDE_TARGET
+    if attack_detail in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
+        return False, attack_detail
+    anchor = runtime['anchor']
+    position = get_position() or {}
+    own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
+    if own_distance is None:
+        return False, attack_detail if attack_detail == 'tạm thiếu dữ liệu Player' else 'thiếu tọa độ hoặc đã đổi vùng'
+    if own_distance > runtime['radius']:
+        # Engaged chase: self outside alone is not a hard fail when Player list is thin.
+        if attack_detail == 'tạm thiếu dữ liệu Player' and (pvp_target == uid or direct_target == uid):
+            return False, 'tạm thiếu dữ liệu Player'
+        return False, AUTO_PK_OUTSIDE_SELF
+    if attack_detail == 'tạm thiếu dữ liệu Player':
+        return False, 'tạm thiếu dữ liệu Player'
+    return False, attack_detail
 
 
 def auto_pk_target_unavailable(runtime, uid, target, now):
@@ -4529,9 +4557,9 @@ def tick_auto_pk(from_event=False):
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
-        fighting = bool(pvp_target or runtime.get('mob_uid') or runtime.get('mob_requested'))
-        # Idle only: pull back if you wander past camp. Never pause mid-fight/farm.
-        if distance > runtime['radius'] and not fighting:
+        engaged_uid = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
+        # [FIX never abort PvP in attack range] Idle wander only. Engaged player → never camp return here.
+        if distance > runtime['radius'] and not engaged_uid:
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
@@ -4541,17 +4569,40 @@ def tick_auto_pk(from_event=False):
             auto_pk_select(character, runtime, now, from_event=from_event)
             return False
         eligible, reason = auto_pk_radius_check(pvp_target)
-        # Keep attacking outside camp radius — no quay về while locked on UID.
-        if reason in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
+        in_attack, attack_detail = auto_pk_player_attack_range(pvp_target, runtime)
+        active = pvp_armed or pvp_activation is not None
+        # [FIX never abort PvP in attack range] Target still in vùng đánh → keep casting.
+        if in_attack:
             runtime.pop('target_outside', None)
             runtime.pop('missing_since', None)
-            active = pvp_armed or pvp_activation is not None
-            return bool(active)
+            return True
+        if reason == AUTO_PK_OUTSIDE_SELF:
+            # Self left camp while chasing — keep engage; do not quay về.
+            runtime.pop('target_outside', None)
+            runtime.pop('missing_since', None)
+            report('[FIX never abort PvP in attack range] self ngoài bán kính · giữ UID %d · %s'
+                   % (pvp_target, attack_detail))
+            return True
+        if reason == AUTO_PK_OUTSIDE_TARGET:
+            uid, since = runtime.get('target_outside', (0, now))
+            if uid != pvp_target:
+                runtime['target_outside'] = (pvp_target, now)
+                runtime.pop('missing_since', None)
+                report('[FIX never abort PvP in attack range] chờ xác nhận mục tiêu ngoài vùng · UID %d'
+                       % pvp_target)
+                return bool(active)
+            if now - since < AUTO_PK_TARGET_OUTSIDE_CONFIRM:
+                return bool(active)
+            # Confirmed left vùng đánh — release lock without camp-return pause; reselect.
+            runtime.pop('target_outside', None)
+            report_error('[FIX never abort PvP in attack range] UID %d đã ra vùng đánh · bỏ khóa, không quay về.'
+                         % pvp_target)
+            release_auto_pk_target(pvp_target, AUTO_PK_OUTSIDE_TARGET)
+            return False
         runtime.pop('target_outside', None)
         if reason in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
             release_auto_pk_target(pvp_target, reason)
             return False
-        active = pvp_armed or pvp_activation is not None
         if eligible and active:
             runtime.pop('missing_since', None)
             return True
@@ -4568,9 +4619,14 @@ def tick_auto_pk(from_event=False):
         runtime.pop('missing_since', None)
         if eligible:
             reason = 'chuỗi đánh đã dừng, xem lý do ngay trước dòng này'
-        report_error('Auto PK bỏ khóa UID %d: %s.' % (pvp_target, reason))
+        report_error('[FIX never abort PvP in attack range] bỏ khóa UID %d: %s (không quay về).'
+                     % (pvp_target, reason))
+        # clear_target must NOT start camp return — reselect next tick.
         pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
-        # Do not force camp return after a dropped lock mid-fight — reselect next tick.
+        if auto_pk_returning:
+            auto_pk_returning = False
+            runtime.pop('withdraw', None)
+            report('[FIX never abort PvP in attack range] hủy auto_pk_returning sau bỏ khóa.')
         QtBind.setText(gui, auto_pk_status_label, 'Bỏ UID · tìm mục tiêu khác (không dừng đánh).')
     if auto_pk_returning:
         withdraw = runtime.get('withdraw')
@@ -4596,15 +4652,28 @@ def tick_auto_pk(from_event=False):
 
 
 def force_auto_pk_return(runtime, reason):
+    """Camp return. Hard-blocked while a PLAYER engage is still in attack range."""
     global auto_pk_returning
     if auto_pk_returning:
         return
+    engaged = int(pvp_target or 0) or int(direct_target or 0) or int((runtime or {}).get('requested') or 0)
+    if engaged:
+        in_attack, detail = auto_pk_player_attack_range(engaged, runtime)
+        # [FIX never abort PvP in attack range] Refuse quay về while target in vùng đánh
+        # OR while self-only outside during an active lock (chase).
+        if in_attack or reason in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
+            report_error('[FIX never abort PvP in attack range] từ chối quay về · UID %d · lý do=%s · %s'
+                         % (engaged, reason, detail))
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Giữ đánh UID %d · bỏ qua %s.' % (engaged, reason))
+            return
     auto_pk_returning = True
     runtime.pop('withdraw', None)
     runtime.pop('patrol_destination', None)
     runtime['move_at'] = 0.0
     pause_pvp('Auto PK: ' + reason, clear_target=True, cancel_action=False, notify=False)
-    report_error('Auto PK: %s (%.1f m) · quay về điểm bật.' % (reason, runtime['radius']))
+    report_error('[FIX never abort PvP in attack range] quay về chỉ khi idle/không engage · %s (%.1f m) · quay về điểm bật.'
+                 % (reason, runtime['radius']))
     QtBind.setText(gui, auto_pk_status_label, 'Quay về điểm chờ · ' + reason + '.')
     move_auto_pk_to_anchor(runtime)
 
