@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party B070 rotate v2.3.1] after B070 miss on a skill (e.g. 54016): ≤2 soft
+  retries then cooldown+7081 cut+next Ghost F skill (never infinite “chưa nhận B070”).
 - [FIX party prefer cast v2.3] B074 03 00 04 40 = ActionRefusal (thường OOR/busy):
   party prefer dùng approach ≤6m + all-B074 pause 2.5s + 7081 cut (giữ prefer);
   không soft-clear sau 7 lượt; Leader F1 debounce (no spam lệnh đánh).
@@ -52,14 +54,15 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '2.3'
-# raw-main download stamp: 2026-11-11T13:30Z (UTF-8 no BOM/U+200B)
-# baseline 2.2 + party prefer range/all-B074 pause (no soft-clear unlock)
+VERSION = '2.3.1'
+# raw-main download stamp: 2026-11-11T13:45Z (UTF-8 no BOM/U+200B)
+# baseline 2.3 + B070 miss → rotate next Ghost F (no forever soft-wait)
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
 PARTY_PREFER_RESELECT_DEBOUNCE = 2.0
 PARTY_PREFER_LOG_INTERVAL = 60.0
+PARTY_PREFER_B070_MISS_MAX = 2  # soft retries per skill then skip+cut+next
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -5587,20 +5590,59 @@ def _party_prefer_unreachable_reason(reason):
 
 
 def party_prefer_wait_timeout(runtime, now):
-    """B070 miss after confirm window → soft-wait same skill (never unlock prefer)."""
+    """B070 miss after confirm window — solo Ghost cadence.
+
+    1–2 soft retries of the SAME skill, then cooldown that skill, 7081 cut,
+    and rotate to the NEXT Ghost F skill. NEVER infinite “chưa nhận B070”.
+    Prefer UID stays locked.
+    """
     global direct_expected, direct_retry_state, pvp_cast_deadline
     if direct_expected is None:
         return
     skill_id, uid = direct_expected
-    soft_wait_b070_without_attempt(
-        skill_id, uid,
-        'Party UID %d · chưa nhận B070 skill %d · giữ prefer, thử lại'
-        % (uid, skill_id))
+    miss_skill, miss_count = runtime.get('party_b070_miss', (0, 0))
+    try:
+        miss_skill = int(miss_skill or 0)
+        miss_count = int(miss_count or 0)
+    except (TypeError, ValueError):
+        miss_skill, miss_count = 0, 0
+    if miss_skill == skill_id:
+        miss_count += 1
+    else:
+        miss_count = 1
+    runtime['party_b070_miss'] = (skill_id, miss_count)
+
+    if miss_count < PARTY_PREFER_B070_MISS_MAX:
+        # One more soft retry of this skill (re-send 7074), then skip.
+        soft_wait_b070_without_attempt(
+            skill_id, uid,
+            'Party UID %d · chưa nhận B070 skill %d · thử lại %d/%d'
+            % (uid, skill_id, miss_count, PARTY_PREFER_B070_MISS_MAX))
+        # Actually re-inject once so we are not idle-waiting.
+        packet = struct.pack('<BBIBI', 1, 4, int(skill_id), 1, int(uid))
+        try:
+            inject_joymax(0x7074, packet, False)
+        except Exception:
+            pass
+        _auto_pk_debounced_log(
+            runtime, 'party_wait_b070_at',
+            'Party UID %d · chưa nhận B070 skill %d · thử lại %d/%d (giữ mục tiêu)'
+            % (uid, skill_id, miss_count, PARTY_PREFER_B070_MISS_MAX),
+            interval=2.0)
+        return
+
+    # Miss budget exhausted → skip this skill, cut, rotate next (like solo Ghost F).
+    runtime.pop('party_b070_miss', None)
+    retries = runtime.setdefault('skill_retry_at', {})
+    retries[int(skill_id)] = now + 1.25
+    runtime['party_need_cut'] = True
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = now + 0.35
     _auto_pk_debounced_log(
         runtime, 'party_wait_b070_at',
-        'Party UID %d · chưa nhận B070 skill %d · giữ mục tiêu (không bỏ khóa).'
-        % (uid, skill_id),
-        interval=5.0)
+        'Party UID %d · bỏ skill %d (hết %d lần chờ B070) · cut + skill kế (giữ prefer)'
+        % (uid, skill_id, PARTY_PREFER_B070_MISS_MAX),
+        interval=2.0)
 
 
 def party_prefer_prepare_cast(runtime, uid, now=None):
@@ -7085,6 +7127,7 @@ def handle_joymax(opcode, data):
             if runtime is not None:
                 runtime.pop('party_refusal_count', None)
                 runtime.pop('party_b074_skills', None)
+                runtime.pop('party_b070_miss', None)
                 runtime.pop('party_all_b074_need_prep', None)
                 runtime.pop('party_need_cut', None)
             if runtime is not None and is_party_sync_prefer_uid(target, runtime):
