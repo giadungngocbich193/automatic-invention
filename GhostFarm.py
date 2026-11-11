@@ -2,10 +2,11 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
-- v1.0.7: Port AG cut sequence — prewarm (arm1→completed4) then Timer(cfg_ms)
-  from 7074 send → bridge.arm(2) exactly like AutoGhost send_pvp_interrupt /
-  GhostNativeProbe arm path. NEVER rebase cut on B070 (that made since_7074≈500ms
-  with cfg=1). since_7074 in log must ≈ cfg ms.
+- v1.0.8: Match AG PVP interrupt byte-for-byte timing — wait S→C B070 (cast
+  landed / mid-animation) THEN Timer(cfg_ms) → arm(2). 1.0.7 cut at 7074+ms
+  aborted cast before hit (no B070, “skill không đánh”). Keep prewarm before
+  cast. Fallback: if no B070 within 800ms, cut as 7074+cfg_ms.
+- v1.0.7: Prewarm then Timer from 7074 (too early — aborted cast before B070).
 - v1.0.6: Real Ghost overlap — pre-warm NativeCut BEFORE cast; fire arm(2) at
   configured ms from 7074 send (prefer: wait B070 then +ms). Do NOT spend the
   delay installing/verifying the hook after the cast window (that cut after XP
@@ -69,7 +70,7 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.7'
+VERSION = '1.0.8'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -112,6 +113,8 @@ RESEND_GAP_SEC = 0.75
 NO_TARGET_RETRY_SEC = 1.0
 SELECT_WAIT_SEC = 0.25  # after 7045 before skill cast
 DEFAULT_GHOST_DELAY_MS = 0  # used when skill has no =ms (bare id)
+# AG schedules Timer on B070; if confirm never arrives, fall back after this.
+B070_WAIT_SEC = 0.8
 # After GetTickCount / install conflict — do not re-spam NativeCut every 0.75s.
 HOOK_CONFLICT_BACKOFF_SEC = 8.0
 
@@ -176,8 +179,8 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 236)
 
 QtBind.createLabel(
     gui,
-    'v1.0.7: pre-warm trước cast; arm(2) ĐÚNG cfg_ms sau 7074 (không chờ B070). '
-    'Skill: 80031=1;66007=20 → since_7074≈1/20ms. Quái chết: vẫn Ghost self.',
+    'v1.0.8: prewarm → 7074 → chờ B070 → Timer(cfg_ms)→arm(2) (như AG). '
+    'Thiếu B070 800ms → fallback 7074+ms. Skill: 80031=1;66007=20.',
     10, 268,
 )
 
@@ -947,7 +950,7 @@ def btn_start():
     _cancel_cut_timer(active)
     preview = ';'.join('%d=%d' % pair for pair in entries[:6])
     set_status(
-        'START farm · r=%gm · %s — 7045→7074→Timer(ms)→arm(2) self'
+        'START farm · r=%gm · %s — 7045→7074→B070→Timer(ms)→arm(2)'
         % (read_radius(), preview))
 
 
@@ -1117,20 +1120,22 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
         job['send_deadline'] = now + 2.0
         job['next_at'] = now + 0.02
         cast_at = float(job.get('cast_at') or 0)
+        b070_at = float(job.get('b070_at') or 0)
         delay_ms = int(job.get('ghost_delay_ms') or 0)
-        lag_ms = int(round((now - cast_at) * 1000)) if cast_at else -1
+        since_7074 = int(round((now - cast_at) * 1000)) if cast_at else -1
+        since_b070 = int(round((now - b070_at) * 1000)) if b070_at else -1
         with lock:
             state['last_send_uid'] = uid
             state['last_send_at'] = now
             state['pending_watch_until'] = now + 3.0
         _log(
             'NativeCut arm(2) CUT NOW · reason=%s · self=%d · skill=%d · '
-            'delay_cfg=%dms · since_7074=%dms · hex=%s'
-            % (reason, uid, int(job.get('skill_id') or 0), delay_ms, lag_ms,
-               job.get('hex') or '?'))
+            'delay_cfg=%dms · since_B070=%dms · since_7074=%dms · hex=%s'
+            % (reason, uid, int(job.get('skill_id') or 0), delay_ms, since_b070,
+               since_7074, job.get('hex') or '?'))
         set_status(
-            'Ghost CUT self=%d · since_7074=%dms (cfg=%dms) · skill=%d'
-            % (uid, lag_ms if lag_ms >= 0 else delay_ms, delay_ms,
+            'Ghost CUT self=%d · since_B070=%dms (cfg=%dms) · skill=%d'
+            % (uid, since_b070 if since_b070 >= 0 else delay_ms, delay_ms,
                int(job.get('skill_id') or 0)))
         return True
     except Exception as error:
@@ -1138,15 +1143,22 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
         return False
 
 
-def _schedule_cut_from_7074(job, uid, delay_ms):
-    """Port AG Timer(delay, queue_interrupt) — but anchor = 7074 send, not B070."""
+def _schedule_ag_cut_timer(job, uid, delay_ms, anchor='B070'):
+    """AutoGhost handle_joymax B070 → Timer(delay) → queue_interrupt → arm(2).
+
+    AG stores delay in seconds (pvp_delays[skill]); Farm UI uses ms → convert here.
+    """
     _cancel_cut_timer(job)
     delay_s = max(0, int(delay_ms)) / 1000.0
     ticket = object()
     job['cut_ticket'] = ticket
+    job['cut_anchor'] = anchor
+    job['phase'] = 'cut_wait'
+    job['cut_at'] = monotonic() + delay_s
 
     def _timer_fire():
-        # Mirrors AutoGhost queue_interrupt → begin_native_cut → send_pvp_interrupt.
+        # Mirrors AutoGhost queue_interrupt → fire_interrupt → begin_native_cut
+        # → send_pvp_interrupt → session['bridge'].arm(2).
         with lock:
             if state.get('active') is not job:
                 return
@@ -1155,15 +1167,29 @@ def _schedule_cut_from_7074(job, uid, delay_ms):
             if job.get('phase') != 'cut_wait':
                 return
             job['phase'] = 'cut_now'
-        _fire_native_cut(job, uid, reason='7074+%dms' % int(delay_ms))
+        _fire_native_cut(job, uid, reason='%s+%dms' % (anchor, int(delay_ms)))
 
     timer = Timer(delay_s, _timer_fire)
     timer.daemon = True
     job['cut_timer'] = timer
     timer.start()
     _log(
-        'CUT TIMER scheduled · AG-style Timer(%.3fs) from 7074 · cfg=%dms · self=%d · skill=%d'
-        % (delay_s, int(delay_ms), uid, int(job.get('skill_id') or 0)))
+        'CUT TIMER scheduled · AG Timer(%.3fs) after %s · cfg=%dms · self=%d · skill=%d'
+        % (delay_s, anchor, int(delay_ms), uid, int(job.get('skill_id') or 0)))
+
+
+def _fallback_cut_from_7074(job, uid, now):
+    """No B070 within B070_WAIT_SEC — cut at 7074+cfg (remaining time)."""
+    delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
+    cast_at = float(job.get('cast_at') or now)
+    elapsed = max(0.0, now - cast_at)
+    remaining_s = max(0.0, (delay_ms / 1000.0) - elapsed)
+    remaining_ms = int(round(remaining_s * 1000))
+    _log(
+        'B070 MISSING after %.0fms · fallback Timer(7074+%dms) remaining=%dms'
+        % (B070_WAIT_SEC * 1000, delay_ms, remaining_ms))
+    job['b070_miss'] = True
+    _schedule_ag_cut_timer(job, uid, remaining_ms, anchor='7074-fallback')
 
 
 def _classify_b074(data):
@@ -1316,15 +1342,14 @@ def _drive_native_queue(now):
             alive = select_uid > 0 and any(row['uid'] == select_uid for row in rows)
             if not alive:
                 _log(
-                    'CAST: quái #%d đã chết/mất — bỏ 7074, vẫn cut self tại T+%dms'
+                    'CAST: quái #%d đã chết/mất — bỏ 7074, cut self sau %dms (no B070)'
                     % (select_uid, delay_ms))
                 job['cast_sent'] = True
                 job['cast_api'] = 'skipped_dead_target'
                 job['cast_at'] = now
-                job['cut_at'] = now + (delay_ms / 1000.0)
-                job['phase'] = 'cut_wait'
+                job['b070_deadline'] = now  # no cast → no B070; Timer(cfg) now
+                _schedule_ag_cut_timer(job, uid, delay_ms, anchor='dead-skip')
                 job['next_at'] = now + max(0.01, delay_ms / 1000.0)
-                _schedule_cut_from_7074(job, uid, delay_ms)
                 set_status(
                     'Quái #%d chết — Ghost self tại T+%dms' % (select_uid, delay_ms))
                 return
@@ -1336,39 +1361,51 @@ def _drive_native_queue(now):
             job['cast_sent'] = True
             job['cast_api'] = api
             job['cast_at'] = now
-            # AG cut body = Timer → arm(2). Farm anchor = 7074 send (NOT B070).
-            job['cut_at'] = now + (delay_ms / 1000.0)
+            job['b070_seen'] = False
+            job['b070_at'] = 0.0
+            job['b070_deadline'] = now + B070_WAIT_SEC
+            # AG: do NOT Timer yet — wait S→C B070 then Timer(cfg) → arm(2).
+            job['phase'] = 'wait_b070'
+            job['next_at'] = now + 0.02
             _log(
-                'C→S 0x7074 CAST · skill=%d · target=%d · Timer(7074+%dms) → arm(2) · '
+                'C→S 0x7074 CAST · skill=%d · target=%d · chờ B070 rồi Timer(+%dms) · '
                 'hex=%s · API=%r'
                 % (skill_id, select_uid, delay_ms, _hex_bytes(packet), api))
             if api is False:
                 _log(
-                    '7074 API=False skill=%d target=%d — vẫn Timer cut tại 7074+%dms'
-                    % (skill_id, select_uid, delay_ms))
-            job['phase'] = 'cut_wait'
-            job['next_at'] = now + max(0.01, delay_ms / 1000.0)
-            _schedule_cut_from_7074(job, uid, delay_ms)
+                    '7074 API=False skill=%d target=%d — vẫn chờ B070 / fallback 800ms'
+                    % (skill_id, select_uid))
             set_status(
-                'Cast skill %d → Timer Ghost self +%dms sau 7074'
+                'Cast skill %d → chờ B070 rồi Ghost +%dms (AG)'
                 % (skill_id, delay_ms))
             return
 
+        if phase == 'wait_b070':
+            # Primary: handle_joymax schedules AG Timer on B070.
+            if job.get('cut_fired') or job.get('cut_timer') is not None:
+                return
+            deadline = float(job.get('b070_deadline') or 0)
+            if now >= deadline:
+                _fallback_cut_from_7074(job, uid, now)
+                job['next_at'] = now + 0.02
+                return
+            job['next_at'] = min(now + 0.02, deadline)
+            return
+
         if phase == 'cut_wait':
-            # Primary fire is Timer from 7074. Backup poll if timer missed.
+            # AG Timer owns the cut; backup poll if timer thread missed.
             if job.get('cut_fired'):
                 return
-            delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
-            cast_at = float(job.get('cast_at') or now)
-            cut_at = float(job.get('cut_at') or (cast_at + delay_ms / 1000.0))
-            if now < cut_at:
+            cut_at = float(job.get('cut_at') or 0)
+            if cut_at and now < cut_at:
                 job['next_at'] = min(now + 0.02, cut_at)
                 return
             if job.get('cut_timer') is not None:
-                # Timer still pending — let it own the cut (more precise).
                 job['next_at'] = now + 0.02
                 return
-            if not _fire_native_cut(job, uid, now, reason='7074+%dms-backup' % delay_ms):
+            delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
+            anchor = job.get('cut_anchor') or 'B070'
+            if not _fire_native_cut(job, uid, now, reason='%s+%dms-backup' % (anchor, delay_ms)):
                 job['next_at'] = now + 0.01
                 return
             return
@@ -1377,7 +1414,8 @@ def _drive_native_queue(now):
             # Timer thread flipped phase; ensure arm(2) landed (idempotent).
             if not job.get('cut_fired'):
                 delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
-                if not _fire_native_cut(job, uid, now, reason='7074+%dms' % delay_ms):
+                anchor = job.get('cut_anchor') or 'B070'
+                if not _fire_native_cut(job, uid, now, reason='%s+%dms' % (anchor, delay_ms)):
                     job['next_at'] = now + 0.01
             return
 
@@ -1548,7 +1586,7 @@ def handle_silkroad(opcode, data):
 
 
 def handle_joymax(opcode, data):
-    """Watch B070 (log only) and B074 after NativeCut arm(2). Never schedule cut on B070."""
+    """AG path: B070 confirms cast → Timer(cfg) → arm(2). Also watch B074 after cut."""
     if not plugin_enabled():
         return
     if opcode not in (0xB070, 0xB074, 0xB081, 0xB084, 0x3085):
@@ -1561,25 +1599,43 @@ def handle_joymax(opcode, data):
             job = state.get('active')
 
         if opcode == 0xB070 and job is not None:
-            # Log only. NEVER rebase cut_at / Timer — AG PVP waits B070, but
-            # Farm cut anchors to 7074 send (B070 arrives ~cast duration late).
-            if len(raw) >= 11 and raw[0] == 1:
-                skill, source = struct.unpack_from('<II', raw, 3)
-                expect_skill = int(job.get('skill_id') or 0)
-                self_uid = int(job.get('uid') or state.get('self_uid') or 0)
-                if expect_skill and skill == expect_skill:
-                    if self_uid and source and source != self_uid:
-                        return
-                    now = monotonic()
-                    cast_at = float(job.get('cast_at') or 0)
-                    since_7074 = int(round((now - cast_at) * 1000)) if cast_at else -1
-                    delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
-                    job['b070_seen'] = True
-                    job['b070_at'] = now
-                    _log(
-                        'S→C 0xB070 CAST CONFIRM · skill=%d · source=%s · '
-                        'since_7074=%dms · cut stays Timer(7074+%dms) — NO rebase'
-                        % (skill, source, since_7074, delay_ms))
+            # Byte-for-byte with AutoGhost handle_joymax B070 scheduling gate:
+            #   len(data) >= 19; skill,source @3; target @15; data[0]==1 for cast.
+            # Then Timer(delay) → queue_interrupt → begin_native_cut → arm(2).
+            if job.get('phase') != 'wait_b070':
+                return
+            if job.get('cut_timer') is not None or job.get('cut_fired'):
+                return
+            if len(raw) < 19 or raw[0] != 1:
+                return
+            skill, source = struct.unpack_from('<II', raw, 3)
+            target = struct.unpack_from('<I', raw, 15)[0]
+            expect_skill = int(job.get('skill_id') or 0)
+            expect_target = int(job.get('select_uid') or job.get('monster_uid') or 0)
+            self_uid = int(job.get('uid') or state.get('self_uid') or 0)
+            if not expect_skill or skill != expect_skill:
+                return
+            if self_uid and source and source != self_uid:
+                return
+            if expect_target and target and target != expect_target:
+                return
+            if self_uid and target == self_uid:
+                return
+            now = monotonic()
+            cast_at = float(job.get('cast_at') or 0)
+            since_7074 = int(round((now - cast_at) * 1000)) if cast_at else -1
+            delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
+            job['b070_seen'] = True
+            job['b070_at'] = now
+            _log(
+                'S→C 0xB070 CAST CONFIRM · skill=%d · source=%s · target=%d · '
+                'since_7074=%dms · hẹn AG Timer(+%dms) → arm(2)'
+                % (skill, source, target, since_7074, delay_ms))
+            set_status(
+                'B070 skill %d — Ghost self sau %dms (AG)'
+                % (skill, delay_ms))
+            _schedule_ag_cut_timer(job, int(job.get('uid') or self_uid), delay_ms,
+                                   anchor='B070')
             return
 
         prefix = 'sau NativeCut' if watching else 'ngoài cửa sổ 3s'
@@ -1615,7 +1671,7 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — AG Timer cut: arm(2) đúng cfg_ms sau 7074 (không chờ B070).'
+        'Nạp %s v%s — AG: chờ B070 rồi Timer(cfg)→arm(2); fallback 7074+ms @800ms.'
         % (NAME, VERSION))
 except Exception as error:
     try:
