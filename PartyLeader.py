@@ -2,6 +2,9 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.14: Config PER character PartyLeader_<char>.json (fix shared Chủ);
+  Trace AG_He False → silent move_to Leader; Prefer same UID silent.
+- v1.0.13: Trace AG_He job nick candidates; Prefer silent set_status.
 - v1.0.12: Prefer same UID debounce ≥2.0s (stop 3s Prefer re-log storm).
 - v1.0.11: Prefer backoff ≥1.5s after AG B074 refuse same UID (stop re-arm spam).
 - v1.0.10: Trace AG_He/*AG_He hard-allow; >10m clear prefer+chase; persist
@@ -23,6 +26,7 @@ from __future__ import print_function
 
 import json
 import math
+import re
 import struct
 import sys
 from pathlib import Path
@@ -43,6 +47,11 @@ from phBot import (
 )
 
 try:
+    from phBot import move_to as _phbot_move_to
+except ImportError:
+    _phbot_move_to = None
+
+try:
     from phBot import get_players as _get_players
 except ImportError:
     _get_players = None
@@ -53,7 +62,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.12'
+VERSION = '1.0.14'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -94,9 +103,11 @@ state = {
     'last_b070_uid': 0,
     'last_b070_at': 0.0,
     'last_inject_log_at': 0.0,
+    'prefer_silent_uid': 0,  # same UID already Prefer+cast — no more Log
     'follow_grace_until': 0.0,
     'last_trace_fail_at': 0.0,
     'last_trace_fail_msg': '',
+    'last_trace_ok_name': '',
 }
 
 _ui_applying = False  # True while restore — skip checkbox side-effects
@@ -149,13 +160,42 @@ def _log(msg):
     log('[%s] %s' % (NAME, msg))
 
 
-def set_status(msg):
+def set_status(msg, silent=False):
+    """Update UI status. silent=True → no Log (Prefer keepalive / Trace retry)."""
     QtBind.setText(gui, status_label, 'Trạng thái: ' + msg)
-    _log(msg)
+    if not silent:
+        _log(msg)
 
 
-def config_path():
-    return Path(get_config_dir()) / (CONFIG_NAME + '.json')
+def config_char_key():
+    """Sanitized local CharName for per-character config file."""
+    name = _strip_job_star(self_name())
+    if not name:
+        name = _strip_job_star(self_job_name())
+    if not name:
+        data = get_character_data() or {}
+        for key in ('name', 'charname', 'char_name', 'character_name', 'CharName'):
+            name = _strip_job_star(data.get(key) or '')
+            if name:
+                break
+    if not name:
+        return ''
+    safe = re.sub(r'[^\w\-]+', '_', name, flags=re.UNICODE).strip('._-')
+    return safe[:64]
+
+
+def config_path(char_key=None):
+    """Per-character: PartyLeader_<CharName>.json — never share Chủ across clients."""
+    key = char_key if char_key is not None else config_char_key()
+    base = Path(get_config_dir())
+    if key:
+        return base / ('%s_%s.json' % (CONFIG_NAME, key))
+    # Char unknown (plugin boot before login) — do not use shared file for role.
+    return base / ('%s.json' % CONFIG_NAME)
+
+
+def legacy_shared_config_path():
+    return Path(get_config_dir()) / ('%s.json' % CONFIG_NAME)
 
 
 def _strip_job_star(text):
@@ -822,19 +862,31 @@ def inject_select(uid, reason):
         return False
     with lock:
         now = monotonic()
-        # Strong debounce — same Prefer UID at most once / 2.0s (stop 3s log storm).
-        if uid == state['last_uid'] and (now - state['last_select_at']) < 2.0:
-            return True
-        # AG reported B074 refuse → back off Prefer spam for that UID.
-        if (uid == int(state.get('refuse_uid') or 0)
-                and now < float(state.get('refuse_backoff_until') or 0)):
-            return True
-        state['last_uid'] = uid
-        state['last_select_at'] = now
-        state['fight_held'] = False
-        quiet = (now - state.get('last_inject_log_at', 0)) < 5.0
-        if not quiet:
-            state['last_inject_log_at'] = now
+        silent_uid = int(state.get('prefer_silent_uid') or 0)
+        # Same UID already Prefer+cast — absolute silence (no Log / no status spam).
+        if uid == silent_uid and uid == int(state.get('last_uid') or 0):
+            if (now - state['last_select_at']) < 2.0:
+                return True
+            state['last_select_at'] = now
+            # Fall through to quiet AG refresh only.
+            quiet = True
+            already_silent = True
+        else:
+            already_silent = False
+            # Strong debounce — same Prefer UID at most once / 2.0s.
+            if uid == state['last_uid'] and (now - state['last_select_at']) < 2.0:
+                return True
+            # AG reported B074 refuse → back off Prefer spam for that UID.
+            if (uid == int(state.get('refuse_uid') or 0)
+                    and now < float(state.get('refuse_backoff_until') or 0)):
+                return True
+            state['last_uid'] = uid
+            state['last_select_at'] = now
+            state['fight_held'] = False
+            quiet = True  # never Log Prefer keepalive; only first below
+            if uid != silent_uid:
+                quiet = False
+                state['last_inject_log_at'] = now
 
     ghost = find_autoghost()
     if ghost is not None:
@@ -849,13 +901,19 @@ def inject_select(uid, reason):
                         state['refuse_uid'] = uid
                         state['refuse_backoff_until'] = b074_until
                     return True
+                # AG already cast this prefer UID — mark silent.
+                if (int(runtime.get('party_sync_uid') or 0) == uid
+                        and runtime.get('first_cast_sent')):
+                    with lock:
+                        state['prefer_silent_uid'] = uid
+                    already_silent = True
+                    quiet = True
         except Exception:
             pass
         select_hook = getattr(ghost, 'party_sync_select_uid', None)
         if callable(select_hook):
             try:
                 ok = bool(select_hook(uid, source='%s:%s' % (NAME, reason)))
-                # After select, if AG set B074 backoff — mirror it locally.
                 try:
                     runtime = getattr(ghost, 'auto_pk_runtime', None)
                     if isinstance(runtime, dict):
@@ -865,17 +923,22 @@ def inject_select(uid, reason):
                             with lock:
                                 state['refuse_uid'] = uid
                                 state['refuse_backoff_until'] = b074_until
+                        if ok and (runtime.get('first_cast_sent')
+                                   or int(runtime.get('party_sync_uid') or 0) == uid):
+                            with lock:
+                                state['prefer_silent_uid'] = uid
                 except Exception:
                     pass
-                # F4 may have stopped Auto PK — re-arm then prefer again.
-                # Never re-arm during B074 refuse backoff.
                 if not ok:
                     if uid == int(state.get('refuse_uid') or 0) and monotonic() < float(
                             state.get('refuse_backoff_until') or 0):
                         return True
                     arm_ok = arm_auto_pk(prefer_uid=uid)
                     ok = bool(select_hook(uid, source='%s:%s:rearm' % (NAME, reason))) if arm_ok else False
-                if not quiet:
+                if ok:
+                    with lock:
+                        state['prefer_silent_uid'] = uid
+                if not quiet and not already_silent:
                     set_status('Prefer UID=%d (%s) · AG hook=%r (no 7045)' % (uid, reason, ok))
                 return bool(ok)
             except Exception as error:
@@ -897,12 +960,14 @@ def inject_select(uid, reason):
                 runtime['party_follow_mode'] = True
                 runtime['party_hold_fight'] = False
                 runtime['requested'] = uid
-                if not quiet:
+                with lock:
+                    state['prefer_silent_uid'] = uid
+                if not quiet and not already_silent:
                     set_status('Prefer UID=%d gắn runtime (no 7045)' % uid)
                 return True
         except Exception:
             pass
-    if not quiet:
+    if not quiet and not already_silent:
         set_status('Không AutoGhost hook · bỏ 7045 loop · UID=%d' % uid)
     return False
 
@@ -1082,30 +1147,97 @@ def follower_stop_and_follow(reason):
 
 
 def leader_xy_from_party():
-    """Tọa độ chủ từ get_party (name khớp Leader field)."""
+    """Tọa độ chủ từ get_party / get_players (CharName hoặc job nick AG_He)."""
     char_name, job_name, display = parse_leader_identity(configured_leader())
-    tokens = identity_tokens(char_name, job_name, display)
+    tokens = set(identity_tokens(char_name, job_name, display))
     if not tokens:
         return None
-    party = get_party()
-    if not isinstance(party, dict):
-        return None
-    for member in party.values():
-        if not isinstance(member, dict):
-            continue
-        name = str(member.get('name') or '').strip()
-        if not name or name.casefold() not in tokens:
-            # cũng khớp job_name nếu party chỉ có char name
-            if name.casefold() != char_name.casefold():
-                continue
+
+    def _xy_from(obj, label=''):
+        if not isinstance(obj, dict):
+            return None
         try:
-            x = float(member.get('x'))
-            y = float(member.get('y'))
+            x = float(obj.get('x'))
+            y = float(obj.get('y'))
         except (TypeError, ValueError):
-            continue
-        if math.isfinite(x) and math.isfinite(y):
-            return {'x': x, 'y': y, 'name': name}
-    return None
+            return None
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None
+        z = 0.0
+        try:
+            z = float(obj.get('z') or 0)
+        except (TypeError, ValueError):
+            z = 0.0
+        return {'x': x, 'y': y, 'z': z, 'name': label or str(obj.get('name') or '')}
+
+    party = get_party()
+    master_xy = None
+    if isinstance(party, dict):
+        for member in party.values():
+            if not isinstance(member, dict) or _is_self_member(member):
+                continue
+            m_char, m_job = _resolve_member_identity(member)
+            member_tokens = set(identity_tokens(m_char, m_job, member.get('name')))
+            got = _xy_from(member, m_char or m_job or member.get('name'))
+            if not got:
+                continue
+            if tokens.intersection(member_tokens):
+                return got
+            if _member_is_party_master(member) and master_xy is None:
+                master_xy = got
+    if callable(_get_players):
+        try:
+            players = _get_players() or {}
+        except Exception:
+            players = {}
+        if isinstance(players, dict):
+            for player in players.values():
+                if not isinstance(player, dict):
+                    continue
+                p_char = _strip_job_star(player.get('name') or player.get('charname') or '')
+                p_job = str(player.get('job_name') or player.get('job') or '')
+                if not set(identity_tokens(p_char, p_job, p_char)).intersection(tokens):
+                    continue
+                got = _xy_from(player, p_char or p_job)
+                if got:
+                    return got
+    return master_xy
+
+
+def move_to_leader_silent(reason=''):
+    """When start_trace(AG_He) False — walk toward Leader coords, never spam reject."""
+    leader = leader_xy_from_party()
+    if not leader:
+        set_status('[%s] Trace từ chối · chưa có tọa độ Leader — giữ Auto PK.'
+                   % (reason or 'trace'), silent=True)
+        return False
+    me = get_position() or {}
+    try:
+        z = float(me.get('z', leader.get('z') or 0))
+    except (TypeError, ValueError):
+        z = float(leader.get('z') or 0)
+    mover = _phbot_move_to
+    if not callable(mover):
+        try:
+            import phBot as _ph
+            mover = getattr(_ph, 'move_to', None)
+        except Exception:
+            mover = None
+    if not callable(mover):
+        set_status('[%s] Trace từ chối · phBot thiếu move_to.' % (reason or 'trace'),
+                   silent=True)
+        return False
+    try:
+        result = mover(float(leader['x']), float(leader['y']), z)
+    except Exception as error:
+        set_status('[%s] move_to Leader lỗi: %s' % (reason or 'trace', error), silent=True)
+        return False
+    with lock:
+        state['following'] = True
+        state['last_trace_fail_msg'] = ''
+    set_status('[%s] Trace từ chối AG_He · move_to Leader (%.0f,%.0f)'
+               % (reason or 'trace', leader['x'], leader['y']), silent=True)
+    return result is not False
 
 
 def distance_to_leader():
@@ -1131,51 +1263,126 @@ def _name_is_configured_leader(name):
     return needle in identity_tokens(char_name, job_name, display)
 
 
+def _party_leader_trace_names(hint=''):
+    """Collect every plausible Leader name for start_trace (CharName + AG_He)."""
+    names = []
+    seen = set()
+
+    def _add(value):
+        text = str(value or '').strip()
+        if not text:
+            return
+        variants = (text, _strip_job_star(text))
+        if text.startswith('*'):
+            variants = (text, _strip_job_star(text), '*' + _strip_job_star(text))
+        elif not text.startswith('*') and text:
+            variants = (text, '*' + text, _strip_job_star(text))
+        for item in variants:
+            item = str(item or '').strip()
+            if not item:
+                continue
+            key = item.casefold()
+            if key in seen:
+                continue
+            # Never trace self.
+            if _is_self_identity(item, item):
+                continue
+            seen.add(key)
+            names.append(item)
+
+    hint = str(hint or '').strip()
+    if hint:
+        _add(hint)
+        h_char, h_job, _ = parse_leader_identity(hint)
+        _add(h_char)
+        _add(h_job)
+    cfg = configured_leader()
+    if cfg:
+        _add(cfg)
+        c_name, c_job, _ = parse_leader_identity(cfg)
+        _add(c_name)
+        _add(c_job)
+    # Reuse last OK name first.
+    with lock:
+        last_ok = str(state.get('last_trace_ok_name') or '').strip()
+    if last_ok:
+        names.insert(0, last_ok) if last_ok not in names else None
+        if last_ok in names:
+            names.remove(last_ok)
+            names.insert(0, last_ok)
+    # Party member that matches Leader identity — harvest ALL name fields.
+    party = get_party()
+    if isinstance(party, dict):
+        hint_tokens = set()
+        for part in (hint, cfg, last_ok):
+            c, j, d = parse_leader_identity(part)
+            for token in identity_tokens(c, j, d):
+                if token:
+                    hint_tokens.add(token)
+        for member in party.values():
+            if not isinstance(member, dict) or _is_self_member(member):
+                continue
+            m_char, m_job = _resolve_member_identity(member)
+            member_tokens = identity_tokens(m_char, m_job, member.get('name'))
+            matched = (not hint_tokens) or bool(hint_tokens.intersection(member_tokens))
+            if not matched and not _member_is_party_master(member):
+                continue
+            for key in ('name', 'charname', 'char_name', 'character_name', 'CharName',
+                        'player_name', 'PlayerName', 'nickname', 'nick',
+                        'job_name', 'jobName', 'job', 'guild'):
+                _add(member.get(key))
+            _add(m_char)
+            _add(m_job)
+            if matched or _member_is_party_master(member):
+                # Prioritize distinct CharName ahead of job nick.
+                if m_char and m_job and _strip_job_star(m_char).casefold() != _strip_job_star(m_job).casefold():
+                    if m_char in names:
+                        names.remove(m_char)
+                    names.insert(0, m_char)
+    return names
+
+
 def safe_start_trace(char_name, reason=''):
-    """start_trace with CharName or job nick AG_He/*AG_He. Soft-fail, no spam."""
+    """start_trace accepting CharName OR job nick AG_He/*AG_He for real."""
     raw = str(char_name or '').strip()
     name = _strip_job_star(raw)
-    if not name:
+    if not name and not configured_leader():
         set_status('[%s] Bỏ trace — tên trống.' % (reason or 'trace'))
         return False
-    # Always allow configured Leader / Phụ job nick — never self-reject AG_He.
-    candidates = []
-    for c in (raw, name, '*' + name):
-        c = str(c or '').strip()
-        if c and c not in candidates:
-            candidates.append(c)
-    # Also try configured field variants.
-    cfg = configured_leader()
-    c_name, c_job, _ = parse_leader_identity(cfg)
-    for c in (c_name, _strip_job_star(c_job), c_job,
-              ('*' + _strip_job_star(c_job)) if c_job else ''):
-        c = str(c or '').strip()
-        if c and c not in candidates:
-            candidates.append(c)
+    candidates = _party_leader_trace_names(raw or configured_leader())
+    if not candidates and name:
+        candidates = [raw, name, '*' + name]
+    if not candidates:
+        set_status('[%s] Bỏ trace — không có ứng viên tên Leader.' % (reason or 'trace'))
+        return False
     last_error = None
+    refused = []
     for candidate in candidates:
         try:
             ok = start_trace(candidate)
         except Exception as error:
             last_error = error
+            refused.append('%s:err' % candidate)
             continue
         if ok is False:
+            refused.append(candidate)
             continue
+        # Success (True or None) — remember working name (often CharName, not AG_He).
+        with lock:
+            state['last_trace_ok_name'] = candidate
+            state['following'] = True
+            state['last_trace_fail_msg'] = ''
         return True
-    # Debounce reject spam (distance tick every 2s).
-    msg = ('start_trace từ chối %r (thử %s)%s'
-           % (name, '/'.join(candidates),
-              (': %s' % last_error) if last_error else ''))
+    # start_trace(AG_He) False → silent move_to Leader (never spam reject Log).
     with lock:
         now = monotonic()
-        prev = state.get('last_trace_fail_msg') or ''
         last_at = float(state.get('last_trace_fail_at') or 0)
-        quiet = (msg == prev and (now - last_at) < 5.0)
-        state['last_trace_fail_msg'] = msg
         state['last_trace_fail_at'] = now
-    if not quiet:
-        set_status('[%s] %s — giữ Auto PK, không spam.' % (reason or 'trace', msg))
-    return False
+        state['last_trace_fail_msg'] = 'start_trace False → move_to'
+        moved_recently = (now - last_at) < 1.5
+    if moved_recently:
+        return False
+    return bool(move_to_leader_silent(reason or 'trace'))
 
 
 def follower_ensure_trace(reason):
@@ -1185,13 +1392,19 @@ def follower_ensure_trace(reason):
         # Fallback: raw Leader field / AG_He job nick.
         leader_char = _strip_job_star(configured_leader()) or configured_leader()
         if not leader_char:
-            set_status('[%s] %s' % (reason, error))
+            # Still try walk-to-leader if party coords exist.
+            if move_to_leader_silent(reason):
+                with lock:
+                    state['following'] = True
+                return True
+            set_status('[%s] %s' % (reason, error), silent=True)
             return False
     ok = safe_start_trace(leader_char, reason)
     with lock:
         state['following'] = bool(ok)
+        already = bool(state.get('last_trace_ok_name'))
     if ok:
-        set_status('[%s] Trace → %r · OK' % (reason, leader_char))
+        set_status('[%s] Trace/move → Leader OK' % reason, silent=already)
     return bool(ok)
 
 
@@ -1300,6 +1513,10 @@ def apply_settings(data):
 
 def btn_save():
     try:
+        key = config_char_key()
+        if not key:
+            set_status('Chưa lưu: chưa đọc CharName — vào game rồi Lưu lại.')
+            return
         data = read_settings()
         if data['role'] == ROLE_LEADER and not data['leader_name']:
             me = self_display()
@@ -1313,18 +1530,26 @@ def btn_save():
             # Job nick chủ (AG_He / *AG_He) is valid — do not reject on Lưu.
             QtBind.setText(gui, leader_field, data['leader_name'])
         data['plugin_version'] = VERSION
-        path = config_path()
+        data['character'] = key
+        path = config_path(key)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         apply_settings(data)
         set_status('Đã lưu %s · %s' % (path.name, settings_summary(data)))
-        _log('Lưu cấu hình: %s' % settings_summary(data))
+        _log('Lưu cấu hình: %s · file=%s' % (settings_summary(data), path.name))
     except (OSError, ValueError, TypeError) as error:
         set_status('Chưa lưu: %s' % error)
 
 
 def load_settings(quiet=False):
-    """Load PartyLeader.json and apply all checkboxes / fields / enable."""
-    path = config_path()
+    """Load PartyLeader_<CharName>.json — never shared Chủ across clients."""
+    key = config_char_key()
+    if not key:
+        # Before login: do NOT load legacy shared PartyLeader.json (both clients
+        # were restoring Chủ from the same file).
+        if not quiet:
+            set_status('Chưa có CharName — vào game rồi Tải/Lưu (file theo từng acc).')
+        return None
+    path = config_path(key)
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(data, dict):
@@ -1351,11 +1576,16 @@ def load_settings(quiet=False):
                 return data
         if not quiet:
             set_status('Đã tải %s · %s' % (path.name, settings_summary(data)))
-            _log('Tải cấu hình: %s' % settings_summary(data))
+            _log('Tải cấu hình: %s · file=%s' % (settings_summary(data), path.name))
         return data
     except FileNotFoundError:
-        if not quiet:
-            set_status('Chưa có file — tick cấu hình rồi bấm Lưu.')
+        legacy = legacy_shared_config_path()
+        if legacy.is_file() and not quiet:
+            set_status(
+                'Chưa có %s — file cũ %s không còn dùng chung. Tick Phụ/Chủ rồi Lưu.'
+                % (path.name, legacy.name))
+        elif not quiet:
+            set_status('Chưa có %s — tick cấu hình rồi bấm Lưu.' % path.name)
         return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
         if not quiet:
@@ -1589,7 +1819,11 @@ def handle_silkroad(opcode, data):
 def _ensure_persist_ui():
     """Re-apply saved ticks if UI drifted after plugin reload."""
     global _persist_synced, _ui_applying
-    path = config_path()
+    key = config_char_key()
+    if not key:
+        # Wait for CharName — never re-sync from shared PartyLeader.json.
+        return None
+    path = config_path(key)
     if not path.is_file():
         _persist_synced = True
         return None
@@ -1707,23 +1941,33 @@ def teleported():
 
 def _deferred_persist_restore():
     try:
+        # CharName may appear after boot — load per-char file then re-sync UI.
+        if config_char_key() and not _persist_synced:
+            load_settings(quiet=True)
         _ensure_persist_ui()
     except Exception as error:
         _log('deferred persist: %s' % error)
 
 
 # Auto-restore on plugin reload (before joined_game) + deferred re-assert.
+# Per-character file only — skip until CharName known (joined_game / deferred).
 try:
-    _boot = load_settings(quiet=True)
-    if _boot is not None:
-        _log('Nạp v%s · restored %s · file=%s'
-             % (VERSION, settings_summary(_boot), config_path()))
+    _boot_key = config_char_key()
+    if _boot_key:
+        _boot = load_settings(quiet=True)
+        if _boot is not None:
+            _log('Nạp v%s · restored %s · file=%s'
+                 % (VERSION, settings_summary(_boot), config_path(_boot_key).name))
+        else:
+            _log('Nạp v%s · chưa có %s — tick Phụ/Chủ rồi Lưu.'
+                 % (VERSION, config_path(_boot_key).name))
     else:
-        _log('Nạp v%s · chưa có PartyLeader.json — tick rồi Lưu.' % VERSION)
+        _log('Nạp v%s · chờ CharName rồi tải PartyLeader_<char>.json (không dùng file chung).'
+             % VERSION)
 except Exception as _boot_error:
     _log('Nạp v%s · restore lỗi: %s' % (VERSION, _boot_error))
 
-for _delay in (0.5, 1.5, 3.0):
+for _delay in (0.5, 1.5, 3.0, 6.0):
     try:
         _t = Timer(_delay, _deferred_persist_restore)
         _t.daemon = True
@@ -1731,5 +1975,5 @@ for _delay in (0.5, 1.5, 3.0):
     except Exception:
         pass
 
-log('[%s] Đã nạp v%s. Persist ticks · Trace AG_He · >10m chase · AG≥1.8.70.'
+log('[%s] Đã nạp v%s. Config theo CharName · Trace move_to fallback · Prefer silent.'
     % (NAME, VERSION))

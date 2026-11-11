@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX prefer silent locked v1.8.75] same UID after first cast: absolute silent
+  Prefer (no 5s Ghost F cast log) while locked.
 - [FIX prefer immediate cast v1.8.74] Prefer → lock+7074 Ghost F ngay (<1s);
   không 7081 cut trước skill đầu; không re-log same UID; PL Prefer debounce ≥2s.
 - [FIX party prefer cast v1.8.73] prefer: range/move trước cast; 7081/B074 cut
@@ -54,9 +56,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.74'
+VERSION = '1.8.75'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + prefer immediate Ghost cast (no pre-cut / no Prefer spam log)
+# baseline 2600 + prefer silent while locked after first cast
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
@@ -5300,6 +5302,12 @@ def party_sync_select_uid(uid, source='PartyLeader'):
             return True
         last_at = float(runtime.get('party_sync_select_at') or 0)
         last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
+        # Same UID after first cast while locked → absolute silence (no Log).
+        if (int(runtime.get('party_sync_uid') or 0) == uid
+                and (pvp_target == uid or direct_target == uid)
+                and runtime.get('first_cast_sent')):
+            runtime['party_sync_select_at'] = now
+            return True
         # Same UID already locked/armed → quiet keep-alive (no re-log / no reset).
         # Still fall through if skill #1 never left (first_cast_sent False).
         if armed_same and uid == last_uid:
