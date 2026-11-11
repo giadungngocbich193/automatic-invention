@@ -2,6 +2,12 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.1: Fix event_loop Exception spam after Start (Self + Target monster).
+  Root: except (…, ctypes.WinError) — WinError is not a catchable class; any
+  NativeCut error became a second uncaught TypeError every tick. Wrap
+  event_loop + _drive_native_queue like GhostNativeProbe intent; catch
+  Exception; log full traceback to phBot log; sanitize monster names for
+  log/UI (mojibake “Th­¬ng…”); safe hex; hashlib.sha256 fallback.
 - v1.0.0: Standalone farm plugin. SAME NativeCut / client_7081 path proven in
   GhostNativeProbe (self UID → C→S 0x7081 + B074 02 00). Scans get_monsters /
   get_npcs within radius (default 50 m). Modes: Self (Ghost self UID when
@@ -24,6 +30,7 @@ import hashlib
 import math
 import struct
 import sys
+import traceback
 from pathlib import PureWindowsPath
 from threading import RLock
 from time import monotonic
@@ -34,7 +41,7 @@ import phBot as phbot_api
 from phBot import get_character_data, get_monsters, get_npcs, get_position, log
 
 NAME = 'GhostFarm'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -139,13 +146,73 @@ QtBind.createLabel(
 )
 
 
+def _safe_text(value, fallback='?'):
+    """Normalize entity/UI names so mojibake / surrogates cannot crash log/Qt."""
+    if value is None:
+        return fallback
+    try:
+        text = str(value)
+    except Exception:
+        return fallback
+    try:
+        text = text.encode('utf-8', 'replace').decode('utf-8', 'replace')
+    except Exception:
+        return fallback
+    # Strip NULs / lone surrogates that break some phBot consoles.
+    text = text.replace('\x00', '').strip()
+    return text or fallback
+
+
+def _hex_bytes(data):
+    raw = bytes(data or b'')
+    try:
+        return raw.hex(' ').upper()
+    except TypeError:
+        return ' '.join('%02X' % byte for byte in raw)
+
+
+def _file_sha256(path):
+    """SHA256 of client EXE — hashlib.file_digest needs 3.11+; fallback for Stable."""
+    digest = getattr(hashlib, 'file_digest', None)
+    with open(path, 'rb') as source:
+        if digest is not None:
+            return digest(source, 'sha256').hexdigest()
+        hasher = hashlib.sha256()
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+        return hasher.hexdigest()
+
+
 def _log(msg):
-    log('[%s] %s' % (NAME, msg))
+    text = _safe_text(msg, fallback='(empty log)')
+    try:
+        log('[%s] %s' % (NAME, text))
+    except Exception:
+        try:
+            log('[%s] %s' % (NAME, text.encode('ascii', 'replace').decode('ascii')))
+        except Exception:
+            pass
+
+
+def _log_traceback(prefix, error=None):
+    detail = traceback.format_exc()
+    if detail and detail.strip() != 'NoneType: None':
+        for line in detail.strip().splitlines():
+            _log('%s %s' % (prefix, line))
+    elif error is not None:
+        _log('%s %s: %s' % (prefix, type(error).__name__, error))
 
 
 def set_status(msg):
-    QtBind.setText(gui, status_label, 'Trạng thái: ' + msg)
-    _log(msg)
+    text = _safe_text(msg, fallback='(status)')
+    try:
+        QtBind.setText(gui, status_label, 'Trạng thái: ' + text)
+    except Exception as error:
+        _log('set_status QtBind lỗi: %s' % error)
+    _log(text)
 
 
 def set_stats():
@@ -191,7 +258,8 @@ class NativeCut:
         # QUERY_INFORMATION | VM_OPERATION | VM_READ | VM_WRITE
         self.handle = self.api.OpenProcess(0x0438, False, job['pid'])
         if not self.handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+            err = ctypes.get_last_error()
+            raise OSError('OpenProcess thất bại (Win32=%s).' % err)
         self.page = self.code = self.original = 0
         self.published = False
         try:
@@ -236,8 +304,7 @@ class NativeCut:
         if not self.api.QueryFullProcessImageNameW(
                 self.handle, 0, path, ctypes.byref(length)):
             raise OSError('Không đọc được đường dẫn client.')
-        with open(path.value, 'rb') as source:
-            digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        digest = _file_sha256(path.value)
         if digest not in CLIENT_SHA256:
             raise RuntimeError(
                 'Client đang chạy khác bản Hùng Vương đã đối chiếu. SHA256=' + digest)
@@ -477,7 +544,8 @@ def scan_nearby(radius):
             distance = math.hypot(ex - px, ey - py)
             if distance > radius:
                 continue
-            name = entity.get('name') or entity.get('servername') or str(uid)
+            name = _safe_text(
+                entity.get('name') or entity.get('servername') or uid, str(uid))
             rows.append({
                 'uid': uid,
                 'kind': kind,
@@ -492,32 +560,39 @@ def show_nearby(rows):
     count = len(rows)
     with lock:
         state['nearby_count'] = count
-    if not rows:
+    try:
+        if not rows:
+            QtBind.setText(
+                gui, nearby_label,
+                'Gần: 0 quái/NPC trong bán kính %g m' % read_radius())
+            return
+        head = rows[0]
         QtBind.setText(
             gui, nearby_label,
-            'Gần: 0 quái/NPC trong bán kính %g m' % read_radius())
-        return
-    head = rows[0]
-    QtBind.setText(
-        gui, nearby_label,
-        'Gần: %d · gần nhất %s #%d (%s) %.1fm'
-        % (count, head['kind'], head['uid'], head['name'], head['distance']))
+            'Gần: %d · gần nhất %s #%d (%s) %.1fm'
+            % (count, _safe_text(head['kind']), head['uid'],
+               _safe_text(head['name']), head['distance']))
+    except Exception as error:
+        _log_traceback('show_nearby TRACE', error)
 
 
 def show_pick(uid, label, kind=''):
-    if uid:
-        text = 'Mục tiêu Ghost: UID=%d' % uid
-        if kind:
-            text += ' [%s]' % kind
-        if label:
-            text += ' · %s' % label
-        QtBind.setText(gui, pick_label, text)
-        with lock:
-            state['last_pick'] = text
-    else:
-        QtBind.setText(gui, pick_label, 'Mục tiêu Ghost: (chưa chọn)')
-        with lock:
-            state['last_pick'] = ''
+    try:
+        if uid:
+            text = 'Mục tiêu Ghost: UID=%d' % uid
+            if kind:
+                text += ' [%s]' % _safe_text(kind)
+            if label:
+                text += ' · %s' % _safe_text(label)
+            QtBind.setText(gui, pick_label, text)
+            with lock:
+                state['last_pick'] = text
+        else:
+            QtBind.setText(gui, pick_label, 'Mục tiêu Ghost: (chưa chọn)')
+            with lock:
+                state['last_pick'] = ''
+    except Exception as error:
+        _log_traceback('show_pick TRACE', error)
 
 
 def pick_ghost_target(rows):
@@ -640,14 +715,16 @@ def queue_native(uid, label, kind='?'):
         'bridge_done': False,
         'b074': '',
         'ok_any': False,
-        'hex': _pack_uid(uid).hex(' ').upper(),
+        'hex': _hex_bytes(_pack_uid(uid)),
         'error': '',
     }
     with lock:
         state['queue'] = [job]
         state['active'] = job
     show_pick(uid, label, kind)
-    set_status('Xếp NativeCut %s UID=%d [%s] · arm(2) event_loop' % (label, uid, kind))
+    set_status(
+        'Xếp NativeCut %s UID=%d [%s] · arm(2) event_loop'
+        % (_safe_text(label), uid, _safe_text(kind)))
     return True
 
 
@@ -660,8 +737,8 @@ def _classify_b074(data):
     if len(raw) >= 4 and raw[:4] == b'\x03\x00\x04\x40':
         return '03 00 04 40 · ActionRefusal (từ chối / OOR / busy)'
     if len(raw) >= 2 and raw[:2] == b'\x03\x00':
-        return '%s · từ chối / fail (03 00…)' % raw[:8].hex(' ').upper()
-    return '%s · (xem hex)' % (raw[:12].hex(' ').upper() if raw else '(trống)')
+        return '%s · từ chối / fail (03 00…)' % _hex_bytes(raw[:8])
+    return '%s · (xem hex)' % (_hex_bytes(raw[:12]) if raw else '(trống)')
 
 
 def _finish_job(job, note, ok=False):
@@ -808,8 +885,11 @@ def _drive_native_queue(now):
             job['next_at'] = now + 0.05
             return
 
-    except (OSError, ValueError, RuntimeError, ctypes.WinError) as error:
-        job['error'] = str(error)
+    except Exception as error:
+        # NOTE: never except ctypes.WinError — it is a factory fn, not a class;
+        # catching it raised TypeError and spammed “Python: Exception occurred”.
+        job['error'] = '%s: %s' % (type(error).__name__, error)
+        _log_traceback('NativeCut drive TRACE', error)
         close_session(str(error))
         with lock:
             if state['queue'] and state['queue'][0] is job:
@@ -818,7 +898,9 @@ def _drive_native_queue(now):
             state['fail_count'] = int(state.get('fail_count') or 0) + 1
             state['next_scan_at'] = monotonic() + RESEND_GAP_SEC
         set_stats()
-        set_status('LỖI NativeCut %s UID=%d · %s' % (job['label'], uid, error))
+        set_status(
+            'LỖI NativeCut %s UID=%d · %s'
+            % (_safe_text(job.get('label')), uid, job['error']))
         return
 
 
@@ -841,27 +923,45 @@ def _farm_scan_tick(now):
             % (radius, current_mode()))
         return
     uid, label, kind = pick
-    queue_native(uid, label, kind)
+    queue_native(uid, _safe_text(label), _safe_text(kind))
 
 
 def event_loop():
     """Drive farm scan + NativeCut verify/arm/wait from phBot callback."""
     if not plugin_enabled():
         return
-    now = monotonic()
-    if farming_active():
+    try:
+        now = monotonic()
+        if farming_active():
+            with lock:
+                busy = bool(state['queue']) or state.get('active') is not None
+            if busy:
+                _drive_native_queue(now)
+            else:
+                _farm_scan_tick(now)
+            return
+        # Not farming: still advance any leftover single job (none expected after Stop).
         with lock:
-            busy = bool(state['queue']) or state.get('active') is not None
-        if busy:
+            has_queue = bool(state['queue'])
+        if has_queue:
             _drive_native_queue(now)
-        else:
-            _farm_scan_tick(now)
-        return
-    # Not farming: still advance any leftover single job (none expected after Stop).
-    with lock:
-        has_queue = bool(state['queue'])
-    if has_queue:
-        _drive_native_queue(now)
+    except Exception as error:
+        _log_traceback('event_loop TRACE', error)
+        with lock:
+            state['queue'] = []
+            state['active'] = None
+            state['fail_count'] = int(state.get('fail_count') or 0) + 1
+            state['next_scan_at'] = monotonic() + RESEND_GAP_SEC
+        try:
+            close_session('event_loop exception')
+        except Exception:
+            pass
+        try:
+            set_stats()
+            set_status('LỖI event_loop · %s: %s — xem log TRACE' % (
+                type(error).__name__, error))
+        except Exception:
+            pass
 
 
 def handle_silkroad(opcode, data):
@@ -887,7 +987,7 @@ def handle_silkroad(opcode, data):
         job = state.get('active')
         watching = monotonic() <= float(state.get('pending_watch_until') or 0)
         expect = int((job or {}).get('uid') or state.get('last_send_uid') or 0)
-    hex_out = raw.hex(' ').upper()
+    hex_out = _hex_bytes(raw)
     if expect and uid == expect and job is not None and job.get('phase') == 'wait':
         job['observed'] = True
         _log(
@@ -905,31 +1005,35 @@ def handle_joymax(opcode, data):
         return
     if opcode not in (0xB074, 0xB081, 0xB084, 0x3085):
         return
-    raw = bytes(data or b'')
-    with lock:
-        watching = monotonic() <= float(state.get('pending_watch_until') or 0)
-        last_uid = int(state.get('last_send_uid') or 0)
-        job = state.get('active')
-    prefix = 'sau NativeCut' if watching else 'ngoài cửa sổ 3s'
-    if opcode == 0xB074:
-        note = _classify_b074(raw)
-        _log('S→C 0xB074 [%s] %s | last UID=%d' % (prefix, note, last_uid))
-        if job is not None and job.get('phase') == 'wait' and watching:
-            job['b074'] = note
-            if raw == b'\x02\x00':
-                set_status(
-                    'B074 02 00 sau NativeCut UID=%d — NGẮT OK.' % last_uid)
-            elif raw[:2] == b'\x03\x00':
-                set_status(
-                    'B074 từ chối sau NativeCut UID=%d — %s' % (last_uid, note))
-        return
-    if opcode == 0xB081:
-        _log('S→C 0xB081 [%s] hex=%s'
-             % (prefix, raw[:16].hex(' ').upper() if raw else '(trống)'))
-        return
-    if opcode in (0xB084, 0x3085) and watching:
-        _log('S→C 0x%04X [%s] hex=%s'
-             % (opcode, prefix, raw[:16].hex(' ').upper() if raw else '(trống)'))
+    try:
+        raw = bytes(data or b'')
+        with lock:
+            watching = monotonic() <= float(state.get('pending_watch_until') or 0)
+            last_uid = int(state.get('last_send_uid') or 0)
+            job = state.get('active')
+        prefix = 'sau NativeCut' if watching else 'ngoài cửa sổ 3s'
+        if opcode == 0xB074:
+            note = _classify_b074(raw)
+            _log('S→C 0xB074 [%s] %s | last UID=%d' % (prefix, note, last_uid))
+            if job is not None and job.get('phase') == 'wait' and watching:
+                job['b074'] = note
+                if raw == b'\x02\x00':
+                    set_status(
+                        'B074 02 00 sau NativeCut UID=%d — NGẮT OK.' % last_uid)
+                elif raw[:2] == b'\x03\x00':
+                    set_status(
+                        'B074 từ chối sau NativeCut UID=%d — %s'
+                        % (last_uid, note))
+            return
+        if opcode == 0xB081:
+            _log('S→C 0xB081 [%s] hex=%s'
+                 % (prefix, _hex_bytes(raw[:16]) if raw else '(trống)'))
+            return
+        if opcode in (0xB084, 0x3085) and watching:
+            _log('S→C 0x%04X [%s] hex=%s'
+                 % (opcode, prefix, _hex_bytes(raw[:16]) if raw else '(trống)'))
+    except Exception as error:
+        _log_traceback('handle_joymax TRACE', error)
 
 
 try:
@@ -941,5 +1045,8 @@ try:
     set_status(
         'Nạp %s v%s — bật → chọn Self/Target → Start farm (NativeCut, không inject).'
         % (NAME, VERSION))
-except Exception:
-    pass
+except Exception as error:
+    try:
+        _log_traceback('load TRACE', error)
+    except Exception:
+        pass
