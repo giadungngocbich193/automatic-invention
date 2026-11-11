@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.55'
-# raw-main download stamp: 2026-11-11T01:25Z (UTF-8 no BOM/U+200B) · buff on arm; fast scan; farm checkbox
+VERSION = '1.8.56'
+# raw-main download stamp: 2026-11-11T01:35Z (UTF-8 no BOM/U+200B) · no radius-return while fight/farm
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -2711,9 +2711,8 @@ def rotate_direct(character, gate_checked=False):
         if auto_pk_returning:
             return
         inside, reason = auto_pk_radius_check(direct_target)
-        if not inside:
-            if reason == AUTO_PK_OUTSIDE_SELF:
-                force_auto_pk_return(auto_pk_runtime, reason)
+        # Locked fight: ignore camp-radius outs — keep rotating skills on UID.
+        if not inside and reason not in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
             return
     pk_runtime = auto_pk_runtime if auto_pk_running else None
     probing_uid = pk_runtime is not None and pk_runtime.get('skill_probe_uid') == direct_target
@@ -3743,6 +3742,7 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
 
 
 def auto_pk_ready_to_cast(runtime, uid, now):
+    """While fighting a locked UID: keep casting — never force camp-radius return."""
     anchor = runtime['anchor']
     position = get_position() or {}
     players = auto_pk_players() or {}
@@ -3750,22 +3750,17 @@ def auto_pk_ready_to_cast(runtime, uid, now):
     own_radius = auto_pk_distance(position, anchor) if 'region' in position else None
     if own_radius is None:
         return False
-    if own_radius > runtime['radius']:
-        force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
-        return False
     # Opposing-faction enemies may be absent from get_players; skill packets still
     # use the server-confirmed UID, so allow cast without approach coords.
     if not isinstance(target, dict):
         runtime.pop('approach', None)
         return True
-    target_radius = auto_pk_target_distance(target, anchor, runtime)
-    if target_radius is None:
+    x, y = float(position['x']), float(position['y'])
+    try:
+        dx, dy = float(target['x']) - x, float(target['y']) - y
+    except (KeyError, TypeError, ValueError):
         runtime.pop('approach', None)
         return True
-    if target_radius > runtime['radius']:
-        return False
-    x, y = float(position['x']), float(position['y'])
-    dx, dy = float(target['x']) - x, float(target['y']) - y
     distance = math.hypot(dx, dy)
     if distance <= AUTO_PK_APPROACH_RANGE:
         runtime.pop('approach', None)
@@ -3777,18 +3772,19 @@ def auto_pk_ready_to_cast(runtime, uid, now):
     elif distance <= approach['best'] - AUTO_PK_RETURN_MIN_PROGRESS:
         approach.update(best=distance, since=now)
     elif now - approach['since'] >= AUTO_PK_RETURN_STALL_TIMEOUT:
+        # Chase stalled — retire UID and hunt another; do NOT pause for camp return.
         runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
-        force_auto_pk_return(runtime, 'không áp sát được mục tiêu')
+        runtime.pop('approach', None)
         return False
     if now >= approach['move_at']:
         approach['move_at'] = now + 2.0
-        fraction = (distance - 4.0) / distance
+        fraction = (distance - 4.0) / distance if distance else 0
         z = float(position.get('z', anchor['z']))
         if phbot_api.move_to(x + dx * fraction, y + dy * fraction, z) is False:
             runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
-            force_auto_pk_return(runtime, 'phBot từ chối áp sát')
-        else:
-            QtBind.setText(gui, auto_pk_status_label, 'Đang áp sát UID %d · cách %.1f m.' % (uid, distance))
+            runtime.pop('approach', None)
+            return False
+        QtBind.setText(gui, auto_pk_status_label, 'Đang áp sát UID %d · cách %.1f m.' % (uid, distance))
     return False
 
 
@@ -4529,7 +4525,9 @@ def tick_auto_pk(from_event=False):
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
-        if distance > runtime['radius']:
+        fighting = bool(pvp_target or runtime.get('mob_uid') or runtime.get('mob_requested'))
+        # Idle only: pull back if you wander past camp. Never pause mid-fight/farm.
+        if distance > runtime['radius'] and not fighting:
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
@@ -4539,17 +4537,12 @@ def tick_auto_pk(from_event=False):
             auto_pk_select(character, runtime, now, from_event=from_event)
             return False
         eligible, reason = auto_pk_radius_check(pvp_target)
-        if reason == AUTO_PK_OUTSIDE_SELF:
-            force_auto_pk_return(runtime, reason)
-            return False
-        if reason == AUTO_PK_OUTSIDE_TARGET:
-            uid, since = runtime.get('target_outside', (0, now))
-            if uid != pvp_target:
-                runtime['target_outside'] = (pvp_target, now)
-                runtime.pop('missing_since', None)
-            elif now - since >= AUTO_PK_TARGET_OUTSIDE_CONFIRM:
-                force_auto_pk_return(runtime, reason)
-            return False
+        # Keep attacking outside camp radius — no quay về while locked on UID.
+        if reason in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
+            runtime.pop('target_outside', None)
+            runtime.pop('missing_since', None)
+            active = pvp_armed or pvp_activation is not None
+            return bool(active)
         runtime.pop('target_outside', None)
         if reason in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
             release_auto_pk_target(pvp_target, reason)
@@ -4573,8 +4566,8 @@ def tick_auto_pk(from_event=False):
             reason = 'chuỗi đánh đã dừng, xem lý do ngay trước dòng này'
         report_error('Auto PK bỏ khóa UID %d: %s.' % (pvp_target, reason))
         pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
-        auto_pk_returning = True
-        QtBind.setText(gui, auto_pk_status_label, 'Dừng đánh · đang quay về điểm bật.')
+        # Do not force camp return after a dropped lock mid-fight — reselect next tick.
+        QtBind.setText(gui, auto_pk_status_label, 'Bỏ UID · tìm mục tiêu khác (không dừng đánh).')
     if auto_pk_returning:
         withdraw = runtime.get('withdraw')
         if withdraw and not auxiliary_exchange_ready(withdraw):
