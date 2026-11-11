@@ -2,17 +2,15 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [FIX hostile filter đỏ/tím+job] List-select chỉ chữ đỏ/tím hoặc cờ nghề
-  đạo tặc↔bảo tiêu/hunter. Không AE_Sro must-attack, không ALT, không player 7045.
-- [FIX camp stand-still] Khi canh không mục tiêu: đứng im tại điểm bật (không
-  move_to trừ Chạy vòng bật, engage địch trong vùng đánh, hoặc quay về khi
-  tự ra ngoài vùng đánh lúc không engage).
-- [FIX widen scan 60m] Player early-scan uses Vùng quét (default 60m), not only
-  Vùng đánh (~30–40m). Status reports scan-ring enemies before attack range.
-- [FIX never abort PvP in attack range] Keep casting while engaged player still
-  in vùng đánh; refuse camp return; hold/coord flicker must not quay về mid-fight.
-- [FIX no player 7045] Auto PK player engage prefers Target Enemy key — does not
-  inject player 0x7045 (mob farm select unchanged).
+- [FIX drop hostile filter] Bỏ lọc đỏ/tím/job — Auto PK chọn mọi player sống
+  trong vùng quét/đánh (như trước 1.8.59). Không ALT, không player 7045.
+- [FIX buff VK equip] Mỗi buff theo VK F1/F2/F3: đợi Lấy đồ sẵn sàng rồi mới
+  cast; thiếu bộ đồ thì bỏ buff đó (không cast sai vũ khí); sau cast trả trang bị.
+- [FIX camp stand-still] Canh không mục tiêu: đứng im (trừ Chạy vòng / engage /
+  tự ra ngoài vùng đánh khi không engage).
+- [FIX widen scan 60m] Vùng quét mặc định 60m; Ghost lock theo vùng đánh.
+- [FIX never abort PvP in attack range] Không quay về khi đang đánh địch còn
+  trong vùng đánh.
 """
 
 import ctypes
@@ -36,9 +34,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.59'
-# raw-main download stamp: 2026-11-11T06:25Z (UTF-8 no BOM/U+200B)
-# [FIX hostile filter đỏ/tím+job] + [FIX camp stand-still] + scan 60m + never-abort
+VERSION = '1.8.60'
+# raw-main download stamp: 2026-11-11T06:40Z (UTF-8 no BOM/U+200B)
+# [FIX drop hostile filter] + [FIX buff VK equip] + stand-still + scan 60m + never-abort
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -741,8 +739,8 @@ def pause_pvp(reason, clear_target=False, cancel_action=True, notify=True):
         report_error(message)
 
 
-def request_gear_only(page):
-    """A physical F press may change equipment without authorizing an attack."""
+def request_gear_only(page, hold_on_fail=True):
+    """Swap to a captured F-page loadout without authorizing an attack."""
     global pvp_activation, pvp_armed, current_page, active_sequence, sequence_index, gear_blocked_page, exchange_key, pvp_resume_page
     global pvp_first_skill
     pvp_first_skill = False
@@ -758,15 +756,17 @@ def request_gear_only(page):
         slot = pvp_page_exchanges[page]
         exchange_key = ord(slot) if slot else None
     if not any(runtime_gear.get(page, {}).values()):
-        fail_pvp_activation('chưa cài vũ khí hoặc khiên cho nhóm %s' % page)
+        fail_pvp_activation('chưa cài vũ khí hoặc khiên cho nhóm %s' % page, hold=hold_on_fail)
         return False
-    pvp_activation = {'page': page, 'target': pvp_target, 'page_sent': True,
-                      'ready_at': monotonic(), 'move': None, 'gear_only': True}
-    report('%s: nhận phím, đổi bộ đồ đã cài; chưa cho phép đánh.' % page)
+    # Must run prepare_pvp_page (inventory 7034). page_sent False → press F first.
+    pvp_activation = {'page': page, 'target': pvp_target, 'page_sent': False,
+                      'ready_at': 0.0, 'move': None, 'gear_only': True,
+                      'buff_swap': not hold_on_fail}
+    report('%s: đổi bộ đồ đã cài (gear_only); chưa cho phép đánh.' % page)
     return True
 
 
-def fail_pvp_activation(message):
+def fail_pvp_activation(message, hold=True):
     global pvp_activation, pvp_armed, gear_blocked_page
     gear_blocked_page = current_page
     pvp_activation = None
@@ -774,7 +774,8 @@ def fail_pvp_activation(message):
     reason = 'Auto Ghost dừng (%s): %s.' % (current_page or 'PvP', message.rstrip('.'))
     QtBind.setText(gui, status_label, reason)
     report_error(reason)
-    if auto_pk_running:
+    # [FIX buff VK equip] Buff gear miss must not hold/return the whole Auto PK camp.
+    if auto_pk_running and hold:
         hold_auto_pk('lỗi chuẩn bị nhóm: ' + message, retry_after=5.0)
 
 
@@ -784,6 +785,7 @@ def prepare_pvp_page(client):
     job = pvp_activation
     if job is None:
         return pvp_armed
+    hold_fail = not job.get('buff_swap')
     if not job.get('gear_only'):
         monsters = get_monsters()
         if monsters is None:
@@ -798,7 +800,7 @@ def prepare_pvp_page(client):
         if not press_pvp_key(PAGE_KEYS[PAGES.index(job['page'])], client):
             return False
         job['page_sent'] = True
-        job['ready_at'] = now + 0.005
+        job['ready_at'] = now + 0.05
         return False
     if now < job['ready_at']:
         return False
@@ -829,7 +831,7 @@ def prepare_pvp_page(client):
         fn = getattr(phbot_api, 'get_inventory', None)
         items = ((fn() or {}).get('items') or []) if fn else []
         if len(items) < 8:
-            fail_pvp_activation('không đọc được hành trang')
+            fail_pvp_activation('không đọc được hành trang', hold=hold_fail)
             return False
         if gear_inflight and gear_inflight['owner'] != profile_owner:
             gear_inflight = None
@@ -845,7 +847,7 @@ def prepare_pvp_page(client):
                 gear_inflight = None
             elif now >= deadline:
                 gear_inflight = None
-                fail_pvp_activation('server chưa xác nhận đổi trang bị trong 3 giây')
+                fail_pvp_activation('server chưa xác nhận đổi trang bị trong 3 giây', hold=hold_fail)
                 return False
             else:
                 return False
@@ -854,14 +856,14 @@ def prepare_pvp_page(client):
         if wanted.get('shield') == '0' and is_shield_item(items[7]):
             empty = next((i for i, item in enumerate(items) if i >= 13 and not item), None)
             if empty is None or empty > 255:
-                fail_pvp_activation('không có ô trống để cất khiên')
+                fail_pvp_activation('không có ô trống để cất khiên', hold=hold_fail)
                 return False
             job['move'] = ('__remove_shield__', 7, now + 3.0)
             gear_inflight = {'owner': profile_owner, 'move': job['move'], 'job': job}
             report('%s: gửi cất khiên từ ô 7 sang ô túi %d.' % (job['page'], empty))
             if inject_joymax(0x7034, struct.pack('<BBBH', 0, 7, empty, 0), False) is False:
                 gear_inflight = None
-                fail_pvp_activation('phBot từ chối cất khiên 0x7034')
+                fail_pvp_activation('phBot từ chối cất khiên 0x7034', hold=hold_fail)
             return False
         for destination, key in ((6, 'weapon'), (7, 'shield')):
             identity = wanted.get(key, '')
@@ -871,12 +873,12 @@ def prepare_pvp_page(client):
             if len(slots) != 1 or slots[0] > 255:
                 name = 'vũ khí' if destination == 6 else 'khiên'
                 issue = 'không tìm thấy' if not slots else 'không xác định được đúng ô túi của'
-                fail_pvp_activation('%s %s %s đã cài' % (issue, name, identity))
+                fail_pvp_activation('%s %s %s đã cài' % (issue, name, identity), hold=hold_fail)
                 return False
             item_fn = getattr(phbot_api, 'get_item', None)
             data = (item_fn(items[slots[0]]['model']) or {}) if item_fn else {}
             if data and data.get('tid2') != (6 if destination == 6 else 4):
-                fail_pvp_activation('ID %s không phải %s' % (identity, key))
+                fail_pvp_activation('ID %s không phải %s' % (identity, key), hold=hold_fail)
                 return False
             job['move'] = (identity, destination, now + 3.0)
             gear_inflight = {'owner': profile_owner, 'move': job['move'], 'job': job}
@@ -884,7 +886,7 @@ def prepare_pvp_page(client):
                    (job['page'], identity, slots[0], destination))
             if inject_joymax(0x7034, struct.pack('<BBBH', 0, slots[0], destination, 0), False) is False:
                 gear_inflight = None
-                fail_pvp_activation('phBot từ chối đổi trang bị 0x7034')
+                fail_pvp_activation('phBot từ chối đổi trang bị 0x7034', hold=hold_fail)
             return False
     # AutoPK can cast once target and gear are ready. Install the 7081
     # transport only when a confirmed cast actually needs interruption.
@@ -3524,9 +3526,7 @@ def scan_auto_pk_evidence(runtime=None):
             center = runtime.get('scan_center', anchor)
             scan_radius = runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS)
         players = auto_pk_players()
-        character = get_character_data() or {}
-        player_id = character.get('player_id')
-        monsters = get_monsters() if callable(get_monsters) else None
+        player_id = (get_character_data() or {}).get('player_id')
         now = monotonic()
         rows = []
         for uid, player in (players or {}).items():
@@ -3538,34 +3538,28 @@ def scan_auto_pk_evidence(runtime=None):
             attack_distance = auto_pk_target_distance(player, anchor, runtime)
             unavailable = (auto_pk_target_unavailable(runtime, int(uid), player, now)
                            if runtime is not None and str(uid).isdigit() else None)
-            label, hostile = auto_pk_hostility_label(player, character, uid=int(uid) if str(uid).isdigit() else None,
-                                                    monsters=monsters)
             rows.append(dict(uid=str(uid), name=player.get('name','?'), distance_m=scan_distance,
-                             dead=player.get('dead'), unavailable=unavailable, hostile=hostile,
-                             hostility=label,
+                             dead=player.get('dead'), unavailable=unavailable,
                              in_attack_range=attack_distance is not None and attack_distance <= radius))
-        rows.sort(key=lambda row: (not row['hostile'], row['distance_m']))
+        rows.sort(key=lambda row: row['distance_m'])
         for i, field in enumerate(auto_pk_result_fields):
             row = rows[i] if i<len(rows) else None
-            text = ('%s | UID=%s | %.1f m | %s | %s' %
-                    (row['name'], row['uid'], row['distance_m'], row['hostility'],
+            text = ('%s | UID=%s | %.1f m từ tâm quét | %s' %
+                    (row['name'], row['uid'], row['distance_m'],
                      'đã chết' if row['dead'] else row['unavailable'] or
                      ('trong vùng đánh' if row['in_attack_range'] else 'vùng quét'))) if row else ''
             QtBind.setText(gui, field, text)
-        hostiles = [row for row in rows if row['hostile'] and not row['dead']]
-        outside = sum(not row['in_attack_range'] for row in hostiles)
-        message = ('[FIX hostile filter đỏ/tím+job] Quét %g m · đánh %g m · %d địch / %d thấy.' %
-                   (scan_radius, radius, len(hostiles), len(rows)))
+        outside = sum(not row['in_attack_range'] for row in rows)
+        message = ('[FIX drop hostile filter] Quét %g m · đánh %g m · %d người · %d ngoài vùng đánh.' %
+                   (scan_radius, radius, len(rows), outside))
         if not players:
             message += ' Chưa có UID từ phBot (giới hạn client/get_players).'
-        elif hostiles:
-            nearest = hostiles[0]
+        elif rows:
+            nearest = rows[0]
             if nearest.get('in_attack_range'):
                 message += ' Sẵn sàng Target/Ghost.'
             else:
-                message += ' Địch trong vùng quét · sẵn sàng Target khi vào vùng đánh.'
-        elif rows:
-            message += ' Không có đỏ/tím/job địch trong tầm.'
+                message += ' Người trong vùng quét · sẵn sàng Target khi vào vùng đánh.'
         QtBind.setText(gui, auto_pk_scan_field, message)
         return {'players': rows}
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as error:
@@ -4369,11 +4363,14 @@ def auto_pk_buff_weapon_for(runtime, uid):
     return legacy if legacy in ('F1', 'F2', 'F3') else ''
 
 
-def tick_auto_pk_idle_buff(runtime, now):
-    """Existing idle auto-buff: cast when idle, rebuff when expired, never while fighting.
+def auto_pk_advance_buff_gear():
+    """Drive gear_only prepare while idle buff waits for VK equip/restore."""
+    if pvp_activation and pvp_activation.get('gear_only'):
+        prepare_pvp_page(get_client() or {})
 
-    Only addition: optional per-skill F-page weapon switch around that cast, then restore.
-    """
+
+def tick_auto_pk_idle_buff(runtime, now):
+    """Idle auto-buff + [FIX buff VK equip]: wait for mapped F-page gear, cast, restore."""
     global blocked_until
     ids = runtime.get('buff_ids') if runtime.get('buffs_enabled') else None
     if not ids or auto_pk_returning or pvp_target or pvp_stunned_character is not None or now < blocked_until:
@@ -4384,13 +4381,12 @@ def tick_auto_pk_idle_buff(runtime, now):
         return False
     if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
         return False
-    # Allow buff while gear_only (weapon switch) or no PvP target yet.
-    # Blocking on any pvp_activation prevented cast after arm / after VK switch.
-    if pvp_activation is not None and pvp_target and not pvp_activation.get('gear_only'):
+    # Fight activation blocks buff; gear_only buff swap must continue.
+    if pvp_activation is not None and not pvp_activation.get('gear_only'):
         return True
     if now < runtime.get('buff_check_at', 0):
         return False
-    runtime['buff_check_at'] = now + 0.3
+    runtime['buff_check_at'] = now + 0.2
     combat_page = runtime.get('page')
     phase = runtime.get('buff_phase')
     try:
@@ -4401,10 +4397,14 @@ def tick_auto_pk_idle_buff(runtime, now):
                     runtime.pop('buff_phase', None)
                     runtime.pop('buff_restore_page', None)
                     runtime.pop('buff_cast_uid', None)
-                    QtBind.setText(gui, auto_pk_status_label, 'Buff xong · đã trả vũ khí %s.' % restore)
+                    QtBind.setText(gui, auto_pk_status_label,
+                                   '[FIX buff VK equip] Buff xong · đã trả vũ khí %s.' % restore)
                     return False
-                if request_gear_only(restore):
-                    QtBind.setText(gui, auto_pk_status_label, 'Buff xong · trả vũ khí nhóm %s.' % restore)
+                if pvp_activation and pvp_activation.get('gear_only') and pvp_activation.get('page') == restore:
+                    return True
+                if request_gear_only(restore, hold_on_fail=False):
+                    QtBind.setText(gui, auto_pk_status_label,
+                                   '[FIX buff VK equip] Trả vũ khí nhóm %s…' % restore)
                     return True
             runtime.pop('buff_phase', None)
             runtime.pop('buff_restore_page', None)
@@ -4413,8 +4413,6 @@ def tick_auto_pk_idle_buff(runtime, now):
 
         retry_at = runtime.setdefault('buff_retry_at', {})
         skills = skill_table()
-        cast_any = False
-        # Same skill walk as before; if mid-equip, stay on that skill only.
         walk = ids
         equip_uid = runtime.get('buff_cast_uid')
         if phase == 'equip' and equip_uid in ids:
@@ -4424,41 +4422,57 @@ def tick_auto_pk_idle_buff(runtime, now):
             if (not data or data.get('can_cast') is False or now < retry_at.get(uid, 0)
                     or imbue_is_active(phbot_api, uid, data)):
                 continue
-            # --- only addition vs classic buff: weapon for this skill ID ---
             buff_page = auto_pk_buff_weapon_for(runtime, uid)
-            if (buff_page and buff_page != combat_page
-                    and any((runtime_gear.get(buff_page) or {}).values())):
+            # [FIX buff VK equip] Mapped page must be equipped before cast.
+            if buff_page:
+                if not any((runtime_gear.get(buff_page) or {}).values()):
+                    retry_at[uid] = now + 8.0
+                    QtBind.setText(gui, auto_pk_status_label,
+                                   '[FIX buff VK equip] Buff %d cần %s · hãy Lấy đồ nhóm %s trước.'
+                                   % (uid, buff_page, buff_page))
+                    report('[FIX buff VK equip] bỏ buff %d: chưa có runtime_gear %s.' % (uid, buff_page))
+                    continue
                 if not auto_pk_buff_gear_ready(buff_page):
                     stop_auto_pk_patrol(runtime)
                     runtime['buff_phase'] = 'equip'
                     runtime['buff_cast_uid'] = uid
-                    runtime['buff_restore_page'] = combat_page
-                    if request_gear_only(buff_page):
+                    if combat_page and combat_page != buff_page:
+                        runtime['buff_restore_page'] = combat_page
+                    if pvp_activation and pvp_activation.get('gear_only') and pvp_activation.get('page') == buff_page:
                         QtBind.setText(gui, auto_pk_status_label,
-                                       'Đổi vũ khí %s để cast buff %d · rồi trả %s.' %
-                                       (buff_page, uid, combat_page or '?'))
+                                       '[FIX buff VK equip] Đang đổi sang %s cho buff %d…'
+                                       % (buff_page, uid))
                         return True
-                    return False
-                if phase == 'equip':
-                    runtime['buff_phase'] = 'cast'
-                runtime['buff_restore_page'] = combat_page
+                    if request_gear_only(buff_page, hold_on_fail=False):
+                        QtBind.setText(gui, auto_pk_status_label,
+                                       '[FIX buff VK equip] Đổi vũ khí %s để cast buff %d · rồi trả %s.'
+                                       % (buff_page, uid, runtime.get('buff_restore_page') or combat_page or '?'))
+                        return True
+                    retry_at[uid] = now + 5.0
+                    runtime.pop('buff_phase', None)
+                    runtime.pop('buff_cast_uid', None)
+                    continue
+                runtime['buff_phase'] = 'cast'
+                if combat_page and combat_page != buff_page:
+                    runtime['buff_restore_page'] = combat_page
                 runtime['buff_cast_uid'] = uid
-            # --- classic cast / rebuff ---
             stop_auto_pk_patrol(runtime)
             retry_at[uid] = now + max(2.0, imbue_seconds(data, 'cooldown'), imbue_seconds(data, 'duration'))
             if inject_joymax(0x7074, struct.pack('<BBIB', 1, 4, uid, 0), False) is False:
                 continue
-            blocked_until = now + max(0.2, imbue_seconds(data, 'cast_time') + 0.1)
+            blocked_until = now + max(0.25, imbue_seconds(data, 'cast_time') + 0.15)
             runtime['buff_cast_until'] = blocked_until
-            cast_any = True
             runtime.pop('buff_cast_uid', None)
-            if runtime.get('buff_restore_page'):
+            if runtime.get('buff_restore_page') and any(
+                    (runtime_gear.get(runtime['buff_restore_page']) or {}).values()):
                 runtime['buff_phase'] = 'restore'
             else:
                 runtime.pop('buff_phase', None)
-            QtBind.setText(gui, auto_pk_status_label, 'Đã gửi buff ID %d · tiếp tục canh sau khi thi triển.' % uid)
-            return True
-        if cast_any:
+                runtime.pop('buff_restore_page', None)
+            QtBind.setText(gui, auto_pk_status_label,
+                           '[FIX buff VK equip] Đã gửi buff ID %d%s.'
+                           % (uid, (' · sẽ trả ' + runtime['buff_restore_page'])
+                              if runtime.get('buff_restore_page') else ''))
             return True
         if runtime.get('buff_restore_page') and phase in ('cast', 'equip'):
             runtime['buff_phase'] = 'restore'
@@ -4515,6 +4529,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
         return
     # Idle Skill buff first (on arm / rebuff) before farm or Target.
     if tick_auto_pk_idle_buff(runtime, now):
+        auto_pk_advance_buff_gear()
         return
     if players is None:
         # Farm never shares Target/API with PK. Target Enemy is opponent-only.
@@ -4537,23 +4552,17 @@ def auto_pk_select(character, runtime, now, from_event=False):
         scan_radius = attack_radius
     best_attack = None
     best_scan = None
-    monsters = get_monsters() if callable(get_monsters) else None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
     for raw_uid, target in players.items():
         try:
             uid = int(raw_uid)
         except (ValueError, TypeError):
             continue
-        # Do not skip get_players entries that also appear in get_monsters()/NPCs:
-        # opposing-faction enemies are dual-listed on some Stable builds.
+        # [FIX drop hostile filter] Accept every living get_players entry in range.
         if (not 0 < uid <= 0xffffffff or uid == character.get('player_id')
                 or not isinstance(target, dict)):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
-            continue
-        # [FIX hostile filter đỏ/tím+job] Skip non-hostile list entries (no AE_Sro).
-        if not auto_pk_is_hostile_opponent(target, character, require_color=True,
-                                           uid=uid, monsters=monsters):
             continue
         anchor_distance = auto_pk_scan_distance(target, anchor)
         if anchor_distance is None or anchor_distance > scan_radius:
@@ -4568,35 +4577,30 @@ def auto_pk_select(character, runtime, now, from_event=False):
         elif best_scan is None or candidate < best_scan:
             best_scan = candidate
     if best_attack is None and best_scan is not None:
-        # Early ring: hostile in scan, not yet in attack — ready Target only.
         stop_auto_pk_patrol(runtime)
         distance, uid, anchor_distance = best_scan
         QtBind.setText(gui, auto_pk_status_label,
-                       '[FIX widen scan 60m] Địch UID %d trong vùng quét %.0f m (cách điểm chờ %.1f m) · '
+                       '[FIX drop hostile filter] UID %d trong vùng quét %.0f m (%.1f m) · '
                        'sẵn sàng Target khi vào vùng đánh %.0f m.'
                        % (uid, scan_radius, anchor_distance, attack_radius))
-        if auto_pk_try_native_enemy_key(runtime, client, now, 'địch trong vùng quét'):
+        if auto_pk_try_native_enemy_key(runtime, client, now, 'người trong vùng quét'):
             return
         return
     if best_attack is None:
-        # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
         if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        # No list hostile: Target Enemy still for màu ẩn; then stand still unless Chạy vòng.
         if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
-                runtime, client, now, 'không thấy đỏ/tím/job địch trong Player list'):
+                runtime, client, now, 'không thấy UID trong Player list'):
             if native_expired:
                 runtime['native_misses'] = runtime.get('native_misses', 0) + 1
             return
         if tick_auto_pk_patrol(runtime, position, now):
             return
-        # [FIX camp stand-still] Idle camp — no move_to.
         QtBind.setText(gui, auto_pk_status_label,
-                       '[FIX camp stand-still] Đứng canh im · đánh %.0f m · quét %.0f m · chờ đỏ/tím/job địch.'
+                       '[FIX camp stand-still] Đứng canh im · đánh %.0f m · quét %.0f m · chờ người.'
                        % (attack_radius, scan_radius))
         return
     runtime['native_misses'] = 0
-    # Opponent in attack radius → drop mob (if any) and Ghost via Target (no player 7045).
     auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
     distance, uid, anchor_distance = best_attack
@@ -4605,10 +4609,9 @@ def auto_pk_select(character, runtime, now, from_event=False):
                      and failed_pid == client.get('pid') and now < until)
     if (native_expired or prefer_direct) and start_auto_pk_skill_probe(runtime, uid):
         return
-    # [FIX no player 7045] Prefer configured Target Enemy; never inject player select.
     sent_at = monotonic()
     runtime.update(target_seen_at=now, target_sent_at=sent_at)
-    if auto_pk_try_native_enemy_key(runtime, client, now, 'địch trong vùng đánh'):
+    if auto_pk_try_native_enemy_key(runtime, client, now, 'người trong vùng đánh'):
         QtBind.setText(gui, auto_pk_status_label,
                        '[FIX no player 7045] Target Enemy · UID gần nhất %d · cách %.1f m.'
                        % (uid, distance))
@@ -4754,8 +4757,8 @@ def request_auto_pk_arm():
         show_auto_pk_anchor()
         farm_on = bool(options.get('mob_farm'))
         scan_m = float(options.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
-        message = ('[FIX hostile filter đỏ/tím+job] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
-                   'đứng canh im · chỉ đỏ/tím/job địch.' % (radius, scan_m, page))
+        message = ('[FIX drop hostile filter] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
+                   'đứng canh im · không lọc màu/job.' % (radius, scan_m, page))
         message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
         if options.get('buffs_enabled') and options.get('buff_ids'):
             message += ' Đang gửi Skill buff…'
@@ -4895,6 +4898,7 @@ def tick_auto_pk(from_event=False):
         if not pvp_target:
             # Buff on idle/arm before opponent Target or Đánh quái.
             if tick_auto_pk_idle_buff(runtime, now):
+                auto_pk_advance_buff_gear()
                 return False
             auto_pk_select(character, runtime, now, from_event=from_event)
             return False
