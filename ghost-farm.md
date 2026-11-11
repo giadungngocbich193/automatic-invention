@@ -1,26 +1,27 @@
-# GhostFarm v1.0.3
+# GhostFarm v1.0.4
 
-Standalone phBot Stable plugin to **Ghost farm quái/NPC** in a radius (default **50 m**). Uses **NativeCut / `client_7081`**. **Not** `inject_joymax` for Ghost (7045 select uses inject).
+Standalone phBot farm: **select → cast → Ghost interrupt**. Does **not** modify AutoGhost / PartyLeader.
 
-Does **not** modify AutoGhost / PartyLeader.
+## Combat loop (every cycle)
 
-## v1.0.3 — Target monster fix
+1. **7045** select a living monster/NPC in radius (logged) — **required**
+2. **7074** cast attack skill ID on that UID (`01 04 <skill> 01 <target>`)
+3. **NativeCut self** interrupt while casting (proven `B074 02 00`)
 
-v1.0.2 Target mode NativeCut’d the **monster UID** → `7081 OBSERVED` + `B081` + game “Không thấy mục tiêu” / no `B074` (OK=0).
+**Never Ghost** if there is no living in-range target, no Self UID, or no Skill IDs.
 
-Fix:
+## UI
 
-- **Prefer Self**: NativeCut **self UID** interrupt (proven `B074 02 00`) when any living monster/NPC is in radius.
-- **Target monster**: `inject_joymax(0x7045, monster_uid)` select first, then NativeCut **self** (never Ghost the monster UID).
-- Only Ghost while a living monster/NPC remains in range (Target also requires the selected UID still in range).
-
-## AutoGhost coexistence (v1.0.2)
-
-If AutoGhost owns GetTickCount, GhostFarm **reuses** the matching THUNK. Conflict → 8s backoff.
+| Control | Action |
+|---------|--------|
+| Bán kính (m) | Scan radius (default 50) |
+| Skill IDs (F1) | Comma-separated skill IDs, e.g. `3048,3050` |
+| Start farm | Begin combat loop |
+| Stop / Tháo móc | Stop + close NativeCut session |
 
 ## Install
 
-Copy `GhostFarm.py` into phBot `Plugins/`, reload.
+Copy `GhostFarm.py` into phBot `Plugins/`, reload. Prefer not double-hooking GetTickCount with AG Ghost cut (v1.0.2 can reuse AG’s thunk).
 
 ## jsDelivr
 
