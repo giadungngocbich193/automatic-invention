@@ -1,18 +1,29 @@
-# PartyLeader v1.0.6 + AutoGhost v1.8.67
+# PartyLeader v1.0.8 + AutoGhost v1.8.68
 
 ## Reload
-Bỏ plugin cũ → nạp **PartyLeader v1.0.6** (tab title phải hiện 1.0.6). HARD text: **>10m**.
+Tab title **must** show `PartyLeader v1.0.8` and `AutoGhost v1.8.68`. Xóa bản cũ trong Plugins.
+
+## Trace / chủ PT
+- Chủ job nick **AG_He / *AG_He** được phép Trace / `start_trace`.
+- Prefer party master **CharName** nếu có; không thì dùng **job name**.
+- Không còn reject “Trace cần CharName thật” cho job nick.
+
+## Soft-stop (>10m / F4)
+- Phụ dừng đánh bằng soft-hold Ghost/Auto PK (memory only).
+- **Không** inject `7046`/`7074`, **không** `stop_bot` (tránh client DC).
+- Giữ Auto PK armed + Trace theo chủ.
+
+## Persist (Lưu / Tải / auto-load)
+Lưu & khôi phục:
+- Bật plugin
+- Đồng bộ mục tiêu
+- ks: bật AutoGhost Auto PK
+- Chủ: chat party ks#UID
+- Chủ / Phụ
+- Nhóm Ghost F
+- Leader name
+
+Nạp plugin / vào game → **auto-apply** (kể cả Bật=ON nếu đã lưu).
 
 ## jsDelivr
 Pin commit SHA trên PR.
-
-## Phụ
-1. Tick Phụ · **Lấy tên chủ PT** — phải ra `CharName, *job` của chủ (vd BangChu), **không** `AG_He, *AG_He`.
-2. Nếu báo trùng tên mình: đứng gần chủ, mở PT, bấm lại.
-3. Bật plugin: grace ~12s (không clear storm).
-4. `ks` → Trace **CharName** thật. Không bao giờ `start_trace('AG_He')`.
-
-## HARD
-- >**10 m**: stop cast + soft Trace CharName.
-- Chủ F4: stop + Trace ngay.
-- Disconnect giả: giữ Auto PK.

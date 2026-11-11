@@ -2,8 +2,10 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party soft-hold v1.8.68] hold/clear không inject 7046/7074 (tránh DC);
+  PL Trace job nick AG_He OK; soft-stop Ghost giữ Auto PK armed.
 - [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
-  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm. PL 1.0.6 follow 10m + never Trace AG_He.
+  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm.
   No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
 - [FIX no B070 hard-stop v1.8.66] Baseline AutoGhost_2600. pause_pvp chặn mọi
   “chưa có B070 khớp / sau N lần thử lại” → soft-wait; không “Auto Ghost dừng”.
@@ -37,9 +39,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.67'
+VERSION = '1.8.68'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + ally filters + party sync no-7045 + follower no-camp
+# baseline 2600 + ally filters + party sync soft-hold no-inject
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -5321,9 +5323,10 @@ def party_sync_select_uid(uid, source='PartyLeader'):
 
 
 def party_sync_clear_target(reason=None, source='PartyLeader'):
-    """HARD: chủ bỏ target → phụ clear ngay, không giữ cast."""
+    """Soft clear: stop Ghost cast in memory — NO 7046/7074 inject (Stable DC)."""
     global pvp_target, pvp_selection_request, direct_target, direct_select_request
     global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
+    global pvp_armed, active_sequence, sequence_index, auto_pk_returning
     reason = reason or ('clear bởi %s' % source)
     with pvp_lock:
         runtime = auto_pk_runtime if auto_pk_running else None
@@ -5333,26 +5336,28 @@ def party_sync_clear_target(reason=None, source='PartyLeader'):
             runtime.update(requested=0, native_uid=0, select_until=0.0,
                            native_probe_until=0.0, skill_probe_uid=0)
             runtime.pop('select_in_event', None)
+            runtime.pop('withdraw', None)
+            runtime.pop('return_progress', None)
+            auto_pk_returning = False
         clear_pending()
         reset_pvp_activation()
+        pvp_armed = False
+        active_sequence = None
+        sequence_index = 0
         pvp_target = pvp_selection_request = 0
         direct_target = direct_select_request = 0
         direct_expected = direct_retry_state = None
         pvp_cast_deadline = 0.0
         pvp_paused = True
-    try:
-        inject_joymax(0x7046, b'', False)
-        inject_joymax(0x7074, b'\x02', False)
-    except Exception:
-        pass
-    msg = 'Party sync clear · %s' % reason
+    # Never inject_joymax here — spam 7046/7074 while tracing DCs the client.
+    msg = 'Party sync soft-clear · %s (no inject)' % reason
     QtBind.setText(gui, auto_pk_status_label, msg)
     log('[%s] %s' % (NAME, msg))
     return True
 
 
 def party_sync_hold_fight(reason=None, source='PartyLeader'):
-    """HARD: chủ F4/dừng Ghost → phụ dừng đánh ngay (giữ Auto PK armed)."""
+    """Soft-stop Ghost/Auto PK cast (giữ armed). No inject / no stop_bot."""
     return party_sync_clear_target(reason=reason or ('hold bởi %s' % source), source=source)
 
 
