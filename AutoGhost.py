@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.53'
-# raw-main download stamp: 2026-11-11T00:40Z (UTF-8 no BOM/U+200B) · per-skill buff weapon
+VERSION = '1.8.54'
+# raw-main download stamp: 2026-11-11T00:50Z (UTF-8 no BOM/U+200B) · buff logic kept; per-skill VK only
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -372,11 +372,11 @@ widget('auto_pk_options','createButton','save_auto_pk_settings','Lưu Auto PK',1
 widget('auto_pk_options','createButton','view_auto_pk','Quay lại Auto PK',140,238)
 auto_pk_options_status=widget('auto_pk_options','createLabel','',10,272)
 
-widget('auto_pk_buffs','createLabel','SKILL BUFF AUTO PK · mỗi skill có thể gắn vũ khí F riêng (vd cung / khiên).',10,36)
-widget('auto_pk_buffs','createLabel','Canh rảnh: đổi đúng vũ khí skill → buff → trả vũ khí đánh. Để trống ID = bỏ dòng.',10,61)
+widget('auto_pk_buffs','createLabel','SKILL BUFF AUTO PK · nhập ID skill tự buff. Để trống dòng không dùng.',10,36)
+widget('auto_pk_buffs','createLabel','Buff khi rảnh / hết hạn. Vũ khí F chỉ đổi lúc cast skill đó rồi trả lại.',10,61)
 auto_pk_buffs_box=widget('auto_pk_buffs','createCheckBox','auto_pk_buffs_changed','Tự buff',10,86)
 widget('auto_pk_buffs','createLabel','ID skill',95,90)
-widget('auto_pk_buffs','createLabel','Vũ khí',220,90)
+widget('auto_pk_buffs','createLabel','VK lúc cast',210,90)
 auto_pk_buff_fields=[]
 auto_pk_buff_weapon_fields=[]
 _AUTO_PK_BUFF_WEAPON_CHOICES = ('(Không đổi)', 'F1', 'F2', 'F3')
@@ -4034,14 +4034,17 @@ def auto_pk_buff_weapon_for(runtime, uid):
 
 
 def tick_auto_pk_idle_buff(runtime, now):
-    """Idle buff: per-skill F weapon → cast that skill → restore combat page."""
+    """Existing idle auto-buff: cast when idle, rebuff when expired, never while fighting.
+
+    Only addition: optional per-skill F-page weapon switch around that cast, then restore.
+    """
     global blocked_until
     ids = runtime.get('buff_ids') if runtime.get('buffs_enabled') else None
     if not ids or auto_pk_returning or pvp_target or pvp_stunned_character is not None or now < blocked_until:
         if pvp_target:
             runtime.pop('buff_phase', None)
             runtime.pop('buff_restore_page', None)
-            runtime.pop('buff_pending_uid', None)
+            runtime.pop('buff_cast_uid', None)
         return False
     if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
         return False
@@ -4059,7 +4062,7 @@ def tick_auto_pk_idle_buff(runtime, now):
                 if auto_pk_buff_gear_ready(restore):
                     runtime.pop('buff_phase', None)
                     runtime.pop('buff_restore_page', None)
-                    runtime.pop('buff_pending_uid', None)
+                    runtime.pop('buff_cast_uid', None)
                     QtBind.setText(gui, auto_pk_status_label, 'Buff xong · đã trả vũ khí %s.' % restore)
                     return False
                 if request_gear_only(restore):
@@ -4067,56 +4070,57 @@ def tick_auto_pk_idle_buff(runtime, now):
                     return True
             runtime.pop('buff_phase', None)
             runtime.pop('buff_restore_page', None)
-            runtime.pop('buff_pending_uid', None)
+            runtime.pop('buff_cast_uid', None)
             return False
 
         retry_at = runtime.setdefault('buff_retry_at', {})
         skills = skill_table()
-        pending_uid = runtime.get('buff_pending_uid')
-        candidates = [pending_uid] if pending_uid in ids else []
-        candidates.extend(uid for uid in ids if uid != pending_uid)
-
-        for uid in candidates:
+        cast_any = False
+        # Same skill walk as before; if mid-equip, stay on that skill only.
+        walk = ids
+        equip_uid = runtime.get('buff_cast_uid')
+        if phase == 'equip' and equip_uid in ids:
+            walk = [equip_uid]
+        for uid in walk:
             data = skills.get(uid)
             if (not data or data.get('can_cast') is False or now < retry_at.get(uid, 0)
                     or imbue_is_active(phbot_api, uid, data)):
-                if pending_uid == uid and phase == 'equip':
-                    # Skill became unavailable after equip — restore.
-                    runtime['buff_phase'] = 'restore'
-                    return True
                 continue
+            # --- only addition vs classic buff: weapon for this skill ID ---
             buff_page = auto_pk_buff_weapon_for(runtime, uid)
-            needs_switch = bool(
-                buff_page and buff_page != combat_page
-                and any((runtime_gear.get(buff_page) or {}).values()))
-            if needs_switch and not auto_pk_buff_gear_ready(buff_page):
-                stop_auto_pk_patrol(runtime)
-                runtime['buff_phase'] = 'equip'
-                runtime['buff_pending_uid'] = uid
+            if (buff_page and buff_page != combat_page
+                    and any((runtime_gear.get(buff_page) or {}).values())):
+                if not auto_pk_buff_gear_ready(buff_page):
+                    stop_auto_pk_patrol(runtime)
+                    runtime['buff_phase'] = 'equip'
+                    runtime['buff_cast_uid'] = uid
+                    runtime['buff_restore_page'] = combat_page
+                    if request_gear_only(buff_page):
+                        QtBind.setText(gui, auto_pk_status_label,
+                                       'Đổi vũ khí %s để cast buff %d · rồi trả %s.' %
+                                       (buff_page, uid, combat_page or '?'))
+                        return True
+                    return False
+                if phase == 'equip':
+                    runtime['buff_phase'] = 'cast'
                 runtime['buff_restore_page'] = combat_page
-                if request_gear_only(buff_page):
-                    QtBind.setText(gui, auto_pk_status_label,
-                                   'Buff ID %d · đổi %s (vd cung/khiên) · rồi trả %s.' %
-                                   (uid, buff_page, combat_page or '?'))
-                    return True
-                return False
-            if needs_switch:
-                runtime['buff_restore_page'] = combat_page
-                runtime['buff_pending_uid'] = uid
+                runtime['buff_cast_uid'] = uid
+            # --- classic cast / rebuff ---
             stop_auto_pk_patrol(runtime)
             retry_at[uid] = now + max(2.0, imbue_seconds(data, 'cooldown'), imbue_seconds(data, 'duration'))
             if inject_joymax(0x7074, struct.pack('<BBIB', 1, 4, uid, 0), False) is False:
                 continue
             blocked_until = now + max(0.2, imbue_seconds(data, 'cast_time') + 0.1)
             runtime['buff_cast_until'] = blocked_until
-            runtime.pop('buff_pending_uid', None)
+            cast_any = True
+            runtime.pop('buff_cast_uid', None)
             if runtime.get('buff_restore_page'):
                 runtime['buff_phase'] = 'restore'
             else:
                 runtime.pop('buff_phase', None)
-            QtBind.setText(gui, auto_pk_status_label,
-                           'Đã gửi buff ID %d%s · tiếp tục canh.' %
-                           (uid, (' · VK %s' % buff_page) if buff_page else ''))
+            QtBind.setText(gui, auto_pk_status_label, 'Đã gửi buff ID %d · tiếp tục canh sau khi thi triển.' % uid)
+            return True
+        if cast_any:
             return True
         if runtime.get('buff_restore_page') and phase in ('cast', 'equip'):
             runtime['buff_phase'] = 'restore'
