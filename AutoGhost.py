@@ -3,7 +3,7 @@
 
 Changelog (verify in Log / file header):
 - [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
-  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm. PL follow 10m + F4→trace.
+  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm. PL 1.0.6 follow 10m + never Trace AG_He.
   No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
 - [FIX no B070 hard-stop v1.8.66] Baseline AutoGhost_2600. pause_pvp chặn mọi
   “chưa có B070 khớp / sau N lần thử lại” → soft-wait; không “Auto Ghost dừng”.

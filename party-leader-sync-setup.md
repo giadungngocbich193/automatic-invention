@@ -1,16 +1,18 @@
-# PartyLeader v1.0.5 + AutoGhost v1.8.67
+# PartyLeader v1.0.6 + AutoGhost v1.8.67
+
+## Reload
+Bỏ plugin cũ → nạp **PartyLeader v1.0.6** (tab title phải hiện 1.0.6). HARD text: **>10m**.
 
 ## jsDelivr
-Cùng commit SHA trên PR — xem chat.
+Pin commit SHA trên PR.
 
 ## Phụ
-1. Cài AutoGhost **1.8.67** + PartyLeader **1.0.5**, reload.
-2. Tick **Phụ** · **Lấy tên chủ PT** → `CharName, *job` (CharName thật, không job AG_He).
-3. Bật plugin: **grace ~12s** trước luật khoảng cách (không clear storm ngay).
-4. `ks` → trace **CharName** + Auto PK F.
-5. Ally filters: Party luôn bỏ qua; Guild/Liên minh mặc định bật.
+1. Tick Phụ · **Lấy tên chủ PT** — phải ra `CharName, *job` của chủ (vd BangChu), **không** `AG_He, *AG_He`.
+2. Nếu báo trùng tên mình: đứng gần chủ, mở PT, bấm lại.
+3. Bật plugin: grace ~12s (không clear storm).
+4. `ks` → Trace **CharName** thật. Không bao giờ `start_trace('AG_He')`.
 
 ## HARD
-- Chủ xa **>10 m** (sau grace): dừng cast + `start_trace(CharName)` — **không** tắt Auto PK.
-- Chủ **F4 / dừng Ghost**: phụ **stop attack + trace theo chủ ngay**.
-- Disconnect giả khi Phụ+arm: AutoGhost **giữ** Auto PK.
+- >**10 m**: stop cast + soft Trace CharName.
+- Chủ F4: stop + Trace ngay.
+- Disconnect giả: giữ Auto PK.

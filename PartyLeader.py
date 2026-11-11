@@ -2,10 +2,11 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
-- v1.0.5: Follow threshold **10m**; grace sau Bật/ks; trace CharName (`name, *job`);
-  chủ F4 → phụ stop + trace ngay; không clear storm lúc bật Phụ; không tắt Auto PK.
+- v1.0.6: UI/log **10m**; Lấy tên chủ PT từ chối self/job AG_He; never start_trace(job);
+  soft trace (no DC); fix old follower_ensure_trace override.
+- v1.0.5: Follow 10m; grace; F4→stop+trace; CharName resolve.
 - v1.0.4: Lấy tên chủ PT CharName + prefer UID no-7045. AG≥1.8.67.
-- v1.0.3: Checkbox Chủ/Phụ. HARD Phụ UID chủ; >5m → trace; clear/hold.
+- v1.0.3: Checkbox Chủ/Phụ. HARD Phụ UID chủ; >10m → trace; clear/hold.
 - v1.0.2: `ks` → trace + Auto PK F.
 - v1.0.1: Lấy tên mình = name + job_name.
 - v1.0.0: Chat ks / sync B070 + ks#UID. Không ALT.
@@ -45,7 +46,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -256,6 +257,35 @@ def _member_player_id(member):
     return 0
 
 
+def _self_identity_tokens():
+    tokens = set()
+    for part in (self_name(), self_job_name(),
+                 _strip_job_star(self_name()), _strip_job_star(self_job_name())):
+        key = str(part or '').strip().casefold()
+        if key:
+            tokens.add(key)
+            tokens.add(key.lstrip('*'))
+    data = get_character_data() or {}
+    for key in ('name', 'job_name', 'jobName', 'job', 'charname', 'CharName'):
+        val = _strip_job_star(data.get(key) or '').casefold()
+        if val:
+            tokens.add(val)
+    tokens.discard('')
+    return tokens
+
+
+def _is_self_identity(char_name, job_name=''):
+    """True if CharName/job looks like the local character (job nick AG_He included)."""
+    tokens = _self_identity_tokens()
+    if not tokens:
+        return False
+    for part in (char_name, job_name, _strip_job_star(char_name), _strip_job_star(job_name)):
+        key = str(part or '').strip().casefold().lstrip('*')
+        if key and key in tokens:
+            return True
+    return False
+
+
 def _is_self_member(member):
     """True if party member is the local character (avoid picking self as chủ)."""
     if not isinstance(member, dict):
@@ -263,12 +293,16 @@ def _is_self_member(member):
     pid = _member_player_id(member)
     if pid and pid == self_player_id():
         return True
-    name = _strip_job_star(member.get('name') or '').casefold()
-    me = self_name().casefold()
-    me_job = _strip_job_star(self_job_name()).casefold()
-    if name and me and name == me:
+    m_char, m_job = '', ''
+    try:
+        m_char, m_job = _resolve_member_identity(member)
+    except Exception:
+        m_char = _strip_job_star(member.get('name') or '')
+        m_job = str(member.get('job_name') or member.get('job') or '')
+    if _is_self_identity(m_char, m_job):
         return True
-    if name and me_job and name == me_job:
+    name = _strip_job_star(member.get('name') or '').casefold()
+    if name and name in _self_identity_tokens():
         return True
     return False
 
@@ -403,11 +437,38 @@ def party_master_display():
         raise ValueError(
             'Chỉ thấy chính mình trong party master — đứng gần chủ / mở PT rồi thử lại.')
     char_name, job = _resolve_member_identity(master)
+    # If party only exposes job nick (*AG_BangChu), keep it as job; try near/char fields first.
+    if _is_self_identity(char_name, job):
+        # Wrong master (self) — try any other member marked leader / first other.
+        alt = None
+        for member in members:
+            if _is_self_member(member):
+                continue
+            if _member_is_party_master(member) or alt is None:
+                alt = member
+                if _member_is_party_master(member):
+                    break
+        if alt is None:
+            raise ValueError(
+                'Lấy tên chủ PT ra chính mình (%r). Đứng gần chủ (vd AG_BangChu), mở PT, thử lại.'
+                % (char_name or job))
+        char_name, job = _resolve_member_identity(alt)
+        if _is_self_identity(char_name, job):
+            raise ValueError(
+                'Vẫn khớp tên mình (%r). Không điền job AG_He làm chủ — thử lại gần chủ.'
+                % (char_name or job))
+    # Prefer job with * when name came from job-mode overhead.
+    if job and not str(job).startswith('*') and char_name and char_name.casefold() == _strip_job_star(job).casefold():
+        job = '*' + _strip_job_star(job)
     full = format_leader_display(char_name, job)
     if not full:
         raise ValueError(
             'Chủ PT thiếu name/job_name (name=%r job=%r). Đứng gần chủ hoặc mở PT rồi thử lại.'
             % (char_name, job))
+    if _is_self_identity(*parse_leader_identity(full)[:2]):
+        raise ValueError(
+            'Từ chối điền chủ=chính mình %r. Lấy tên chủ PT khi đứng gần BangChu/chủ thật.'
+            % full)
     return full
 
 
@@ -797,15 +858,15 @@ def do_follow(reason):
     except ValueError as error:
         set_status('[%s] %s' % (reason, error))
         return False
-    mark_follow_grace()
-    try:
-        ok = start_trace(leader_char)
-    except Exception as error:
-        set_status('start_trace lỗi: %s (CharName=%r) — giữ Auto PK.' % (error, leader_char))
+    if _is_self_identity(leader_char, leader_char):
+        set_status('[%s] Từ chối Trace %r — đó là job/tên mình. Lấy tên chủ PT lại.' % (
+            reason, leader_char))
         return False
+    mark_follow_grace()
+    ok = safe_start_trace(leader_char, reason)
     with lock:
         state['following'] = bool(ok)
-    set_status('[%s] Trace → CharName=%r (Leader=%r) · API=%r' % (
+    set_status('[%s] Trace → CharName=%r (Leader=%r) · OK=%r' % (
         reason, leader_char, full, ok))
     arm_auto_pk(prefer_uid=0)
     mark_follow_grace()
@@ -1004,28 +1065,62 @@ def distance_to_leader():
     return math.hypot(leader['x'] - mx, leader['y'] - my)
 
 
-def follower_ensure_trace(reason):
-    leader_char = configured_leader_char()
-    if not leader_char:
+def safe_start_trace(char_name, reason=''):
+    """start_trace only with real CharName — never job AG_He / self. Soft-fail (no DC spam)."""
+    name = _strip_job_star(char_name)
+    if not name:
+        set_status('[%s] Bỏ trace — CharName trống.' % (reason or 'trace'))
+        return False
+    if _is_self_identity(name, name):
+        set_status(
+            '[%s] Bỏ trace — %r là tên/job mình (không start_trace job AG_He). Lấy tên chủ PT lại.'
+            % (reason or 'trace', name))
+        return False
+    # Refuse obvious job-only duplicates of configured job side when char==job.
+    _c, job, _d = parse_leader_identity(configured_leader())
+    job_bare = _strip_job_star(job)
+    if job_bare and name.casefold() == job_bare.casefold() and _is_self_identity(job_bare, job):
+        set_status('[%s] Bỏ trace job-only %r.' % (reason or 'trace', name))
         return False
     try:
-        ok = start_trace(leader_char)
+        ok = start_trace(name)
     except Exception as error:
-        set_status('[%s] start_trace lỗi: %s' % (reason, error))
+        set_status('[%s] start_trace lỗi: %s (CharName=%r) — giữ Auto PK, không DC retry.'
+                   % (reason or 'trace', error, name))
         return False
+    if ok is False:
+        set_status('[%s] start_trace từ chối CharName=%r — giữ Auto PK (không spam).'
+                   % (reason or 'trace', name))
+        return False
+    return True
+
+
+def follower_ensure_trace(reason):
+    try:
+        leader_char = resolve_trace_char_name()
+    except ValueError as error:
+        set_status('[%s] %s' % (reason, error))
+        return False
+    if _is_self_identity(leader_char, leader_char):
+        set_status('[%s] Từ chối Trace %r (job/tên mình).' % (reason, leader_char))
+        return False
+    ok = safe_start_trace(leader_char, reason)
     with lock:
         state['following'] = bool(ok)
-    set_status('[%s] Trace → %r · API=%r' % (reason, leader_char, ok))
+    if ok:
+        set_status('[%s] Trace → CharName=%r · OK' % (reason, leader_char))
     return bool(ok)
 
 
 def follower_check_leader_distance():
-    """HARD: chủ >5m → phụ dừng đánh + start_trace."""
+    """HARD: chủ >10m → phụ dừng đánh + start_trace (sau grace)."""
     if i_am_leader() or not QtBind.isChecked(gui, enabled_box):
+        return
+    if in_follow_grace():
         return
     with lock:
         following = state['following'] or state['armed_auto_pk']
-    if not following and not QtBind.isChecked(gui, arm_box):
+    if not following:
         return
     dist = distance_to_leader()
     if dist is None:
@@ -1034,9 +1129,10 @@ def follower_check_leader_distance():
         return
     with lock:
         now = monotonic()
-        if (now - state['last_follow_nudge_at']) < 1.0:
+        if (now - state['last_follow_nudge_at']) < 2.0:
             return
         state['last_follow_nudge_at'] = now
+    # Log always shows configured threshold (10).
     follower_stop_fight('chủ cách %.1fm (>%.0fm)' % (dist, LEADER_FOLLOW_DISTANCE))
     follower_ensure_trace('chủ xa %.1fm' % dist)
 
@@ -1082,6 +1178,11 @@ def btn_save():
                 QtBind.setText(gui, leader_field, me)
         data['leader_name'] = require_full_leader(
             data.get('leader_name'), context='Chủ (Leader)')
+        c, j, _ = parse_leader_identity(data['leader_name'])
+        if data.get('role') == ROLE_FOLLOWER and _is_self_identity(c, j):
+            raise ValueError(
+                'Leader=%r trùng tên/job mình — bấm Lấy tên chủ PT (không lưu AG_He).'
+                % data['leader_name'])
         QtBind.setText(gui, leader_field, data['leader_name'])
         path = config_path()
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -1133,15 +1234,22 @@ def btn_self():
 
 
 def btn_party_master():
-    """Phụ: điền chủ PT = CharName, job_name từ party."""
+    """Phụ: điền chủ PT = CharName thật + job (từ chối self/job AG_He)."""
     try:
         full = party_master_display()
     except ValueError as error:
         set_status('Lấy tên chủ PT: %s' % error)
         return
+    char_name, job_name, _ = parse_leader_identity(full)
+    if _is_self_identity(char_name, job_name):
+        set_status(
+            'Lấy tên chủ PT từ chối %r — trùng tên/job mình. Đứng gần chủ thật rồi bấm lại.'
+            % full)
+        return
     QtBind.setText(gui, leader_field, full)
     set_role(ROLE_FOLLOWER)
-    set_status('Đã điền chủ PT %r · vai trò Phụ. Bấm Lưu cấu hình.' % full)
+    mark_follow_grace()
+    set_status('Đã điền chủ PT %r · CharName=%r · vai trò Phụ. Bấm Lưu.' % (full, char_name))
 
 
 def btn_follow():
@@ -1319,7 +1427,7 @@ def handle_silkroad(opcode, data):
 
 
 def event_loop():
-    """Phụ: chủ >5m → dừng đánh + trace."""
+    """Phụ: chủ >10m → dừng đánh + trace."""
     if not QtBind.isChecked(gui, enabled_box):
         return
     if i_am_leader():
@@ -1347,5 +1455,5 @@ def teleported():
     pass
 
 
-log('[%s] Đã nạp v%s. Follow>10m · Grace · Trace CharName · F4→stop+trace. AG≥1.8.67.'
+log('[%s] Đã nạp v%s. UI>10m · Lấy chủ≠job AG_He · soft Trace CharName. AG≥1.8.67.'
     % (NAME, VERSION))
