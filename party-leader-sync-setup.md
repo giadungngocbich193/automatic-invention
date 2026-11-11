@@ -1,23 +1,25 @@
-# PartyLeader v1.0.9 + AutoGhost v1.8.69
+# PartyLeader v1.0.10 + AutoGhost v1.8.70
 
 ## Reload
-Tab title **must** show `PartyLeader v1.0.9` and `AutoGhost v1.8.69`. Xóa bản cũ trong Plugins.
+Tab title **must** show `PartyLeader v1.0.10` and `AutoGhost v1.8.70`. Xóa bản cũ trong Plugins.
 
-## Trace / chủ PT
-- `start_trace('AG_He')` / `*AG_He` **always OK** on Phụ.
-- Prefer party master CharName if available; else job name.
-- Phụ role checkbox is authoritative (job nick never flips to “mình là chủ”).
+## Ally filter (AutoGhost)
+- Không đánh: **Party** + **Guild** only.
+- **No Liên minh / alliance**.
+- Missing party/guild data ⇒ **do not skip** (stranger still attackable).
 
-## Party prefer → Ghost cast
-- Prefer UID locks target and **casts Ghost F skills immediately**.
-- Prefer UID is **never retired/skipped** after B070 miss — soft-wait + retry.
-- No spam log “tạm bỏ qua UID · dò mục tiêu khác” for party prefer.
+## Trace / Leader
+- Field label: **tên Leader cần theo** (manual OK). Button **Lấy tên chủ PT** kept.
+- `start_trace('AG_He')` / `*AG_He` hard-allowed (tries multiple forms).
+- >10m: clear prefer + soft-stop + Trace/chase.
 
-## Soft-stop (>10m / F4)
-- Memory-only hold (no `7046`/`7074`, no `stop_bot`).
+## Ghost nền / F4
+- Party prefer uses normal **7081/B074** Ghost interrupt (no silent normal-attack lock).
+- After F4 Auto PK off, prefer **re-arms** Ghost without UI.
 
 ## Persist
-Lưu/Tải/auto-load all ticks (Bật, sync, ks Auto PK, chat ks#, Chủ/Phụ, F, Leader).
+Lưu/Tải + plugin_load + joined_game + deferred/event_loop re-sync:
+Bật, Sync, ks AutoPK, chat ks#, Chủ/Phụ, F, Leader.
 
 ## jsDelivr
-Pin commit SHA on PR after push.
+Pin commit SHA on PR after verified push.

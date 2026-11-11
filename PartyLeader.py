@@ -2,9 +2,10 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.10: Trace AG_He/*AG_He hard-allow; >10m clear prefer+chase; persist
+  restore on load/joined/deferred; label “tên Leader cần theo”; AG≥1.8.70.
 - v1.0.9: Trace AG_He luôn OK (Phụ role authoritative); AG≥1.8.69 prefer cast.
-- v1.0.8: Trace job nick AG_He/*AG_He OK; soft-stop >10m (no inject/stop_bot DC);
-  prefer party master name else job; giữ persist ticks 1.0.7. AG≥1.8.68.
+- v1.0.8: soft-stop >10m (no inject/stop_bot DC); persist ticks 1.0.7.
 - v1.0.7: Lưu/Tải đủ checkbox (Bật/sync/ks Auto PK/chat ks#/Chủ-Phụ/F/Leader);
   auto-load khi nạp plugin + auto-apply Bật từ file.
 - v1.0.6: UI 10m; soft Trace; fix ensure override.
@@ -23,7 +24,7 @@ import math
 import struct
 import sys
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Timer
 from time import monotonic, sleep
 
 import QtBind
@@ -50,7 +51,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.9'
+VERSION = '1.0.10'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -92,11 +93,14 @@ state = {
     'last_b070_at': 0.0,
     'last_inject_log_at': 0.0,
     'follow_grace_until': 0.0,
+    'last_trace_fail_at': 0.0,
+    'last_trace_fail_msg': '',
 }
 
 _ui_applying = False  # True while restore — skip checkbox side-effects
+_persist_synced = False
 
-QtBind.createLabel(gui, '%s v%s — PT theo chủ' % (NAME, VERSION), 10, 8)
+QtBind.createLabel(gui, '%s v%s — PT theo Leader' % (NAME, VERSION), 10, 8)
 enabled_box = QtBind.createCheckBox(gui, 'ui_enabled', 'Bật plugin', 10, 32)
 sync_box = QtBind.createCheckBox(gui, 'ui_sync', 'Đồng bộ mục tiêu (7045 / B070)', 140, 32)
 arm_box = QtBind.createCheckBox(gui, 'ui_arm', 'ks: bật AutoGhost Auto PK', 400, 32)
@@ -112,22 +116,22 @@ page_combo = QtBind.createCombobox(gui, 150, 106, 70, 22)
 for page in GHOST_PAGES:
     QtBind.append(gui, page_combo, page)
 
-QtBind.createLabel(gui, 'Chủ (name, job_name)', 240, 88)
+QtBind.createLabel(gui, 'tên Leader cần theo', 240, 88)
 leader_field = QtBind.createLineEdit(gui, '', 240, 106, 160, 22)
 QtBind.createButton(gui, 'btn_self', 'Lấy tên mình', 410, 104)
 QtBind.createButton(gui, 'btn_party_master', 'Lấy tên chủ PT', 520, 104)
 
 QtBind.createButton(gui, 'btn_save', 'Lưu cấu hình', 10, 144)
 QtBind.createButton(gui, 'btn_load', 'Tải cấu hình', 140, 144)
-QtBind.createButton(gui, 'btn_follow', 'Thử theo chủ (trace)', 280, 144)
+QtBind.createButton(gui, 'btn_follow', 'Thử theo Leader (trace)', 280, 144)
 QtBind.createButton(gui, 'btn_stop', 'Dừng theo', 460, 144)
 
 status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 184)
 QtBind.createLabel(
     gui,
-    'ks = phụ trace + Auto PK · ks off = dừng. Chủ chọn/đánh → phụ cùng UID.\n'
-    'HARD Phụ: chỉ UID chủ · >10m soft-stop (no inject) + Trace job nick OK (AG_He).\n'
-    'Phụ: tick Phụ + Lấy tên chủ PT + F + Lưu. Chủ: tick Chủ + Lấy tên mình / chat ks.',
+    'ks = phụ trace + Auto PK · ks off = dừng. Leader chọn/đánh → phụ cùng UID.\n'
+    'HARD Phụ: chỉ UID Leader · >10m soft-stop + Trace AG_He OK · Lưu/Tải giữ ticks.\n'
+    'Phụ: tick Phụ + điền tên Leader cần theo / Lấy tên chủ PT + F + Lưu.',
     10, 214,
 )
 
@@ -832,25 +836,31 @@ def inject_select(uid, reason):
         if callable(select_hook):
             try:
                 ok = bool(select_hook(uid, source='%s:%s' % (NAME, reason)))
+                # F4 may have stopped Auto PK — re-arm then prefer again.
+                if not ok:
+                    arm_ok = arm_auto_pk(prefer_uid=uid)
+                    ok = bool(select_hook(uid, source='%s:%s:rearm' % (NAME, reason))) if arm_ok else False
                 if not quiet:
                     set_status('Prefer UID=%d (%s) · AG hook=%r (no 7045)' % (uid, reason, ok))
-                return True if ok else True  # prefer set path is enough
+                return bool(ok)
             except Exception as error:
                 _log('party_sync_select_uid: %s' % error)
-        # Fallback: set prefer dict fields without 7045.
+        # Fallback: re-arm + set prefer dict fields without 7045.
         try:
+            if not getattr(ghost, 'auto_pk_running', False):
+                arm_auto_pk(prefer_uid=uid)
             runtime = getattr(ghost, 'auto_pk_runtime', None)
             if isinstance(runtime, dict):
                 runtime['party_sync_uid'] = uid
                 runtime['party_lock'] = True
                 runtime['party_follow_mode'] = True
+                runtime['party_hold_fight'] = False
                 runtime['requested'] = uid
                 if not quiet:
                     set_status('Prefer UID=%d gắn runtime (no 7045)' % uid)
                 return True
         except Exception:
             pass
-    # Last resort ONLY if AutoGhost missing — still try once, never loop here.
     if not quiet:
         set_status('Không AutoGhost hook · bỏ 7045 loop · UID=%d' % uid)
     return False
@@ -1081,40 +1091,61 @@ def _name_is_configured_leader(name):
 
 
 def safe_start_trace(char_name, reason=''):
-    """start_trace with CharName or job nick (AG_He / *AG_He OK). Soft-fail."""
-    name = _strip_job_star(char_name)
+    """start_trace with CharName or job nick AG_He/*AG_He. Soft-fail, no spam."""
+    raw = str(char_name or '').strip()
+    name = _strip_job_star(raw)
     if not name:
         set_status('[%s] Bỏ trace — tên trống.' % (reason or 'trace'))
         return False
-    # Phụ / configured leader job nick: always allow start_trace('AG_He').
-    # Only block accidental self-trace when role is Chủ and name is self.
-    if (role_index() != ROLE_FOLLOWER
-            and not _name_is_configured_leader(name)
-            and _is_self_identity(name, name)):
-        set_status(
-            '[%s] Bỏ trace — %r là chính mình (không phải chủ đã lưu).'
-            % (reason or 'trace', name))
-        return False
-    try:
-        ok = start_trace(name)
-    except Exception as error:
-        set_status('[%s] start_trace lỗi: %s (name=%r) — giữ Auto PK, không DC retry.'
-                   % (reason or 'trace', error, name))
-        return False
-    if ok is False:
-        set_status('[%s] start_trace từ chối name=%r — giữ Auto PK (không spam).'
-                   % (reason or 'trace', name))
-        return False
-    return True
+    # Always allow configured Leader / Phụ job nick — never self-reject AG_He.
+    candidates = []
+    for c in (raw, name, '*' + name):
+        c = str(c or '').strip()
+        if c and c not in candidates:
+            candidates.append(c)
+    # Also try configured field variants.
+    cfg = configured_leader()
+    c_name, c_job, _ = parse_leader_identity(cfg)
+    for c in (c_name, _strip_job_star(c_job), c_job,
+              ('*' + _strip_job_star(c_job)) if c_job else ''):
+        c = str(c or '').strip()
+        if c and c not in candidates:
+            candidates.append(c)
+    last_error = None
+    for candidate in candidates:
+        try:
+            ok = start_trace(candidate)
+        except Exception as error:
+            last_error = error
+            continue
+        if ok is False:
+            continue
+        return True
+    # Debounce reject spam (distance tick every 2s).
+    msg = ('start_trace từ chối %r (thử %s)%s'
+           % (name, '/'.join(candidates),
+              (': %s' % last_error) if last_error else ''))
+    with lock:
+        now = monotonic()
+        prev = state.get('last_trace_fail_msg') or ''
+        last_at = float(state.get('last_trace_fail_at') or 0)
+        quiet = (msg == prev and (now - last_at) < 5.0)
+        state['last_trace_fail_msg'] = msg
+        state['last_trace_fail_at'] = now
+    if not quiet:
+        set_status('[%s] %s — giữ Auto PK, không spam.' % (reason or 'trace', msg))
+    return False
 
 
 def follower_ensure_trace(reason):
     try:
         leader_char = resolve_trace_char_name()
     except ValueError as error:
-        set_status('[%s] %s' % (reason, error))
-        return False
-    # Phụ always Trace configured leader (job AG_He OK) — no self-job reject.
+        # Fallback: raw Leader field / AG_He job nick.
+        leader_char = _strip_job_star(configured_leader()) or configured_leader()
+        if not leader_char:
+            set_status('[%s] %s' % (reason, error))
+            return False
     ok = safe_start_trace(leader_char, reason)
     with lock:
         state['following'] = bool(ok)
@@ -1124,7 +1155,7 @@ def follower_ensure_trace(reason):
 
 
 def follower_check_leader_distance():
-    """HARD: chủ >10m → soft-stop đánh + Trace (sau grace; no inject)."""
+    """HARD: Leader >10m → clear prefer + soft-stop + Trace/chase."""
     if i_am_leader() or not QtBind.isChecked(gui, enabled_box):
         return
     if in_follow_grace():
@@ -1143,9 +1174,11 @@ def follower_check_leader_distance():
         if (now - state['last_follow_nudge_at']) < 2.0:
             return
         state['last_follow_nudge_at'] = now
-    # Soft-stop Ghost (no 7046/7074) then Trace — job nick OK.
-    follower_stop_fight('chủ cách %.1fm (>%.0fm)' % (dist, LEADER_FOLLOW_DISTANCE))
-    follower_ensure_trace('chủ xa %.1fm' % dist)
+        state['last_uid'] = 0
+        state['fight_held'] = True
+    # Clear prefer UID + soft-stop attack, then chase Leader (AG_He OK).
+    follower_stop_fight('Leader cách %.1fm (>%.0fm)' % (dist, LEADER_FOLLOW_DISTANCE))
+    follower_ensure_trace('Leader xa %.1fm' % dist)
 
 
 def read_settings():
@@ -1201,6 +1234,15 @@ def apply_settings(data):
         QtBind.setChecked(gui, sync_box, sync_target)
         QtBind.setChecked(gui, broadcast_box, broadcast_select)
         QtBind.setChecked(gui, arm_box, arm_auto_pk)
+        # Re-assert after QtBind may async-flip exclusive role boxes.
+        QtBind.setChecked(gui, role_leader_box, role == ROLE_LEADER)
+        QtBind.setChecked(gui, role_follower_box, role == ROLE_FOLLOWER)
+        QtBind.setChecked(gui, enabled_box, enabled)
+        QtBind.setChecked(gui, sync_box, sync_target)
+        QtBind.setChecked(gui, broadcast_box, broadcast_select)
+        QtBind.setChecked(gui, arm_box, arm_auto_pk)
+        QtBind.setText(gui, page_combo, page)
+        QtBind.setText(gui, leader_field, leader_name)
     finally:
         _ui_applying = False
     with lock:
@@ -1503,9 +1545,84 @@ def handle_silkroad(opcode, data):
     return True
 
 
+def _ensure_persist_ui():
+    """Re-apply saved ticks if UI drifted after plugin reload."""
+    global _persist_synced, _ui_applying
+    path = config_path()
+    if not path.is_file():
+        _persist_synced = True
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    want = {
+        'enabled': bool(data.get('enabled')),
+        'sync': bool(data.get('sync_target', data.get('sync', True))),
+        'arm': bool(data.get('arm_auto_pk', data.get('arm', True))),
+        'broadcast': bool(data.get('broadcast_select', True)),
+        'role': ROLE_LEADER if int(data.get('role', 0) or 0) == ROLE_LEADER else ROLE_FOLLOWER,
+        'page': str(data.get('ghost_page') or 'F2').strip().upper(),
+        'leader': str(data.get('leader_name') or '').strip(),
+    }
+    if want['page'] not in GHOST_PAGES:
+        want['page'] = 'F2'
+    cur_enabled = QtBind.isChecked(gui, enabled_box)
+    cur_sync = QtBind.isChecked(gui, sync_box)
+    cur_arm = QtBind.isChecked(gui, arm_box)
+    cur_broadcast = QtBind.isChecked(gui, broadcast_box)
+    cur_role = role_index()
+    cur_page = (QtBind.text(gui, page_combo) or '').strip().upper()
+    cur_leader = (QtBind.text(gui, leader_field) or '').strip()
+    mismatched = (
+        cur_enabled != want['enabled']
+        or cur_sync != want['sync']
+        or cur_arm != want['arm']
+        or cur_broadcast != want['broadcast']
+        or cur_role != want['role']
+        or cur_page != want['page']
+        or cur_leader != want['leader']
+    )
+    if mismatched:
+        apply_settings({
+            'enabled': want['enabled'],
+            'sync_target': want['sync'],
+            'arm_auto_pk': want['arm'],
+            'broadcast_select': want['broadcast'],
+            'role': want['role'],
+            'ghost_page': want['page'],
+            'leader_name': want['leader'],
+        })
+        _log('persist re-sync UI ← %s' % settings_summary({
+            'enabled': want['enabled'],
+            'sync_target': want['sync'],
+            'arm_auto_pk': want['arm'],
+            'broadcast_select': want['broadcast'],
+            'role': want['role'],
+            'ghost_page': want['page'],
+            'leader_name': want['leader'],
+        }))
+    _persist_synced = True
+    return data
+
+
 def event_loop():
-    """Phụ: chủ >10m → dừng đánh + trace."""
-    if not QtBind.isChecked(gui, enabled_box):
+    """Phụ: Leader >10m → dừng đánh + trace. First ticks re-sync persist UI."""
+    global _persist_synced
+    if not _persist_synced:
+        try:
+            _ensure_persist_ui()
+        except Exception as error:
+            _persist_synced = True
+            _log('persist sync: %s' % error)
+    # Prefer state.enabled if UI checkbox failed to restore.
+    enabled = QtBind.isChecked(gui, enabled_box)
+    with lock:
+        if state.get('enabled') and not enabled:
+            enabled = True
+    if not enabled:
         return
     if i_am_leader():
         return
@@ -1521,7 +1638,10 @@ def event_loop():
 
 
 def joined_game():
+    global _persist_synced
+    _persist_synced = False
     data = load_settings(quiet=False)
+    _ensure_persist_ui()
     if role_index() == ROLE_LEADER and not (QtBind.text(gui, leader_field) or '').strip():
         me = self_display() or self_name()
         if me:
@@ -1531,19 +1651,44 @@ def joined_game():
         _log('joined_game: đã auto-bật từ cấu hình đã lưu.')
 
 
+def plugin_load():
+    """phBot hook alias — restore ticks on plugin reload."""
+    global _persist_synced
+    _persist_synced = False
+    data = load_settings(quiet=False)
+    _ensure_persist_ui()
+    return data
+
+
 def teleported():
     pass
 
 
-# Auto-restore on plugin reload (before joined_game).
+def _deferred_persist_restore():
+    try:
+        _ensure_persist_ui()
+    except Exception as error:
+        _log('deferred persist: %s' % error)
+
+
+# Auto-restore on plugin reload (before joined_game) + deferred re-assert.
 try:
     _boot = load_settings(quiet=True)
     if _boot is not None:
-        _log('Nạp v%s · restored %s' % (VERSION, settings_summary(_boot)))
+        _log('Nạp v%s · restored %s · file=%s'
+             % (VERSION, settings_summary(_boot), config_path()))
     else:
         _log('Nạp v%s · chưa có PartyLeader.json — tick rồi Lưu.' % VERSION)
 except Exception as _boot_error:
     _log('Nạp v%s · restore lỗi: %s' % (VERSION, _boot_error))
 
-log('[%s] Đã nạp v%s. Persist · soft-stop · Trace AG_He · prefer Ghost cast. AG≥1.8.69.'
+for _delay in (0.5, 1.5, 3.0):
+    try:
+        _t = Timer(_delay, _deferred_persist_restore)
+        _t.daemon = True
+        _t.start()
+    except Exception:
+        pass
+
+log('[%s] Đã nạp v%s. Persist ticks · Trace AG_He · >10m chase · AG≥1.8.70.'
     % (NAME, VERSION))

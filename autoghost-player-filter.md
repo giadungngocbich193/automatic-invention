@@ -1,22 +1,21 @@
 # AutoGhost — nhận diện người chơi (get_players)
 
-**Plugin version:** AutoGhost **v1.8.69** (+ PartyLeader **v1.0.9**)
+**Plugin version:** AutoGhost **v1.8.70** (+ PartyLeader **v1.0.10**)
 
 ## Tóm tắt (VN)
 
 | Câu hỏi | Trả lời |
 |--------|---------|
-| Có lọc đỏ/tím / job? | **Có** — list-select ưu tiên đỏ/tím hoặc job đạo tặc↔bảo tiêu |
-| Lọc Party? | **HARD luôn bật** — không bao giờ Auto PK người cùng nhóm (`get_party`), kể cả tên job `*AG_BangChu` |
-| Lọc Guild / Liên minh? | Checkbox **Guild (G)** / **Liên minh** (mặc định bật) qua `get_guild` / `get_guild_union` |
-| Party sync phụ? | Prefer UID → Ghost F cast ngay; never retire prefer; soft-hold; Trace AG_He |
-| ALT? | Không |
-| Inject 7045 người? | Solo: Target Enemy. Party sync: không cần 7045 thành công |
-| Buff VK F1/F2/F3? | Cần **Lấy đồ** đúng F; thiếu model → báo rõ tab Đồ |
+| Có lọc đỏ/tím / job? | List-select vẫn ưu tiên đỏ/tím hoặc job (riêng) |
+| Lọc Party? | **HARD** — không Auto PK người cùng `get_party` |
+| Lọc Guild? | Checkbox **Guild (G)** — cùng `get_guild` / cùng guild string |
+| Lọc Liên minh? | **Không** — đã gỡ hoàn toàn |
+| Unknown / thiếu data? | **Không skip** — vẫn đánh được stranger |
+| Party sync phụ? | Prefer → Ghost F + 7081/B074 nền; Trace AG_He; soft-hold |
 
-## Vì sao game báo “không thể tấn công người trong cùng nhóm”?
+## Vì sao trước đây camp đứng im?
 
-Bản trước có thể chọn nhầm PT (lệch `*` job name). **1.8.67+** bỏ qua mọi UID/tên trong `get_party` trước khi Target/Ghost. Soft-hold **1.8.68** không inject khi >10m.
+Filter cũ có thể over-match (union / guild-name-in-names). **1.8.70** chỉ skip đúng cùng Party hoặc cùng Guild.
 
 ## Doc path
 
