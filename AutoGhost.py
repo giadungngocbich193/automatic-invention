@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX prefer cast no-players v1.8.76] Prefer UID cast Ghost F even when
+  get_players() thiếu UID (phe địch); no stall “Giữ UID · Player list thiếu”.
 - [FIX prefer silent locked v1.8.75] same UID after first cast: absolute silent
   Prefer (no 5s Ghost F cast log) while locked.
 - [FIX prefer immediate cast v1.8.74] Prefer → lock+7074 Ghost F ngay (<1s);
@@ -56,14 +58,15 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.75'
+VERSION = '1.8.76'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + prefer silent while locked after first cast
+# baseline 2600 + prefer cast when get_players missing UID
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
 PARTY_PREFER_RESELECT_DEBOUNCE = 2.0
 PARTY_PREFER_LOG_INTERVAL = 60.0
+PARTY_PREFER_MISSING_PLAYER_LOG = 30.0
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -2875,18 +2878,25 @@ def rotate_direct(character, gate_checked=False):
     client = get_client() or {}
     if not client.get('running') or (not client.get('window') and not auto_pk_running):
         return
+    pk_runtime = auto_pk_runtime if auto_pk_running else None
+    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
     monsters = get_monsters()
-    if monsters is None or direct_target in monsters or direct_target in (get_npcs() or {}):
+    if monsters is None:
+        return
+    # Party prefer: enemy often dual-listed / absent from get_players — still cast by UID.
+    if not party_prefer and (direct_target in monsters or direct_target in (get_npcs() or {})):
         return
     if auto_pk_running:
         if auto_pk_returning:
             return
         inside, reason = auto_pk_radius_check(direct_target)
-        # Locked fight: ignore camp-radius outs — keep rotating skills on UID.
-        if not inside and reason not in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
+        # Locked fight: keep casting on camp outs / missing Player list (phe địch).
+        if not inside and reason not in (
+                AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET, 'tạm thiếu dữ liệu Player'):
             return
-    pk_runtime = auto_pk_runtime if auto_pk_running else None
-    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
+        if (not inside and reason == 'tạm thiếu dữ liệu Player'
+                and not (party_prefer or direct_target == pvp_target)):
+            return
     # Party prefer is a locked fight — never treat as disposable skill_probe.
     if party_prefer and pk_runtime is not None:
         pk_runtime['skill_probe_uid'] = 0
@@ -4371,20 +4381,28 @@ def auto_pk_player_attack_range(uid, runtime=None):
 
     [FIX never abort PvP in attack range] Self can be outside while target stays inside —
     that must NOT count as leave-range.
+    Party prefer / locked UID: get_players() often omits opposing-faction enemies —
+    treat as still attackable by packet UID (do not stall).
     """
     runtime = runtime if runtime is not None else auto_pk_runtime
     if not runtime or not uid:
         return False, 'chưa bật Auto PK / thiếu UID'
-    anchor = runtime['anchor']
+    anchor = runtime.get('anchor') or {}
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
+    party_prefer = is_party_sync_prefer_uid(uid, runtime)
+    locked = party_prefer or uid in (pvp_target, direct_target)
     if not isinstance(target, dict):
+        if party_prefer or locked:
+            return True, 'cast theo UID · Player list thiếu (phe địch)'
         return False, 'tạm thiếu dữ liệu Player'
     unavailable = auto_pk_target_unavailable(runtime, uid, target, monotonic())
     if unavailable:
         return False, unavailable
     distance = auto_pk_target_distance(target, anchor, runtime)
     if distance is None:
+        if party_prefer or locked:
+            return True, 'cast theo UID · thiếu tọa độ Player'
         return False, 'tạm thiếu dữ liệu Player'
     if distance > runtime['radius']:
         return False, AUTO_PK_OUTSIDE_TARGET
@@ -4403,17 +4421,28 @@ def auto_pk_radius_check(uid):
         return False, AUTO_PK_OUTSIDE_TARGET
     if attack_detail in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
         return False, attack_detail
+    party_prefer = is_party_sync_prefer_uid(uid, runtime)
+    # Prefer / locked: missing Player list is already treated as in-attack above.
+    # Keep a hard allow here too so cast never stalls on list flicker.
+    if party_prefer and attack_detail == 'tạm thiếu dữ liệu Player':
+        return True, 'party prefer · Player list thiếu · cast theo UID'
     anchor = runtime['anchor']
     position = get_position() or {}
     own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
     if own_distance is None:
+        if party_prefer:
+            return True, 'party prefer · thiếu tọa độ self · cast theo UID'
         return False, attack_detail if attack_detail == 'tạm thiếu dữ liệu Player' else 'thiếu tọa độ hoặc đã đổi vùng'
     if own_distance > runtime['radius']:
         # Engaged chase: self outside alone is not a hard fail when Player list is thin.
         if attack_detail == 'tạm thiếu dữ liệu Player' and (pvp_target == uid or direct_target == uid):
+            if party_prefer:
+                return True, 'party prefer · Player list thiếu · cast theo UID'
             return False, 'tạm thiếu dữ liệu Player'
         return False, AUTO_PK_OUTSIDE_SELF
     if attack_detail == 'tạm thiếu dữ liệu Player':
+        if party_prefer or uid in (pvp_target, direct_target):
+            return True, 'khóa UID · Player list thiếu · cast theo UID'
         return False, 'tạm thiếu dữ liệu Player'
     return False, attack_detail
 
@@ -5965,12 +5994,16 @@ def tick_auto_pk(from_event=False):
             runtime.pop('missing_since', None)
             return True
         if active and reason == 'tạm thiếu dữ liệu Player':
-            # Opposing-faction enemies often omitted from get_players — keep lock briefly.
+            # Opposing-faction enemies often omitted from get_players — CAST by UID.
             runtime.pop('missing_since', None)
+            partyish = party_follow or is_party_sync_prefer_uid(pvp_target, runtime)
             _auto_pk_debounced_log(
                 runtime, 'missing_notice_at',
-                'Giữ UID %d · Player list thiếu (thường gặp phe địch).' % pvp_target,
-                interval=5.0)
+                ('Party prefer UID %d · Player list thiếu · cast Ghost F theo UID'
+                 if partyish else
+                 'Giữ UID %d · Player list thiếu · cast Ghost F theo UID') % pvp_target,
+                interval=PARTY_PREFER_MISSING_PLAYER_LOG if partyish else 15.0)
+            # Do not stall/hold-only — keep tick True so rotate_direct fires.
             return True
         runtime.pop('missing_since', None)
         if eligible:
