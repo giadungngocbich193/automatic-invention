@@ -2,6 +2,8 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.1.1: F1/F2/3 force ALL Phụ ARM (uid optional); remove >10m soft-stop/chase;
+  ag#F1#arm when no target (0 no longer = stop).
 - v1.1.0: Primary Leader→Phụ = F1/F2/key3 (Ghost PvP-style toggle arm/stop);
   Prefer UID sync kept; ks chat secondary; per-char config; Trace move_to.
 - v1.0.14: Config PER character PartyLeader_<char>.json (fix shared Chủ);
@@ -70,7 +72,7 @@ except Exception:
     user32 = None
 
 NAME = 'PartyLeader'
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -90,9 +92,8 @@ LEADER_FIGHT_KEYS = {
 }
 # Party chat protocol: ag#F1#UID | ag#F1#stop | ag#3#UID | ag#3#stop
 AG_FIGHT_PREFIX = 'ag#'
-# HARD: phụ dừng đánh + trace khi chủ xa hơn khoảng này (mét) — mặc định 10.
+# Legacy constants kept for older persist notes — >10m soft-stop/chase REMOVED (v1.1.1).
 LEADER_FOLLOW_DISTANCE = 10.0
-# Sau Bật plugin / ks / arm: chưa áp khoảng cách (tránh clear storm lúc enable Phụ).
 FOLLOW_DISTANCE_GRACE = 12.0
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
@@ -163,8 +164,8 @@ QtBind.createButton(gui, 'btn_stop', 'Dừng theo', 460, 144)
 status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 184)
 QtBind.createLabel(
     gui,
-    'Chủ: F1 / F2 / phím 3 = bật Ghost phụ (cùng target) · bấm lại = dừng (như Ghost PvP).\n'
-    'Phụ: chọn nhóm F + tên Leader · Prefer UID sync · >10m Trace/move_to · config theo CharName.\n'
+    'Chủ: F1 / F2 / phím 3 = FORCE Ghost ON mọi Phụ (Prefer UID nếu có) · bấm lại = STOP.\n'
+    'Không cần Chủ đang đánh · không soft-stop theo khoảng cách. Phụ chọn nhóm F + Lưu theo CharName.\n'
     'ks chat chỉ phụ (tuỳ chọn).',
     10, 214,
 )
@@ -808,22 +809,29 @@ def find_autoghost():
     return None
 
 
-def arm_auto_pk(prefer_uid=0):
-    """Bật AutoGhost Auto PK theo nhóm F đã lưu trên phụ (song song với trace)."""
-    if not QtBind.isChecked(gui, arm_box):
+def arm_auto_pk(prefer_uid=0, force=False):
+    """Bật AutoGhost Auto PK theo nhóm F đã lưu trên phụ.
+
+    force=True (Chủ F1/F2/3): always arm — ignore arm_box / fight_held.
+    """
+    if not force and not QtBind.isChecked(gui, arm_box):
         return False
     ghost = find_autoghost()
     if ghost is None:
-        set_status('Không thấy AutoGhost — chỉ trace/sync 7045.')
+        set_status('Không thấy AutoGhost — không ARM được.')
         return False
-    # Không stop_bot: đang ks/trace thì get_status truthy — AutoGhost 1.8.62+ cho phép.
     page = ghost_page()
+    try:
+        prefer_uid = int(prefer_uid or 0)
+    except (TypeError, ValueError):
+        prefer_uid = 0
+    with lock:
+        state['fight_held'] = False
     hook = getattr(ghost, 'party_sync_arm_auto_pk', None)
     try:
         if callable(hook):
-            ok = bool(hook(page=page, prefer_uid=int(prefer_uid or 0), source=NAME))
+            ok = bool(hook(page=page, prefer_uid=prefer_uid, source=NAME))
         else:
-            # Fallback older AutoGhost: set page UI + request_auto_pk_arm
             field = getattr(ghost, 'auto_pk_page_field', None)
             gui_ref = getattr(ghost, 'gui', None)
             if field is not None and gui_ref is not None:
@@ -834,15 +842,24 @@ def arm_auto_pk(prefer_uid=0):
                 return False
             arm()
             ok = bool(getattr(ghost, 'auto_pk_running', False))
+        # Force Prefer/select even when arm returned True without cast.
+        if prefer_uid > 0:
+            select = getattr(ghost, 'party_sync_select_uid', None)
+            if callable(select):
+                try:
+                    select(prefer_uid, source='%s:force-arm' % NAME)
+                except Exception:
+                    pass
     except Exception as error:
         set_status('Arm Auto PK lỗi: %s' % error)
         return False
     with lock:
         state['armed_auto_pk'] = bool(ok)
-    if ok:
-        mark_follow_grace()
-    set_status('Auto PK %s · nhóm %s · API=%r' % (
-        'ON' if ok else 'FAIL', page, ok))
+        if prefer_uid > 0:
+            state['last_uid'] = prefer_uid
+            state['prefer_silent_uid'] = 0
+    set_status('Auto PK %s · nhóm %s · UID=%s · API=%r' % (
+        'ON' if ok else 'FAIL', page, prefer_uid or '-', ok))
     return ok
 
 
@@ -1084,7 +1101,10 @@ def _game_window_foreground():
 
 
 def parse_ag_fight_cmd(text):
-    """Parse ag#F1#UID | ag#F1#stop | ag#3#123 → (page, action, uid)."""
+    """Parse ag#F1#UID | ag#F1#arm | ag#F1#stop | ag#3#arm → (page, action, uid).
+
+    IMPORTANT: uid 0 / 'arm' means ARM without Prefer — never treat as stop.
+    """
     raw = str(text or '').strip()
     low = raw.casefold()
     if not low.startswith(AG_FIGHT_PREFIX):
@@ -1096,46 +1116,46 @@ def parse_ag_fight_cmd(text):
     page = str(parts[0] or '').strip().upper()
     if page == '3':
         page = '3'
-    elif page not in GHOST_PAGES[:2]:  # F1 / F2 primary; F3 via digit-3 path
-        if page in GHOST_PAGES:
-            pass
-        else:
-            return None
+    elif page not in GHOST_PAGES:
+        return None
     action = 'arm'
     uid = 0
     if len(parts) >= 2:
         token = str(parts[1] or '').strip()
-        if token.casefold() in ('stop', '0', 'off', 'dung', 'dừng'):
+        low_tok = token.casefold()
+        if low_tok in ('stop', 'off', 'dung', 'dừng'):
             action = 'stop'
+        elif low_tok in ('arm', 'on', 'start', ''):
+            action = 'arm'
+            uid = 0
         else:
             try:
                 uid = int(token)
             except (TypeError, ValueError):
                 uid = 0
-            if uid <= 0:
-                action = 'stop'
+            action = 'arm'  # even uid==0 is ARM (no prefer)
     return page, action, uid
 
 
 def leader_broadcast_fight_cmd(page, action, uid=0):
-    """Broadcast F1/F2/3 arm|stop to party (primary Leader→Phụ control)."""
+    """Broadcast F1/F2/3 arm|stop to party — ALWAYS (force Phụ Ghost ON/OFF)."""
     if not QtBind.isChecked(gui, enabled_box):
         return False
     if not i_am_leader():
         return False
-    if not QtBind.isChecked(gui, broadcast_box):
-        return False
+    # Always broadcast fight cmds when plugin on — do not require broadcast_box
+    # (target Prefer sync still uses broadcast_box).
     page = str(page or '').strip().upper()
     if page not in ('F1', 'F2', 'F3', '3'):
         return False
-    action = 'stop' if str(action).casefold() in ('stop', '0', 'off') else 'arm'
+    action = 'stop' if str(action).casefold() in ('stop', 'off') else 'arm'
     try:
         uid = int(uid or 0)
     except (TypeError, ValueError):
         uid = 0
     with lock:
         now = monotonic()
-        if (now - float(state.get('last_fight_cmd_at') or 0)) < 0.25:
+        if (now - float(state.get('last_fight_cmd_at') or 0)) < 0.20:
             return False
         state['last_fight_cmd_at'] = now
         if action == 'arm':
@@ -1146,12 +1166,20 @@ def leader_broadcast_fight_cmd(page, action, uid=0):
                 state['last_uid'] = uid
         else:
             state['leader_cmd_page'] = None
-    payload = '%s%s#%s' % (AG_FIGHT_PREFIX, page, 'stop' if action == 'stop' else uid)
+    # ARM with no target → ag#F1#arm (NOT #0 — that used to mean stop).
+    if action == 'stop':
+        token = 'stop'
+    elif uid > 0:
+        token = str(uid)
+    else:
+        token = 'arm'
+    payload = '%s%s#%s' % (AG_FIGHT_PREFIX, page, token)
     if party_chat(payload):
         set_status('Chủ %s %s%s' % (
             'ARM' if action == 'arm' else 'STOP', page,
-            (' · UID %d' % uid) if action == 'arm' and uid else ''))
+            (' · UID %d' % uid) if action == 'arm' and uid else ' · (no Prefer)'))
         return True
+    set_status('Chủ %s %s — party chat FAIL' % ('ARM' if action == 'arm' else 'STOP', page))
     return False
 
 
@@ -1173,8 +1201,6 @@ def leader_poll_fight_keys():
     if user32 is None:
         return
     if not QtBind.isChecked(gui, enabled_box) or not i_am_leader():
-        return
-    if not QtBind.isChecked(gui, broadcast_box):
         return
     # Ignore while Alt/Ctrl/Shift held (same as AutoGhost).
     try:
@@ -1221,7 +1247,7 @@ def on_leader_ghost_page(page, action='arm'):
     if action in ('stop', 'pause', 'off'):
         return leader_broadcast_fight_cmd(page if page in ('F1', 'F2', 'F3', '3') else '3', 'stop', 0)
     if page == '3' or page in GHOST_PAGES:
-        # Prefer explicit arm from AG with current target (don't double-toggle).
+        # Always ARM broadcast (Leader need not be attacking). Prefer UID if any.
         uid = leader_current_target_uid()
         with lock:
             state['leader_cmd_page'] = page
@@ -1230,36 +1256,52 @@ def on_leader_ghost_page(page, action='arm'):
 
 
 def follower_page_matches_cmd(page):
-    """Phụ responds if cmd page matches configured F, or cmd is digit-3 (any F)."""
+    """ALL Phụ respond to F1/F2/3 — skills still use Phụ's configured F group."""
     page = str(page or '').strip().upper()
-    if page == '3':
-        return True
-    return page == ghost_page()
+    return page in ('F1', 'F2', 'F3', '3')
 
 
 def follower_apply_fight_cmd(page, action, uid, reason='ag#'):
-    """Phụ: arm Auto PK + Prefer UID, or stop like F4."""
+    """Phụ: FORCE arm Auto PK + Prefer UID, or stop like F4.
+
+    Ignores distance/grace/prefer-state/arm_box — Chủ F-cmd always wins.
+    """
     if i_am_leader():
         return False
     if not follower_page_matches_cmd(page):
         return False
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
     if action == 'stop':
         stop_auto_pk_if_ours('%s stop %s' % (reason, page))
         _soft_hold_autoghost('%s stop %s' % (reason, page))
         with lock:
             state['fight_held'] = True
             state['prefer_silent_uid'] = 0
+            state['armed_auto_pk'] = False
         set_status('[%s] STOP Ghost/Auto PK (Chủ %s)' % (reason, page))
         return True
-    if not QtBind.isChecked(gui, arm_box):
-        set_status('[%s] Bỏ qua ARM — tắt “cho phép Auto PK”.' % reason, silent=True)
-        return False
+    # FORCE ARM every Phụ — clear holds; do not require arm_box / prefer / distance.
     with lock:
         state['fight_held'] = False
-    ok = arm_auto_pk(prefer_uid=int(uid or 0))
-    if uid:
-        inject_select(uid, '%s ARM %s' % (reason, page))
-    set_status('[%s] ARM %s%s · AutoPK=%r' % (
+        state['prefer_silent_uid'] = 0
+        state['follow_grace_until'] = 0.0
+    if not QtBind.isChecked(gui, arm_box):
+        try:
+            QtBind.setChecked(gui, arm_box, True)
+        except Exception:
+            pass
+    ok = arm_auto_pk(prefer_uid=uid, force=True)
+    if uid > 0:
+        inject_select(uid, '%s FORCE-ARM %s' % (reason, page))
+    else:
+        # No Prefer UID — still ensure Ghost Auto PK is running on Phụ F group.
+        ghost = find_autoghost()
+        if ghost is not None and not getattr(ghost, 'auto_pk_running', False):
+            ok = arm_auto_pk(prefer_uid=0, force=True) or ok
+    set_status('[%s] FORCE ARM %s%s · AutoPK=%r' % (
         reason, page, (' · UID %d' % uid) if uid else '', ok))
     return bool(ok)
 
@@ -1656,30 +1698,8 @@ def follower_ensure_trace(reason):
 
 
 def follower_check_leader_distance():
-    """HARD: Leader >10m → clear prefer + soft-stop + Trace/chase."""
-    if i_am_leader() or not QtBind.isChecked(gui, enabled_box):
-        return
-    if in_follow_grace():
-        return
-    with lock:
-        following = state['following'] or state['armed_auto_pk']
-    if not following:
-        return
-    dist = distance_to_leader()
-    if dist is None:
-        return
-    if dist <= LEADER_FOLLOW_DISTANCE:
-        return
-    with lock:
-        now = monotonic()
-        if (now - state['last_follow_nudge_at']) < 2.0:
-            return
-        state['last_follow_nudge_at'] = now
-        state['last_uid'] = 0
-        state['fight_held'] = True
-    # Clear prefer UID + soft-stop attack, then chase Leader (AG_He OK).
-    follower_stop_fight('Leader cách %.1fm (>%.0fm)' % (dist, LEADER_FOLLOW_DISTANCE))
-    follower_ensure_trace('Leader xa %.1fm' % dist)
+    """REMOVED (v1.1.1): no >10m soft-stop/chase — Leader F1/F2/3 owns start/stop."""
+    return
 
 
 def read_settings():
@@ -1893,8 +1913,7 @@ def ui_enabled(checked):
         state['enabled'] = bool(checked)
     if checked:
         mark_follow_grace()
-        set_status('Đã bật · grace %.0fs trước luật >%.0fm.' % (
-            FOLLOW_DISTANCE_GRACE, LEADER_FOLLOW_DISTANCE))
+        set_status('Đã bật · Chủ F1/F2/3 FORCE ARM · bấm lại STOP (no >10m).')
     else:
         set_status('Đã tắt.')
 
@@ -2151,7 +2170,7 @@ def _ensure_persist_ui():
 
 
 def event_loop():
-    """Chủ: poll F1/F2/3. Phụ: Leader >10m → soft-stop + Trace. Persist re-sync."""
+    """Chủ: poll F1/F2/3. Phụ: no distance soft-stop. Persist re-sync."""
     global _persist_synced
     if not _persist_synced:
         try:
@@ -2170,16 +2189,7 @@ def event_loop():
             leader_poll_fight_keys()
         except Exception as error:
             _log('leader key poll: %s' % error)
-        return
-    with lock:
-        now = monotonic()
-        if (now - state['distance_check_at']) < 0.45:
-            return
-        state['distance_check_at'] = now
-    try:
-        follower_check_leader_distance()
-    except Exception as error:
-        _log('distance check: %s' % error)
+    # Phụ: >10m soft-stop/chase removed — start/stop only via Chủ F1/F2/3.
 
 
 def joined_game():
@@ -2245,5 +2255,5 @@ for _delay in (0.5, 1.5, 3.0, 6.0):
     except Exception:
         pass
 
-log('[%s] Đã nạp v%s. Chủ F1/F2/3 arm·stop · Prefer sync · per-char config · Trace move_to.'
+log('[%s] Đã nạp v%s. Chủ F1/F2/3 FORCE ARM mọi Phụ · bấm lại STOP · no >10m chase.'
     % (NAME, VERSION))
