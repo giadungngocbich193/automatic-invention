@@ -2,6 +2,8 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.1: Lấy tên mình = name + job_name (vd. ThienHau, AG_He). Phụ khớp tên
+  và/hoặc nghề; start_trace luôn dùng tên NV (phần trước dấu phẩy).
 - v1.0.0: Chat `ks` → phụ start_trace chủ; `ks off`/`dung` → stop_trace.
   Sync mục tiêu: B070 khi chủ đánh + broadcast `ks#UID` khi chủ chọn (0x7045).
   Phụ inject 0x7045 cùng UID. Không ALT.
@@ -35,7 +37,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 CONFIG_NAME = 'PartyLeader'
 
 # Chat lệnh (không phân biệt hoa thường)
@@ -75,7 +77,7 @@ role_combo = QtBind.createCombobox(gui, 10, 106, 220, 22)
 for label in ROLE_LABELS:
     QtBind.append(gui, role_combo, label)
 
-QtBind.createLabel(gui, 'Tên chủ PT (Leader) — phụ bắt buộc điền đúng tên', 250, 88)
+QtBind.createLabel(gui, 'Tên chủ (name, job_name) — phụ điền đúng / Lấy tên mình', 250, 88)
 leader_field = QtBind.createLineEdit(gui, '', 250, 106, 200, 22)
 QtBind.createButton(gui, 'btn_self', 'Lấy tên mình', 460, 104)
 
@@ -89,7 +91,7 @@ QtBind.createLabel(
     gui,
     'Lệnh chat (party/all… từ chủ):  ks = phụ trace chủ  ·  ks off / dung = dừng trace.\n'
     'Chủ chọn địch → (tuỳ chọn) party ks#UID · hoặc khi chủ đánh (B070) phụ tự 7045 cùng UID.\n'
-    'Cùng plugin mọi acc: phụ = Bật + tên chủ · chủ = Vai trò Chủ (hoặc chỉ chat ks).',
+    'Cùng plugin mọi acc: phụ = Bật + ô chủ (name, job_name) · chủ = Lấy tên mình / chat ks.',
     10, 214,
 )
 
@@ -117,12 +119,54 @@ def self_name():
     return str(data.get('name') or '').strip()
 
 
+def self_job_name():
+    data = get_character_data() or {}
+    return str(data.get('job_name') or '').strip()
+
+
+def self_display():
+    """Tên hiển thị cấu hình: 'Name, job_name' (tránh nhầm NV gần giống)."""
+    name = self_name()
+    job = self_job_name()
+    if name and job:
+        return '%s, %s' % (name, job)
+    return name or job
+
+
 def self_player_id():
     data = get_character_data() or {}
     try:
         return int(data.get('player_id') or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def parse_leader_identity(text):
+    """Tách ô Leader → (char_name, job_name, display).
+
+    Chấp nhận: 'ThienHau, AG_He' | 'ThienHau' | chỉ job.
+    """
+    raw = ' '.join(str(text or '').strip().split())
+    if not raw:
+        return '', '', ''
+    if ',' in raw:
+        left, right = raw.split(',', 1)
+        char_name = left.strip()
+        job_name = right.strip()
+    else:
+        char_name = raw
+        job_name = ''
+    display = raw
+    return char_name, job_name, display
+
+
+def identity_tokens(char_name, job_name, display):
+    tokens = []
+    for part in (display, char_name, job_name):
+        key = str(part or '').strip().casefold()
+        if key and key not in tokens:
+            tokens.append(key)
+    return tokens
 
 
 def role_index():
@@ -170,29 +214,53 @@ def parse_ks_uid(msg):
 
 
 def configured_leader():
+    """Chuỗi ô Leader (có thể gồm name, job_name)."""
     name = (QtBind.text(gui, leader_field) or '').strip()
     if name:
         return name
     if role_index() == ROLE_LEADER:
-        return self_name()
+        return self_display() or self_name()
     return ''
 
 
+def configured_leader_char():
+    """Tên NV dùng cho start_trace (không kèm job)."""
+    char_name, _job, _display = parse_leader_identity(configured_leader())
+    return char_name
+
+
 def name_is_leader(player):
-    leader = configured_leader()
-    if not player or not leader:
+    """Khớp chat/party name với ô Leader: full / tên NV / job_name."""
+    if not player:
         return False
-    return str(player).casefold() == leader.casefold()
+    leader = configured_leader()
+    if not leader:
+        return False
+    char_name, job_name, display = parse_leader_identity(leader)
+    needle = str(player).strip().casefold()
+    if not needle:
+        return False
+    return needle in identity_tokens(char_name, job_name, display)
 
 
 def i_am_leader():
-    me = self_name()
-    if not me:
-        return role_index() == ROLE_LEADER
     if role_index() == ROLE_LEADER:
         return True
+    me = self_name()
+    me_job = self_job_name()
+    me_disp = self_display()
+    if not me and not me_job:
+        return False
     leader = configured_leader()
-    return bool(leader) and me.casefold() == leader.casefold()
+    if not leader:
+        return False
+    char_name, job_name, display = parse_leader_identity(leader)
+    tokens = identity_tokens(char_name, job_name, display)
+    for mine in (me_disp, me, me_job):
+        key = str(mine or '').strip().casefold()
+        if key and key in tokens:
+            return True
+    return False
 
 
 def party_member_name(unique_id):
@@ -245,18 +313,19 @@ def do_follow(reason):
     if i_am_leader():
         set_status('[%s] Mình là chủ — không trace chính mình.' % reason)
         return False
-    leader = configured_leader()
-    if not leader:
+    leader_char = configured_leader_char()
+    if not leader_char:
         set_status('Chưa có tên chủ PT.')
         return False
     try:
-        ok = start_trace(leader)
+        ok = start_trace(leader_char)
     except Exception as error:
         set_status('start_trace lỗi: %s' % error)
         return False
     with lock:
         state['following'] = bool(ok)
-    set_status('[%s] Trace → %r · API=%r' % (reason, leader, ok))
+    set_status('[%s] Trace → %r (%s) · API=%r' % (
+        reason, leader_char, configured_leader(), ok))
     return bool(ok)
 
 
@@ -334,16 +403,16 @@ def btn_save():
     try:
         data = read_settings()
         if data['role'] == ROLE_FOLLOWER and not data['leader_name']:
-            raise ValueError('Phụ cần điền tên chủ PT.')
+            raise ValueError('Phụ cần điền tên chủ (name, job_name).')
         if data['role'] == ROLE_LEADER and not data['leader_name']:
-            me = self_name()
+            me = self_display() or self_name()
             if me:
                 data['leader_name'] = me
                 QtBind.setText(gui, leader_field, me)
         path = config_path()
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
         apply_settings(data)
-        set_status('Đã lưu %s' % path.name)
+        set_status('Đã lưu %s · Leader=%r' % (path.name, data['leader_name']))
     except (OSError, ValueError, TypeError) as error:
         set_status('Chưa lưu: %s' % error)
 
@@ -363,13 +432,13 @@ def btn_load():
 
 
 def btn_self():
-    me = self_name()
+    me = self_display() or self_name()
     if not me:
-        set_status('Chưa vào game / chưa đọc được tên.')
+        set_status('Chưa vào game / chưa đọc được name+job_name.')
         return
     QtBind.setText(gui, leader_field, me)
     set_role(ROLE_LEADER)
-    set_status('Đã điền tên mình %r · vai trò Chủ.' % me)
+    set_status('Đã điền tên mình %r (name + job_name) · vai trò Chủ.' % me)
 
 
 def btn_follow():
@@ -503,7 +572,7 @@ def handle_silkroad(opcode, data):
 def joined_game():
     btn_load()
     if role_index() == ROLE_LEADER and not (QtBind.text(gui, leader_field) or '').strip():
-        me = self_name()
+        me = self_display() or self_name()
         if me:
             QtBind.setText(gui, leader_field, me)
 
