@@ -2,6 +2,7 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.9: Trace AG_He luôn OK (Phụ role authoritative); AG≥1.8.69 prefer cast.
 - v1.0.8: Trace job nick AG_He/*AG_He OK; soft-stop >10m (no inject/stop_bot DC);
   prefer party master name else job; giữ persist ticks 1.0.7. AG≥1.8.68.
 - v1.0.7: Lưu/Tải đủ checkbox (Bật/sync/ks Auto PK/chat ks#/Chủ-Phụ/F/Leader);
@@ -49,7 +50,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.8'
+VERSION = '1.0.9'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -687,6 +688,9 @@ def name_is_leader(player):
 
 
 def i_am_leader():
+    # Phụ checkbox is authoritative — never treat job nick AG_He as "mình là chủ".
+    if role_index() == ROLE_FOLLOWER:
+        return False
     if role_index() == ROLE_LEADER:
         return True
     me = self_name()
@@ -866,11 +870,6 @@ def do_follow(reason):
         leader_char = resolve_trace_char_name()
     except ValueError as error:
         set_status('[%s] %s' % (reason, error))
-        return False
-    if (not _name_is_configured_leader(leader_char)
-            and _is_self_identity(leader_char, leader_char)):
-        set_status('[%s] Từ chối Trace %r — chính mình, không phải chủ đã lưu.' % (
-            reason, leader_char))
         return False
     mark_follow_grace()
     ok = safe_start_trace(leader_char, reason)
@@ -1082,14 +1081,16 @@ def _name_is_configured_leader(name):
 
 
 def safe_start_trace(char_name, reason=''):
-    """start_trace with CharName or job nick (AG_He OK). Soft-fail; never stop_bot."""
+    """start_trace with CharName or job nick (AG_He / *AG_He OK). Soft-fail."""
     name = _strip_job_star(char_name)
     if not name:
         set_status('[%s] Bỏ trace — tên trống.' % (reason or 'trace'))
         return False
-    # Allow configured chủ (job AG_He / *AG_He). Only refuse tracing ourselves
-    # when the name is NOT the configured leader.
-    if not _name_is_configured_leader(name) and _is_self_identity(name, name):
+    # Phụ / configured leader job nick: always allow start_trace('AG_He').
+    # Only block accidental self-trace when role is Chủ and name is self.
+    if (role_index() != ROLE_FOLLOWER
+            and not _name_is_configured_leader(name)
+            and _is_self_identity(name, name)):
         set_status(
             '[%s] Bỏ trace — %r là chính mình (không phải chủ đã lưu).'
             % (reason or 'trace', name))
@@ -1113,10 +1114,7 @@ def follower_ensure_trace(reason):
     except ValueError as error:
         set_status('[%s] %s' % (reason, error))
         return False
-    if (not _name_is_configured_leader(leader_char)
-            and _is_self_identity(leader_char, leader_char)):
-        set_status('[%s] Từ chối Trace %r (chính mình).' % (reason, leader_char))
-        return False
+    # Phụ always Trace configured leader (job AG_He OK) — no self-job reject.
     ok = safe_start_trace(leader_char, reason)
     with lock:
         state['following'] = bool(ok)
@@ -1229,11 +1227,7 @@ def btn_save():
         if data.get('leader_name'):
             data['leader_name'] = require_full_leader(
                 data.get('leader_name'), context='Chủ (Leader)')
-            c, j, _ = parse_leader_identity(data['leader_name'])
-            if data.get('role') == ROLE_FOLLOWER and _is_self_identity(c, j):
-                raise ValueError(
-                    'Leader=%r trùng tên/job mình — bấm Lấy tên chủ PT (đứng gần chủ).'
-                    % data['leader_name'])
+            # Job nick chủ (AG_He / *AG_He) is valid — do not reject on Lưu.
             QtBind.setText(gui, leader_field, data['leader_name'])
         data['plugin_version'] = VERSION
         path = config_path()
@@ -1304,18 +1298,14 @@ def btn_self():
 
 
 def btn_party_master():
-    """Phụ: điền chủ PT = prefer name else job (AG_He OK); từ chối self."""
+    """Phụ: điền chủ PT = prefer name else job (AG_He OK)."""
     try:
         full = party_master_display()
     except ValueError as error:
         set_status('Lấy tên chủ PT: %s' % error)
         return
     char_name, job_name, _ = parse_leader_identity(full)
-    if _is_self_identity(char_name, job_name):
-        set_status(
-            'Lấy tên chủ PT từ chối %r — trùng chính mình. Đứng gần chủ rồi bấm lại.'
-            % full)
-        return
+    # party_master_display already refused self-by-member; job nick AG_He is valid.
     QtBind.setText(gui, leader_field, full)
     set_role(ROLE_FOLLOWER)
     mark_follow_grace()
@@ -1555,5 +1545,5 @@ try:
 except Exception as _boot_error:
     _log('Nạp v%s · restore lỗi: %s' % (VERSION, _boot_error))
 
-log('[%s] Đã nạp v%s. Persist ticks · >10m soft-stop · Trace job AG_He OK. AG≥1.8.68.'
+log('[%s] Đã nạp v%s. Persist · soft-stop · Trace AG_He · prefer Ghost cast. AG≥1.8.69.'
     % (NAME, VERSION))

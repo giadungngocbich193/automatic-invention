@@ -2,8 +2,10 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party prefer cast v1.8.69] prefer UID → Ghost F cast ngay; NEVER retire
+  party prefer; B070 miss = soft-wait (no spam “bỏ qua UID”); PL Trace AG_He.
 - [FIX party soft-hold v1.8.68] hold/clear không inject 7046/7074 (tránh DC);
-  PL Trace job nick AG_He OK; soft-stop Ghost giữ Auto PK armed.
+  soft-stop Ghost giữ Auto PK armed.
 - [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
   HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm.
   No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
@@ -39,9 +41,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.68'
+VERSION = '1.8.69'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + ally filters + party sync soft-hold no-inject
+# baseline 2600 + party prefer cast + never-retire prefer UID
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -2865,7 +2867,12 @@ def rotate_direct(character, gate_checked=False):
         if not inside and reason not in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
             return
     pk_runtime = auto_pk_runtime if auto_pk_running else None
-    probing_uid = pk_runtime is not None and pk_runtime.get('skill_probe_uid') == direct_target
+    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
+    # Party prefer is a locked fight — never treat as disposable skill_probe.
+    if party_prefer and pk_runtime is not None:
+        pk_runtime['skill_probe_uid'] = 0
+    probing_uid = (pk_runtime is not None and pk_runtime.get('skill_probe_uid') == direct_target
+                   and not party_prefer)
     if pvp_wait_push_until:
         if now >= pvp_wait_push_until:
             pause_pvp('hết cửa sổ phục hồi, chưa thấy cú đẩy mới từ mục tiêu', cancel_action=False)
@@ -2873,6 +2880,14 @@ def rotate_direct(character, gate_checked=False):
     if direct_expected is not None and pvp_trigger_mode:
         if probing_uid:
             release_auto_pk_target(direct_target, 'thử skill theo UID nhưng không có B070')
+            return
+        if party_prefer:
+            # Soft-wait / retry same prefer UID — never skip to "mục tiêu khác".
+            reason = 'party prefer chờ B070 ID=%d' % direct_expected[0]
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, reason)
+            else:
+                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
             return
         next_group = runtime_skill_groups.get(current_page)
         stale_id = (current_page in runtime_skill_groups
@@ -2915,7 +2930,8 @@ def rotate_direct(character, gate_checked=False):
         report_direct('hết %.1fs chờ 0xB070 cho skill ID=%d.' % (DIRECT_CAST_WAIT, direct_expected[0]))
     if pvp_trigger_mode and not apply_skill_row_changes():
         return
-    if auto_pk_running and not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
+    if (auto_pk_running and not party_prefer
+            and not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now)):
         return
     skill_id = direct_skills[direct_index]
     skills = skill_table()
@@ -2970,6 +2986,10 @@ def rotate_direct(character, gate_checked=False):
     if direct_chain_mode:
         report('ID THỬ: yêu cầu skill=%d, UID=%d, API=%r; chờ B070.'%(skill_id,direct_target,result))
     if result is False:
+        if party_prefer:
+            soft_wait_b070_without_attempt(
+                skill_id, cast_target, 'party prefer phBot từ chối skill · thử lại')
+            return
         if probing_uid:
             if (auto_pk_runtime is pk_runtime and pk_runtime.get('skill_probe_uid') == cast_target
                     and direct_expected == (skill_id, cast_target)):
@@ -4420,6 +4440,10 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
 
 def auto_pk_ready_to_cast(runtime, uid, now):
     """While fighting a locked UID: keep casting — never force camp-radius return."""
+    # Party prefer: cast immediately — no approach / move_to gate.
+    if is_party_sync_prefer_uid(uid, runtime):
+        runtime.pop('approach', None)
+        return True
     anchor = runtime['anchor']
     position = get_position() or {}
     players = auto_pk_players() or {}
@@ -4897,15 +4921,18 @@ def auto_pk_select(character, runtime, now, from_event=False):
         runtime['party_follow_mode'] = True
         if pvp_target and pvp_target != party_uid:
             release_auto_pk_target(pvp_target, 'khác UID chủ · bỏ')
-        # Already preferred/locked → do NOT re-inject / re-log.
+        # Already preferred/locked → ensure Ghost armed+cast (no re-log storm).
         if pvp_target == party_uid or direct_target == party_uid:
-            if not pvp_armed and pvp_activation is None:
+            if not pvp_armed or pvp_paused:
+                party_sync_select_uid(
+                    party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+            elif direct_expected is None and direct_skills:
                 try:
-                    request_pvp_page(runtime.get('page') or 'F2')
+                    rotate_direct(get_character_data() or {}, gate_checked=True)
                 except Exception:
                     pass
             return
-        # Bind prefer + Ghost once (no 7045 loop).
+        # Bind prefer + Ghost cast immediately (no 7045 loop).
         party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
         return
     # Expire Target probe quietly (no Log spam); keep flag for skill-probe fallback.
@@ -5244,13 +5271,14 @@ def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
 
 
 def party_sync_select_uid(uid, source='PartyLeader'):
-    """Party sync: set prefer/direct_target + Ghost cast. NO 7045 inject loop.
+    """Party prefer: lock UID + immediately cast Ghost F skills. NO 7045.
 
-    Stable often blocks player 7045; follower attacks via direct_target UID.
-    Returns True once prefer is set (even if inject would fail).
+    Never skill_probe / never retire this UID. B070 miss → soft-wait + retry.
     """
     global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
     global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
+    global pvp_armed, pvp_activation, current_page, direct_index, direct_blocked_target
+    global active_sequence, sequence_index
     try:
         uid = int(uid)
     except (TypeError, ValueError):
@@ -5264,13 +5292,18 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         runtime = auto_pk_runtime if auto_pk_running else None
         if runtime is None:
             return False
-        # Debounce: same UID already preferred/locked → quiet success.
         last_at = float(runtime.get('party_sync_select_at') or 0)
         last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
-        if (uid == last_uid and (now - last_at) < 2.0
-                and (pvp_target == uid or direct_target == uid
-                     or int(runtime.get('party_sync_uid') or 0) == uid)):
+        if (uid == last_uid and (now - last_at) < 0.35
+                and (pvp_target == uid or direct_target == uid)
+                and pvp_armed and not pvp_paused):
             already = True
+        # Prefer lock — clear any prior retire so Auto PK never skips this UID.
+        try:
+            runtime['retired'].pop(uid, None)
+            runtime['retired'].pop(str(uid), None)
+        except Exception:
+            pass
         runtime['party_sync_uid'] = uid
         runtime['party_sync_source'] = source
         runtime['party_lock'] = True
@@ -5283,13 +5316,15 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         runtime['native_source'] = 'PartyLeader prefer'
         runtime['target_seen_at'] = now
         runtime['target_sent_at'] = now
-        runtime['select_until'] = now + 30.0  # keep prefer; no re-inject storm
-        runtime['skill_probe_uid'] = uid
-        runtime['first_cast_sent'] = False
+        runtime['target_locked_at'] = now
+        runtime['select_until'] = now + 30.0
+        # Locked prefer fight — NOT disposable skill_probe (probe releases on B070 miss).
+        runtime['skill_probe_uid'] = 0
+        if not already:
+            runtime['first_cast_sent'] = False
         runtime.pop('missing_since', None)
         runtime.pop('approach', None)
         runtime.pop('target_outside', None)
-        # Cancel camp return — follower follows chủ, not Auto PK camp.
         auto_pk_returning = False
         runtime.pop('withdraw', None)
         runtime.pop('return_progress', None)
@@ -5297,15 +5332,46 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         pvp_target = direct_target = uid
         pvp_paused = False
         page = runtime.get('page') or QtBind.text(gui, auto_pk_page_field) or 'F2'
-    if already:
-        return True
-    # Arm Ghost page / cast path without requiring 7045 or B045.
+    # Arm Ghost F page only when not already fighting this prefer UID.
+    need_arm = not (pvp_armed and not pvp_paused and pvp_target == uid and direct_skills)
+    if need_arm:
+        try:
+            if page:
+                try:
+                    party_sync_apply_page(page)
+                except Exception:
+                    pass
+                request_pvp_page(page)
+        except Exception as error:
+            log('[%s] party_sync prefer arm page: %s' % (NAME, error))
+        # Force-arm if activation stalled (missing get_players / gear wait).
+        with pvp_lock:
+            if not pvp_armed and direct_skills and pvp_target == uid:
+                if pvp_activation is not None:
+                    pvp_activation = None
+                pvp_armed = True
+                pvp_paused = False
+                current_page = page or current_page
+                direct_index = 0
+                direct_blocked_target = 0
+                active_sequence = None
+                sequence_index = 0
+                if runtime_skill_groups and page:
+                    try:
+                        use_skill_group(page, runtime=True)
+                    except Exception:
+                        pass
+    # Immediate Ghost F cast at prefer UID (skip if already waiting B070).
+    casted = False
     try:
-        if page:
-            request_pvp_page(page)
+        waiting = (direct_expected is not None and direct_expected[1] == uid)
+        if (pvp_armed and direct_skills and direct_target == uid and not pvp_paused
+                and not waiting):
+            character = get_character_data() or {}
+            rotate_direct(character, gate_checked=True)
+            casted = True
     except Exception as error:
-        log('[%s] party_sync prefer request_pvp_page: %s' % (NAME, error))
-    # Soft status — log at most once / 5s per UID.
+        log('[%s] party_sync prefer cast: %s' % (NAME, error))
     with pvp_lock:
         runtime = auto_pk_runtime
         log_at = float((runtime or {}).get('party_sync_log_at') or 0)
@@ -5314,11 +5380,11 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         if runtime is not None and should_log:
             runtime['party_sync_log_at'] = now
             runtime['party_sync_log_uid'] = uid
-    msg = ('Party sync prefer UID %d · Ghost trực tiếp (không 7045) · src=%s'
-           % (uid, source))
+    msg = ('Party prefer UID %d · Ghost F cast%s · src=%s'
+           % (uid, '' if casted else ' (armed)', source))
     QtBind.setText(gui, auto_pk_status_label, msg)
     if should_log:
-        log('[%s] %s · auto_pk=%s' % (NAME, msg, auto_pk_running))
+        log('[%s] %s · auto_pk=%s · armed=%s' % (NAME, msg, auto_pk_running, pvp_armed))
     return True
 
 
@@ -5492,6 +5558,31 @@ def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
     runtime = auto_pk_runtime
     if not auto_pk_running or auto_pk_returning or runtime is None:
         return False
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        return False
+    # HARD: never skip/retire PartyLeader prefer UID — soft-wait / keep casting.
+    if is_party_sync_prefer_uid(uid, runtime):
+        now = monotonic()
+        last = float(runtime.get('party_prefer_soft_log_at') or 0)
+        runtime['party_hold_fight'] = False
+        runtime.pop('missing_since', None)
+        runtime.pop('approach', None)
+        runtime.pop('target_outside', None)
+        # Keep prefer + direct_target; clear only pending expect so cast retries.
+        if direct_expected and direct_expected[1] == uid:
+            soft_wait_b070_without_attempt(
+                direct_expected[0], uid, reason or 'chờ B070 party prefer')
+        else:
+            direct_expected = direct_retry_state = None
+            pvp_cast_deadline = now + 0.25
+        if (now - last) >= 3.0:
+            runtime['party_prefer_soft_log_at'] = now
+            msg = 'Party prefer UID %d · giữ cast Ghost (%s)' % (uid, reason)
+            QtBind.setText(gui, auto_pk_status_label, msg)
+            log('[%s] %s' % (NAME, msg))
+        return False
     now = monotonic()
     # Retire the UID briefly in case the next inventory of nearby players
     # still contains the entity that just disappeared.
@@ -5627,6 +5718,14 @@ def tick_auto_pk(from_event=False):
             return False
         runtime.pop('target_outside', None)
         if reason in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
+            if is_party_sync_prefer_uid(pvp_target, runtime):
+                # Prefer UID: ignore retire/protected — keep Ghost casting.
+                runtime.pop('missing_since', None)
+                try:
+                    runtime['retired'].pop(int(pvp_target), None)
+                except Exception:
+                    pass
+                return True
             release_auto_pk_target(pvp_target, reason)
             return False
         if eligible and active:
@@ -7325,9 +7424,29 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
     return True
 
 
+def is_party_sync_prefer_uid(uid, runtime=None):
+    """True when UID is the locked PartyLeader prefer target — never retire/skip."""
+    runtime = auto_pk_runtime if runtime is None else runtime
+    if not isinstance(runtime, dict):
+        return False
+    try:
+        uid = int(uid or 0)
+        party_uid = int(runtime.get('party_sync_uid') or 0)
+    except (TypeError, ValueError):
+        return False
+    if not uid or not party_uid or uid != party_uid:
+        return False
+    return bool(runtime.get('party_lock') or runtime.get('party_follow_mode')
+                or party_uid)
+
+
 def recover_auto_pk_cast(target, skill_id, reason):
     if not auto_pk_running or target != pvp_target or direct_expected != (skill_id, target):
         return False
+    # Party prefer: soft-wait B070 forever — never release/retire.
+    if is_party_sync_prefer_uid(target):
+        soft_wait_b070_without_attempt(skill_id, target, reason)
+        return True
     return release_auto_pk_target(target, reason)
 
 
@@ -7365,7 +7484,16 @@ def soft_wait_b070_focus(attempt, reason):
                    % (reason, attempt['target'], attempt['skill']))
     QtBind.setText(gui, auto_pk_status_label, message)
     QtBind.setText(gui, status_label, message)
-    report(message)
+    # Party prefer: debounce Log hard — soft-wait can tick often.
+    runtime = auto_pk_runtime if auto_pk_running else None
+    if is_party_sync_prefer_uid(attempt.get('target'), runtime):
+        now = monotonic()
+        last = float((runtime or {}).get('party_prefer_soft_log_at') or 0)
+        if runtime is not None and (now - last) >= 3.0:
+            runtime['party_prefer_soft_log_at'] = now
+            report(message)
+    else:
+        report(message)
     return False
 
 
