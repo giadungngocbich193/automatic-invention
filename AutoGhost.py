@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.52'
-# raw-main download stamp: 2026-11-11T00:30Z (UTF-8 no BOM/U+200B) · mob farm + Ghost preempt
+VERSION = '1.8.53'
+# raw-main download stamp: 2026-11-11T00:40Z (UTF-8 no BOM/U+200B) · per-skill buff weapon
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -372,21 +372,25 @@ widget('auto_pk_options','createButton','save_auto_pk_settings','Lưu Auto PK',1
 widget('auto_pk_options','createButton','view_auto_pk','Quay lại Auto PK',140,238)
 auto_pk_options_status=widget('auto_pk_options','createLabel','',10,272)
 
-widget('auto_pk_buffs','createLabel','SKILL BUFF AUTO PK · nhập ID skill tự buff. Để trống dòng không dùng.',10,36)
-widget('auto_pk_buffs','createLabel','Canh rảnh mới buff. Có thể đổi vũ khí F trước khi buff rồi trả lại.',10,61)
+widget('auto_pk_buffs','createLabel','SKILL BUFF AUTO PK · mỗi skill có thể gắn vũ khí F riêng (vd cung / khiên).',10,36)
+widget('auto_pk_buffs','createLabel','Canh rảnh: đổi đúng vũ khí skill → buff → trả vũ khí đánh. Để trống ID = bỏ dòng.',10,61)
 auto_pk_buffs_box=widget('auto_pk_buffs','createCheckBox','auto_pk_buffs_changed','Tự buff',10,86)
-widget('auto_pk_buffs','createLabel','Vũ khí buff',220,90)
-auto_pk_buff_page_field=widget('auto_pk_buffs','createCombobox',310,86,100,22)
-for _buff_page in ('(Không đổi)','F1','F2','F3'):
-    QtBind.append(gui, auto_pk_buff_page_field, _buff_page)
-QtBind.setText(gui, auto_pk_buff_page_field, '(Không đổi)')
+widget('auto_pk_buffs','createLabel','ID skill',95,90)
+widget('auto_pk_buffs','createLabel','Vũ khí',220,90)
 auto_pk_buff_fields=[]
+auto_pk_buff_weapon_fields=[]
+_AUTO_PK_BUFF_WEAPON_CHOICES = ('(Không đổi)', 'F1', 'F2', 'F3')
 for index in range(5):
     y = 113 + index * 25
     widget('auto_pk_buffs','createLabel','Buff %d' % (index+1),10,y+4)
     auto_pk_buff_fields.append(widget('auto_pk_buffs','createLineEdit','',95,y,110,22))
-widget('auto_pk_buffs','createButton','save_auto_pk_buffs','Lưu buff',310,113)
-widget('auto_pk_buffs','createButton','view_auto_pk','Quay lại Auto PK',310,146)
+    weapon_field = widget('auto_pk_buffs','createCombobox',215,y,100,22)
+    for _buff_page in _AUTO_PK_BUFF_WEAPON_CHOICES:
+        QtBind.append(gui, weapon_field, _buff_page)
+    QtBind.setText(gui, weapon_field, '(Không đổi)')
+    auto_pk_buff_weapon_fields.append(weapon_field)
+widget('auto_pk_buffs','createButton','save_auto_pk_buffs','Lưu buff',330,113)
+widget('auto_pk_buffs','createButton','view_auto_pk','Quay lại Auto PK',330,146)
 auto_pk_buffs_status=widget('auto_pk_buffs','createLabel','',10,253)
 auto_pk_anchor=None
 auto_pk_running=False
@@ -3326,12 +3330,21 @@ def load_auto_pk_options(profile):
             text = str(values[i]) if isinstance(values,(list,tuple)) and len(values)==2 else ''
             QtBind.setText(gui, field, text)
     buffs = profile.get('buff_ids') or []
+    weapons = profile.get('buff_weapons') or {}
+    legacy_page = profile.get('buff_page') or ''
+    if legacy_page in ('(Không đổi)', 'Không đổi'):
+        legacy_page = ''
+    if not isinstance(weapons, dict):
+        weapons = {}
     for i, field in enumerate(auto_pk_buff_fields):
-        QtBind.setText(gui, field, str(buffs[i]) if isinstance(buffs,list) and i<len(buffs) else '')
-    buff_page = profile.get('buff_page') or '(Không đổi)'
-    if buff_page not in ('(Không đổi)', 'F1', 'F2', 'F3'):
-        buff_page = '(Không đổi)'
-    QtBind.setText(gui, auto_pk_buff_page_field, buff_page)
+        uid = buffs[i] if isinstance(buffs, list) and i < len(buffs) else ''
+        QtBind.setText(gui, field, str(uid) if uid else '')
+        page = ''
+        if uid:
+            page = weapons.get(str(uid), weapons.get(uid, legacy_page if legacy_page in ('F1', 'F2', 'F3') else ''))
+        if page not in ('F1', 'F2', 'F3'):
+            page = '(Không đổi)'
+        QtBind.setText(gui, auto_pk_buff_weapon_fields[i], page)
 
 
 def auto_pk_option_radius(field, name, limit):
@@ -3357,48 +3370,57 @@ def read_auto_pk_centers():
 
 
 def read_auto_pk_buff_ids():
-    buffs = []
-    for row, field in enumerate(auto_pk_buff_fields, 1):
+    """Legacy helper — prefer read_auto_pk_buff_rows()."""
+    return [row['id'] for row in read_auto_pk_buff_rows()]
+
+
+def _normalize_buff_weapon_page(text, row):
+    page = (text or '').strip()
+    if page in ('', '(Không đổi)', 'Không đổi'):
+        return ''
+    if page not in ('F1', 'F2', 'F3'):
+        raise ValueError('Buff %d: vũ khí phải là (Không đổi), F1, F2 hoặc F3.' % row)
+    return page
+
+
+def read_auto_pk_buff_rows():
+    """Return [{id, page}, ...] — page is F1/F2/F3 or '' (no weapon switch)."""
+    rows = []
+    seen = set()
+    for index, field in enumerate(auto_pk_buff_fields):
+        row = index + 1
         text = QtBind.text(gui, field).strip()
+        page = _normalize_buff_weapon_page(QtBind.text(gui, auto_pk_buff_weapon_fields[index]), row)
         if not text:
             continue
         try:
             uid = int(text)
         except ValueError:
             raise ValueError('Buff %d: nhập ID bằng số.' % row) from None
-        if not 0 <= uid <= 0xffffffff:
+        if not 0 < uid <= 0xffffffff:
             raise ValueError('Buff %d: ID phải là số dương hợp lệ.' % row)
-        if uid and uid not in buffs:
-            buffs.append(uid)
-    return buffs
-
-
-def read_auto_pk_buff_page():
-    page = (QtBind.text(gui, auto_pk_buff_page_field) or '').strip()
-    if page in ('', '(Không đổi)', 'Không đổi'):
-        return ''
-    if page not in ('F1', 'F2', 'F3'):
-        raise ValueError('Vũ khí buff: chọn (Không đổi), F1, F2 hoặc F3.')
-    return page
+        if uid in seen:
+            continue
+        seen.add(uid)
+        rows.append({'id': uid, 'page': page})
+    return rows
 
 
 def read_auto_pk_options():
     try:
-        buffs, buff_error = read_auto_pk_buff_ids(), None
+        buff_rows, buff_error = read_auto_pk_buff_rows(), None
     except ValueError as error:
-        buffs, buff_error = [], str(error)
-    try:
-        buff_page = read_auto_pk_buff_page()
-    except ValueError as error:
-        buff_page, buff_error = '', buff_error or str(error)
+        buff_rows, buff_error = [], str(error)
+    buffs = [row['id'] for row in buff_rows]
+    weapons = {str(row['id']): row['page'] for row in buff_rows if row.get('page')}
     return {
         'scan_radius':auto_pk_option_radius(auto_pk_scan_radius_field,'Vùng quét',AUTO_PK_MAX_SCAN_RADIUS),
         'patrol_radius':auto_pk_option_radius(auto_pk_patrol_radius_field,'Bán kính chạy vòng',AUTO_PK_MAX_RADIUS),
         'patrol_enabled':QtBind.isChecked(gui,auto_pk_patrol_box),
         'fast_scan':QtBind.isChecked(gui,auto_pk_fast_box),
         'buffs_enabled':QtBind.isChecked(gui,auto_pk_buffs_box),
-        'buff_ids':buffs, 'buff_page':buff_page, 'buff_error':buff_error,
-        'centers':read_auto_pk_centers(),
+        'buff_ids':buffs, 'buff_weapons':weapons, 'buff_page':'',
+        'buff_error':buff_error, 'centers':read_auto_pk_centers(),
     }
 
 
@@ -3443,6 +3465,7 @@ def save_auto_pk_settings(require_valid_buffs=False):
             if not isinstance(previous, dict):
                 previous = {}
             options['buff_ids'] = previous.get('buff_ids', [])
+            options['buff_weapons'] = previous.get('buff_weapons', {})
             options['buff_page'] = previous.get('buff_page', '')
             options['buffs_enabled'] = options['buffs_enabled'] and previous.get('buffs_enabled') is True
         profiles[owner_key] = dict(options, radius=radius, attack_radius=radius, page=page,
@@ -3999,14 +4022,26 @@ def tick_auto_pk_idle_mob(runtime, character, now):
     return True
 
 
+def auto_pk_buff_weapon_for(runtime, uid):
+    """F-page for one buff skill, or '' for no switch. Migrates legacy buff_page."""
+    weapons = runtime.get('buff_weapons') or {}
+    if isinstance(weapons, dict):
+        page = weapons.get(str(uid), weapons.get(uid, ''))
+        if page in ('F1', 'F2', 'F3'):
+            return page
+    legacy = runtime.get('buff_page') or ''
+    return legacy if legacy in ('F1', 'F2', 'F3') else ''
+
+
 def tick_auto_pk_idle_buff(runtime, now):
-    """Idle buff: optional F-page weapon switch → cast → restore combat page."""
+    """Idle buff: per-skill F weapon → cast that skill → restore combat page."""
     global blocked_until
     ids = runtime.get('buff_ids') if runtime.get('buffs_enabled') else None
     if not ids or auto_pk_returning or pvp_target or pvp_stunned_character is not None or now < blocked_until:
         if pvp_target:
             runtime.pop('buff_phase', None)
             runtime.pop('buff_restore_page', None)
+            runtime.pop('buff_pending_uid', None)
         return False
     if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
         return False
@@ -4015,7 +4050,6 @@ def tick_auto_pk_idle_buff(runtime, now):
     if now < runtime.get('buff_check_at', 0):
         return False
     runtime['buff_check_at'] = now + 0.3
-    buff_page = runtime.get('buff_page') or ''
     combat_page = runtime.get('page')
     phase = runtime.get('buff_phase')
     try:
@@ -4025,6 +4059,7 @@ def tick_auto_pk_idle_buff(runtime, now):
                 if auto_pk_buff_gear_ready(restore):
                     runtime.pop('buff_phase', None)
                     runtime.pop('buff_restore_page', None)
+                    runtime.pop('buff_pending_uid', None)
                     QtBind.setText(gui, auto_pk_status_label, 'Buff xong · đã trả vũ khí %s.' % restore)
                     return False
                 if request_gear_only(restore):
@@ -4032,40 +4067,56 @@ def tick_auto_pk_idle_buff(runtime, now):
                     return True
             runtime.pop('buff_phase', None)
             runtime.pop('buff_restore_page', None)
+            runtime.pop('buff_pending_uid', None)
             return False
-        if buff_page and buff_page != combat_page and any((runtime_gear.get(buff_page) or {}).values()):
-            if not auto_pk_buff_gear_ready(buff_page):
-                stop_auto_pk_patrol(runtime)
-                runtime['buff_phase'] = 'equip'
-                runtime['buff_restore_page'] = combat_page
-                if request_gear_only(buff_page):
-                    QtBind.setText(gui, auto_pk_status_label,
-                                   'Đổi vũ khí %s để buff · rồi trả %s.' % (buff_page, combat_page or '?'))
-                    return True
-                return False
-            if phase == 'equip':
-                runtime['buff_phase'] = 'cast'
-                runtime['buff_restore_page'] = combat_page
+
         retry_at = runtime.setdefault('buff_retry_at', {})
         skills = skill_table()
-        cast_any = False
-        for uid in ids:
+        pending_uid = runtime.get('buff_pending_uid')
+        candidates = [pending_uid] if pending_uid in ids else []
+        candidates.extend(uid for uid in ids if uid != pending_uid)
+
+        for uid in candidates:
             data = skills.get(uid)
             if (not data or data.get('can_cast') is False or now < retry_at.get(uid, 0)
                     or imbue_is_active(phbot_api, uid, data)):
+                if pending_uid == uid and phase == 'equip':
+                    # Skill became unavailable after equip — restore.
+                    runtime['buff_phase'] = 'restore'
+                    return True
                 continue
+            buff_page = auto_pk_buff_weapon_for(runtime, uid)
+            needs_switch = bool(
+                buff_page and buff_page != combat_page
+                and any((runtime_gear.get(buff_page) or {}).values()))
+            if needs_switch and not auto_pk_buff_gear_ready(buff_page):
+                stop_auto_pk_patrol(runtime)
+                runtime['buff_phase'] = 'equip'
+                runtime['buff_pending_uid'] = uid
+                runtime['buff_restore_page'] = combat_page
+                if request_gear_only(buff_page):
+                    QtBind.setText(gui, auto_pk_status_label,
+                                   'Buff ID %d · đổi %s (vd cung/khiên) · rồi trả %s.' %
+                                   (uid, buff_page, combat_page or '?'))
+                    return True
+                return False
+            if needs_switch:
+                runtime['buff_restore_page'] = combat_page
+                runtime['buff_pending_uid'] = uid
             stop_auto_pk_patrol(runtime)
             retry_at[uid] = now + max(2.0, imbue_seconds(data, 'cooldown'), imbue_seconds(data, 'duration'))
             if inject_joymax(0x7074, struct.pack('<BBIB', 1, 4, uid, 0), False) is False:
                 continue
             blocked_until = now + max(0.2, imbue_seconds(data, 'cast_time') + 0.1)
             runtime['buff_cast_until'] = blocked_until
-            cast_any = True
+            runtime.pop('buff_pending_uid', None)
             if runtime.get('buff_restore_page'):
                 runtime['buff_phase'] = 'restore'
-            QtBind.setText(gui, auto_pk_status_label, 'Đã gửi buff ID %d · tiếp tục canh sau khi thi triển.' % uid)
-            return True
-        if cast_any:
+            else:
+                runtime.pop('buff_phase', None)
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Đã gửi buff ID %d%s · tiếp tục canh.' %
+                           (uid, (' · VK %s' % buff_page) if buff_page else ''))
             return True
         if runtime.get('buff_restore_page') and phase in ('cast', 'equip'):
             runtime['buff_phase'] = 'restore'
