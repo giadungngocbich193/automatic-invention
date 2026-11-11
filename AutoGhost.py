@@ -2,6 +2,9 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party prefer cast v1.8.73] prefer: range/move trước cast; 7081/B074 cut
+  trước skill; full F-group all-B074 → pause 2.5s + retry interrupt+range;
+  không 7045 DC; debounce B074 log.
 - [FIX party B074 loop v1.8.72] prefer UID: B074 = retry next skill (giữ prefer);
   không soft-clear; Prefer re-arm debounce ≥1.5s after B074.
 - [FIX camp return v1.8.71] UID ra vùng đánh → bỏ khóa + quay về điểm chờ;
@@ -49,10 +52,12 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.72'
+VERSION = '1.8.73'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + party prefer B074 keep+retry (no clear loop)
+# baseline 2600 + party prefer cast: range + 7081 cut + all-B074 pause
 PARTY_PREFER_B074_BACKOFF = 1.5
+PARTY_PREFER_ALL_B074_PAUSE = 2.5
+PARTY_PREFER_B074_LOG_INTERVAL = 3.0
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -2938,9 +2943,21 @@ def rotate_direct(character, gate_checked=False):
         report_direct('hết %.1fs chờ 0xB070 cho skill ID=%d.' % (DIRECT_CAST_WAIT, direct_expected[0]))
     if pvp_trigger_mode and not apply_skill_row_changes():
         return
-    if (auto_pk_running and not party_prefer
-            and not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now)):
-        return
+    if auto_pk_running and auto_pk_runtime is not None:
+        if party_prefer:
+            pause_until = float(auto_pk_runtime.get('party_all_b074_pause_until') or 0)
+            if now < pause_until:
+                return
+            # Same range/move gate as solo Auto PK (no long-range 7074 spam).
+            if not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
+                return
+            # After all-B074 or refuse: one Ghost 7081/B074 cut before next skill.
+            if (auto_pk_runtime.pop('party_all_b074_need_prep', None)
+                    or auto_pk_runtime.pop('party_need_cut', None)):
+                if party_prefer_prepare_cast(auto_pk_runtime, direct_target, now):
+                    return
+        elif not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
+            return
     skill_id = direct_skills[direct_index]
     skills = skill_table()
     skill_retry_at = pk_runtime.get('skill_retry_at', {}) if pk_runtime is not None else {}
@@ -4401,25 +4418,26 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
 
 
 def auto_pk_ready_to_cast(runtime, uid, now):
-    """While fighting a locked UID: keep casting — never force camp-radius return."""
-    # Party prefer: cast immediately — no approach / move_to gate.
-    if is_party_sync_prefer_uid(uid, runtime):
-        runtime.pop('approach', None)
-        return True
-    anchor = runtime['anchor']
+    """While fighting a locked UID: keep casting — never force camp-radius return.
+
+    Party prefer uses the same approach/range gate as solo Auto PK (no bare
+    long-range 7074 spam). Prefer never retires on chase stall.
+    """
+    party_prefer = is_party_sync_prefer_uid(uid, runtime)
+    anchor = runtime.get('anchor') or current_auto_pk_anchor() or {}
     position = get_position() or {}
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
-    own_radius = auto_pk_distance(position, anchor) if 'region' in position else None
-    if own_radius is None:
+    own_radius = auto_pk_distance(position, anchor) if 'region' in position and anchor else None
+    if own_radius is None and not party_prefer:
         return False
     # Opposing-faction enemies may be absent from get_players; skill packets still
     # use the server-confirmed UID, so allow cast without approach coords.
     if not isinstance(target, dict):
         runtime.pop('approach', None)
         return True
-    x, y = float(position['x']), float(position['y'])
     try:
+        x, y = float(position['x']), float(position['y'])
         dx, dy = float(target['x']) - x, float(target['y']) - y
     except (KeyError, TypeError, ValueError):
         runtime.pop('approach', None)
@@ -4435,19 +4453,30 @@ def auto_pk_ready_to_cast(runtime, uid, now):
     elif distance <= approach['best'] - AUTO_PK_RETURN_MIN_PROGRESS:
         approach.update(best=distance, since=now)
     elif now - approach['since'] >= AUTO_PK_RETURN_STALL_TIMEOUT:
-        # Chase stalled — retire UID and hunt another; do NOT pause for camp return.
-        runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
-        runtime.pop('approach', None)
-        return False
-    if now >= approach['move_at']:
-        approach['move_at'] = now + 2.0
-        fraction = (distance - 4.0) / distance if distance else 0
-        z = float(position.get('z', anchor['z']))
-        if phbot_api.move_to(x + dx * fraction, y + dy * fraction, z) is False:
+        if party_prefer:
+            # Keep prefer: reset stall clock and keep chasing (never retire).
+            approach.update(since=now, best=distance)
+        else:
+            # Chase stalled — retire UID and hunt another; do NOT pause for camp return.
             runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
             runtime.pop('approach', None)
             return False
-        QtBind.setText(gui, auto_pk_status_label, 'Đang áp sát UID %d · cách %.1f m.' % (uid, distance))
+    if now >= approach['move_at']:
+        approach['move_at'] = now + 2.0
+        fraction = (distance - 4.0) / distance if distance else 0
+        z = float(position.get('z', (anchor or {}).get('z', 0)))
+        if phbot_api.move_to(x + dx * fraction, y + dy * fraction, z) is False:
+            if party_prefer:
+                QtBind.setText(gui, auto_pk_status_label,
+                               'Party prefer UID %d · move_to fail · giữ prefer · cách %.1f m.'
+                               % (uid, distance))
+                return False
+            runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
+            runtime.pop('approach', None)
+            return False
+        label = ('Party prefer UID %d · áp sát %.1f m rồi cast.'
+                 if party_prefer else 'Đang áp sát UID %d · cách %.1f m.')
+        QtBind.setText(gui, auto_pk_status_label, label % (uid, distance))
     return False
 
 
@@ -5328,15 +5357,25 @@ def party_sync_select_uid(uid, source='PartyLeader'):
                         use_skill_group(page, runtime=True)
                     except Exception:
                         pass
-    # Immediate Ghost F cast at prefer UID (skip if already waiting B070).
+    # Soft-lock like solo Auto PK after B045 — no 7045 player inject (DC).
+    # Cast only when in range; otherwise approach (same pipeline as solo).
     casted = False
+    approached = False
     try:
         waiting = (direct_expected is not None and direct_expected[1] == uid)
+        with pvp_lock:
+            runtime = auto_pk_runtime
+            if isinstance(runtime, dict) and need_arm:
+                runtime['party_need_cut'] = True
+                runtime.setdefault('party_b074_skills', set()).clear()
         if (pvp_armed and direct_skills and direct_target == uid and not pvp_paused
-                and not waiting):
-            character = get_character_data() or {}
-            rotate_direct(character, gate_checked=True)
-            casted = True
+                and not waiting and auto_pk_runtime is not None):
+            if auto_pk_ready_to_cast(auto_pk_runtime, uid, now):
+                character = get_character_data() or {}
+                rotate_direct(character, gate_checked=True)
+                casted = True
+            else:
+                approached = True
     except Exception as error:
         log('[%s] party_sync prefer cast: %s' % (NAME, error))
     with pvp_lock:
@@ -5347,8 +5386,13 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         if runtime is not None and should_log:
             runtime['party_sync_log_at'] = now
             runtime['party_sync_log_uid'] = uid
-    msg = ('Party prefer UID %d · Ghost F cast%s · src=%s'
-           % (uid, '' if casted else ' (armed)', source))
+    if casted:
+        state = 'Ghost F cast'
+    elif approached:
+        state = 'áp sát rồi cast'
+    else:
+        state = 'armed'
+    msg = 'Party prefer UID %d · %s · src=%s' % (uid, state, source)
     QtBind.setText(gui, auto_pk_status_label, msg)
     if should_log:
         log('[%s] %s · auto_pk=%s · armed=%s' % (NAME, msg, auto_pk_running, pvp_armed))
@@ -5550,8 +5594,62 @@ def _party_prefer_unreachable_reason(reason):
     ))
 
 
+def party_prefer_prepare_cast(runtime, uid, now=None):
+    """Mirror solo Auto PK post-lock cast prep: Ghost 7081/B074 cut, then range.
+
+    No 7045 player inject (DC). Returns True if caller should wait this tick.
+    """
+    global direct_expected, direct_retry_state, pvp_cast_deadline, blocked_until
+    if not isinstance(runtime, dict):
+        return False
+    now = monotonic() if now is None else now
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return False
+    # Already mid-cut / exchange — wait.
+    if direct_exchange_wait is not None or pending is not None:
+        return True
+    character = get_character_data() or {}
+    owner = owner_of(character)
+    cut_at = float(runtime.get('party_cut_at') or 0)
+    # Debounce cut spam: at most one interrupt every 1.2s.
+    if owner and uid and (now - cut_at) >= 1.2:
+        runtime['party_cut_at'] = now
+        client = get_client() or {}
+        background = bool(auto_pk_in_background(client))
+        try:
+            begin_native_cut(owner, uid, auto_background=background)
+            _auto_pk_debounced_log(
+                runtime, 'party_cut_log_at',
+                'Party prefer UID %d · Ghost 7081/B074 cut trước cast' % uid,
+                interval=PARTY_PREFER_B074_LOG_INTERVAL)
+            pvp_cast_deadline = now + 0.45
+            return True
+        except (OSError, ValueError, RuntimeError) as error:
+            try:
+                inject_joymax(0x7074, b'\x02', False)
+            except Exception:
+                pass
+            blocked_until = now + 0.2
+            _auto_pk_debounced_log(
+                runtime, 'party_cut_log_at',
+                'Party prefer UID %d · cut fallback 7074 cancel (%s)' % (uid, error),
+                interval=PARTY_PREFER_B074_LOG_INTERVAL)
+    # After cut attempt: require in-range before allowing cast.
+    if not auto_pk_ready_to_cast(runtime, uid, now):
+        return True
+    direct_expected = direct_retry_state = None
+    return False
+
+
 def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đánh (B074)'):
-    """B074 on party prefer = skill fail → cooldown skill, rotate next, KEEP prefer."""
+    """B074 on party prefer = skill fail → cooldown skill, rotate next, KEEP prefer.
+
+    After every skill in the F group refuses: pause 2.5s then one interrupt+range retry.
+    """
     global direct_expected, direct_retry_state, pvp_cast_deadline
     runtime = auto_pk_runtime
     if not isinstance(runtime, dict):
@@ -5571,20 +5669,38 @@ def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đ�
     runtime['party_hold_fight'] = False
     runtime['party_lock'] = True
     runtime['party_follow_mode'] = True
+    runtime['party_need_cut'] = True  # next cast must 7081/B074 cut + range
     if uid:
         runtime['party_sync_uid'] = uid
         runtime['requested'] = uid
+    refused = runtime.setdefault('party_b074_skills', set())
     if skill_id:
+        refused.add(skill_id)
         retries = runtime.setdefault('skill_retry_at', {})
-        retries[skill_id] = now + 0.75
-    # Clear expect so rotate_direct can fire next Ghost skill.
+        retries[skill_id] = now + 0.9
+    skills = tuple(direct_skills or ())
+    all_refused = bool(skills) and refused.issuperset(skills)
+    # Clear expect so rotate_direct can fire next Ghost skill (or pause).
     direct_expected = direct_retry_state = None
-    pvp_cast_deadline = now + 0.35
+    if all_refused:
+        runtime['party_b074_skills'] = set()
+        runtime['skill_retry_at'] = {}
+        runtime['party_all_b074_pause_until'] = now + PARTY_PREFER_ALL_B074_PAUSE
+        runtime['party_all_b074_need_prep'] = True
+        runtime['party_b074_backoff_until'] = now + PARTY_PREFER_ALL_B074_PAUSE
+        pvp_cast_deadline = now + PARTY_PREFER_ALL_B074_PAUSE
+        _auto_pk_debounced_log(
+            runtime, 'party_b074_log_at',
+            'Party prefer UID %d · cả nhóm F B074 · pause %.1fs rồi retry cut+range (giữ prefer)'
+            % (uid, PARTY_PREFER_ALL_B074_PAUSE),
+            interval=PARTY_PREFER_B074_LOG_INTERVAL)
+        return True
+    pvp_cast_deadline = now + 0.55
     _auto_pk_debounced_log(
         runtime, 'party_b074_log_at',
-        'Party prefer UID %d · B074 skill %s · retry next Ghost (giữ prefer · backoff %.1fs)'
-        % (uid, skill_id or '?', PARTY_PREFER_B074_BACKOFF),
-        interval=2.0)
+        'Party prefer UID %d · B074 skill %s · next Ghost + cut/range (giữ prefer)'
+        % (uid, skill_id or '?'),
+        interval=PARTY_PREFER_B074_LOG_INTERVAL)
     return True
 
 
@@ -6978,6 +7094,12 @@ def handle_joymax(opcode, data):
                 message = 'Đã khóa UID %d qua B070 · server đã nhận skill %d.' % (target, skill_id)
                 QtBind.setText(gui, auto_pk_status_label, message)
                 log('[%s] Auto PK: %s' % (NAME, message))
+            # Prefer got a real hit — clear all-B074 refuse set / pause.
+            if runtime is not None and is_party_sync_prefer_uid(target, runtime):
+                runtime['party_b074_skills'] = set()
+                runtime.pop('party_all_b074_pause_until', None)
+                runtime.pop('party_all_b074_need_prep', None)
+                runtime.pop('party_need_cut', None)
             if not pvp_trigger_mode:delay *= DIRECT_DELAY_FACTOR
             if direct_chain_mode:
                 confirm_direct_chain(skill_id,target,owner,now,delay)
