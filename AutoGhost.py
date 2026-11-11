@@ -2,17 +2,9 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [FIX party F1/F2/3 sync v1.8.77] notify PartyLeader on Ghost F1/F2/3 arm/stop
-  (Leader→Phụ primary combat command).
-- [FIX prefer cast no-players v1.8.76] Prefer UID cast Ghost F even when
-  get_players() thiếu UID (phe địch); no stall “Giữ UID · Player list thiếu”.
-- [FIX prefer silent locked v1.8.75] same UID after first cast: absolute silent
-  Prefer (no 5s Ghost F cast log) while locked.
-- [FIX prefer immediate cast v1.8.74] Prefer → lock+7074 Ghost F ngay (<1s);
-  không 7081 cut trước skill đầu; không re-log same UID; PL Prefer debounce ≥2s.
-- [FIX party prefer cast v1.8.73] prefer: range/move trước cast; 7081/B074 cut
-  trước skill; full F-group all-B074 → pause 2.5s + retry interrupt+range;
-  không 7045 DC; debounce B074 log.
+- [FIX party prefer cast v2.3] B074 03 00 04 40 = ActionRefusal (thường OOR/busy):
+  party prefer dùng approach ≤6m + all-B074 pause 2.5s + 7081 cut (giữ prefer);
+  không soft-clear sau 7 lượt; Leader F1 debounce (no spam lệnh đánh).
 - [FIX party B074 loop v1.8.72] prefer UID: B074 = retry next skill (giữ prefer);
   không soft-clear; Prefer re-arm debounce ≥1.5s after B074.
 - [FIX camp return v1.8.71] UID ra vùng đánh → bỏ khóa + quay về điểm chờ;
@@ -60,15 +52,14 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.77'
-# raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + PartyLeader F1/F2/3 combat notify
+VERSION = '2.3'
+# raw-main download stamp: 2026-11-11T13:30Z (UTF-8 no BOM/U+200B)
+# baseline 2.2 + party prefer range/all-B074 pause (no soft-clear unlock)
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
 PARTY_PREFER_RESELECT_DEBOUNCE = 2.0
 PARTY_PREFER_LOG_INTERVAL = 60.0
-PARTY_PREFER_MISSING_PLAYER_LOG = 30.0
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -85,6 +76,8 @@ AUTO_PK_SCAN_PREVIEW_MARGIN = 20
 AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.50  # confirm left vùng đánh before clear+return
 AUTO_PK_LOG_DEBOUNCE = 2.0  # never flood “ra vùng đánh” / quay về logs
 AUTO_PK_CAST_CONFIRM_TIMEOUT = 0.30
+PARTY_CAST_CONFIRM_TIMEOUT = 1.20
+PARTY_CAST_RETRY_GAP = 1.00
 AUTO_PK_SELECT_TIMEOUT = 0.50
 AUTO_PK_NATIVE_TIMEOUT = 0.20
 AUTO_PK_NATIVE_KEYS = {
@@ -383,7 +376,7 @@ widget('auto_pk','createLabel','Vùng quét (m)',171,69)
 auto_pk_scan_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_REPORT_RADIUS),265,65,55,22)
 widget('auto_pk','createLabel','Nhóm Ghost',340,69)
 auto_pk_page_field=widget('auto_pk','createCombobox',427,65,75,22)
-for page in ('F1','F2'):QtBind.append(gui,auto_pk_page_field,page)
+for page in PVP_EDIT_PAGES:QtBind.append(gui,auto_pk_page_field,page)
 QtBind.setText(gui,auto_pk_page_field,'F2')
 widget('auto_pk','createButton','save_auto_pk_settings','Lưu Auto PK',545,64)
 auto_pk_anchor_label=widget('auto_pk','createLabel','Điểm chờ: tự lấy khi bật.',10,103)
@@ -812,8 +805,18 @@ def status_blocks_auto_pk(status=None):
     return False
 
 
+def party_leader_combat_hook(name, *args):
+    for module in reversed(list(sys.modules.values())):
+        if getattr(module, 'NAME', None) != 'PartyLeader':
+            continue
+        hook = getattr(module, name, None)
+        if callable(hook):
+            return hook(*args)
+    return False
+
+
 def notify_party_leader_ghost_stop(reason):
-    """Chủ F4 / dừng Ghost → PartyLeader broadcast stop cho phụ."""
+    """Chủ F4 / dừng Ghost → PartyLeader broadcast dungdanh cho phụ."""
     for module in list(sys.modules.values()):
         try:
             if getattr(module, 'NAME', None) != 'PartyLeader':
@@ -821,21 +824,6 @@ def notify_party_leader_ghost_stop(reason):
             hook = getattr(module, 'on_leader_ghost_stop', None)
             if callable(hook):
                 hook(reason)
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def notify_party_leader_fight_page(page, action='arm'):
-    """Chủ bấm F1/F2/3 (hoặc toggle stop) → PartyLeader broadcast arm/stop phụ."""
-    for module in list(sys.modules.values()):
-        try:
-            if getattr(module, 'NAME', None) != 'PartyLeader':
-                continue
-            hook = getattr(module, 'on_leader_ghost_page', None)
-            if callable(hook):
-                hook(page, action)
                 return True
         except Exception:
             continue
@@ -1130,7 +1118,12 @@ def pvp_gate_tick(client, character):
         if monotonic()<=pvp_synthetic_page['until']:
             fresh.discard(pvp_synthetic_page['page'])
         else:pvp_synthetic_page=None
-    if PVP_STOP_PAGE in fresh and pvp_pause_controls:
+    leader_controls = foreground and party_leader_combat_hook('leader_hotkeys_enabled')
+    if leader_controls:
+        fresh.difference_update(('F1', 'F2', PVP_STOP_PAGE))
+        three_fresh = False
+    if PVP_STOP_PAGE in fresh and (pvp_pause_controls or
+            party_leader_combat_hook('leader_combat_command_active')):
         if auto_pk_running:
             stop_auto_pk_patrol(auto_pk_runtime)
             auto_pk_running = auto_pk_returning = False
@@ -1141,6 +1134,8 @@ def pvp_gate_tick(client, character):
         if request_gear_only(PVP_STOP_PAGE):
             prepare_pvp_page(client)
         return False
+    if foreground and PVP_STOP_PAGE in fresh:
+        notify_party_leader_ghost_stop('F4 dừng Ghost')
     if auto_pk_running:
         if not tick_auto_pk():
             return False
@@ -1159,7 +1154,6 @@ def pvp_gate_tick(client, character):
               and (pvp_armed or (pvp_activation and not pvp_activation.get('gear_only'))
                    or (not pvp_trigger_mode and not pvp_paused))):
             pause_pvp('bấm %s lần nữa' % page, notify=False)
-            notify_party_leader_fight_page(page, 'stop')
             f_keys_held = held
         elif not pvp_trigger_mode:
             pvp_paused = False
@@ -1167,8 +1161,6 @@ def pvp_gate_tick(client, character):
             f_keys_held = held
         elif page in pvp_allowed_pages:
             request_pvp_page(page, physical=True)
-            if page in ('F1', 'F2', 'F3'):
-                notify_party_leader_fight_page(page, 'arm')
         else:
             if pvp_trigger_mode:
                 pause_pvp('trang %s chưa bật cho Ghost' % page, cancel_action=False)
@@ -1182,7 +1174,6 @@ def pvp_gate_tick(client, character):
             and current_page in pvp_allowed_pages
             and (pvp_selection_request or pvp_person_target(pvp_target, character))):
         request_pvp_page(current_page,physical=True)
-        notify_party_leader_fight_page('3', 'arm')
     if pvp_activation is not None and pvp_activation.get('gear_only'):
         prepare_pvp_page(client)
         return False
@@ -2880,6 +2871,8 @@ def rotate_direct(character, gate_checked=False):
     global direct_index, direct_expected, pvp_cast_deadline, blocked_until, direct_retry_state
     global pvp_wait_push_until
     now = monotonic()
+    if auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight'):
+        return
     if pvp_trigger_mode and not gate_checked and not pvp_gate_tick(get_client() or {}, character):
         return
     if pvp_stun_blocks(character):
@@ -2899,25 +2892,21 @@ def rotate_direct(character, gate_checked=False):
     client = get_client() or {}
     if not client.get('running') or (not client.get('window') and not auto_pk_running):
         return
-    pk_runtime = auto_pk_runtime if auto_pk_running else None
-    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
     monsters = get_monsters()
-    if monsters is None:
+    if monsters is None or direct_target in (get_npcs() or {}):
         return
-    # Party prefer: enemy often dual-listed / absent from get_players — still cast by UID.
-    if not party_prefer and (direct_target in monsters or direct_target in (get_npcs() or {})):
+    if direct_target in monsters and not (auto_pk_running and
+                                           pvp_person_target(direct_target, character, monsters)):
         return
     if auto_pk_running:
         if auto_pk_returning:
             return
         inside, reason = auto_pk_radius_check(direct_target)
-        # Locked fight: keep casting on camp outs / missing Player list (phe địch).
-        if not inside and reason not in (
-                AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET, 'tạm thiếu dữ liệu Player'):
+        # Locked fight: ignore camp-radius outs — keep rotating skills on UID.
+        if not inside and reason not in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
             return
-        if (not inside and reason == 'tạm thiếu dữ liệu Player'
-                and not (party_prefer or direct_target == pvp_target)):
-            return
+    pk_runtime = auto_pk_runtime if auto_pk_running else None
+    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
     # Party prefer is a locked fight — never treat as disposable skill_probe.
     if party_prefer and pk_runtime is not None:
         pk_runtime['skill_probe_uid'] = 0
@@ -2932,12 +2921,8 @@ def rotate_direct(character, gate_checked=False):
             release_auto_pk_target(direct_target, 'thử skill theo UID nhưng không có B070')
             return
         if party_prefer:
-            # Soft-wait / retry same prefer UID — never skip to "mục tiêu khác".
-            reason = 'party prefer chờ B070 ID=%d' % direct_expected[0]
-            if direct_retry_state is not None:
-                soft_wait_b070_focus(direct_retry_state, reason)
-            else:
-                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
+            # Soft-wait / retry same prefer UID — never skip / unlock.
+            party_prefer_wait_timeout(pk_runtime, now)
             return
         next_group = runtime_skill_groups.get(current_page)
         stale_id = (current_page in runtime_skill_groups
@@ -2985,8 +2970,7 @@ def rotate_direct(character, gate_checked=False):
             pause_until = float(auto_pk_runtime.get('party_all_b074_pause_until') or 0)
             if now < pause_until:
                 return
-            # First prefer cast: fire 7074 immediately (solo post-B045 path) —
-            # NEVER 7081-cut before skill #1 (that caused 90s Prefer spam / zero hits).
+            # First prefer cast: fire 7074 immediately — NEVER 7081-cut before skill #1.
             first_prefer_cast = not bool(auto_pk_runtime.get('first_cast_sent'))
             if not first_prefer_cast:
                 if not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
@@ -2997,7 +2981,6 @@ def rotate_direct(character, gate_checked=False):
                     if party_prefer_prepare_cast(auto_pk_runtime, direct_target, now):
                         return
             else:
-                # Drop stale cut flag so first packet is not blocked.
                 auto_pk_runtime.pop('party_need_cut', None)
                 auto_pk_runtime.pop('party_all_b074_need_prep', None)
         elif not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
@@ -3005,21 +2988,33 @@ def rotate_direct(character, gate_checked=False):
     skill_id = direct_skills[direct_index]
     skills = skill_table()
     skill_retry_at = pk_runtime.get('skill_retry_at', {}) if pk_runtime is not None else {}
+    skipped = []
     for _ in range(len(direct_skills)):
         skill_id = direct_skills[direct_index]
-        if (skill_retry_at.get(skill_id, 0) <= now and skill_id not in direct_missed_skills
-                and (skills.get(skill_id) or {}).get('can_cast') is not False):
+        if skill_retry_at.get(skill_id, 0) > now:
+            reason = 'đang chờ thử lại'
+        elif skill_id in direct_missed_skills:
+            reason = 'lượt trước chưa khớp'
+        elif (skills.get(skill_id) or {}).get('can_cast') is False:
+            reason = 'phBot báo chưa dùng được'
+        else:
             break
-        if skill_id not in direct_missed_skills:
-            report_direct('ID=%d chưa thể dùng theo dữ liệu phBot; xét skill kế tiếp.' % skill_id)
+        skipped.append('%d (%s)' % (skill_id, reason))
         direct_index = (direct_index + 1) % len(direct_skills)
-    else:
+    if skipped and party_prefer:
+        _auto_pk_debounced_log(pk_runtime, 'party_skip_skill_at',
+                               'Ghost %s bỏ qua skill: %s.' % (current_page, ', '.join(skipped)),
+                               interval=5.0)
+    if len(skipped) == len(direct_skills):
         pvp_cast_deadline = now + 0.05
         return
     cast_target = direct_target
     direct_expected = (skill_id, cast_target)
     if pk_runtime is not None:
-        pvp_cast_deadline = now + AUTO_PK_CAST_CONFIRM_TIMEOUT
+        # Party prefer: short confirm then soft-wait (not 1200ms unlock cycle).
+        pvp_cast_deadline = now + (
+            max(AUTO_PK_CAST_CONFIRM_TIMEOUT, 0.55) if party_prefer
+            else AUTO_PK_CAST_CONFIRM_TIMEOUT)
     else:
         pvp_cast_deadline = now + (reclick_wait if direct_native_exchange and reclick_enabled
                                    else DIRECT_TRIAL_WAIT if direct_chain_mode else DIRECT_CAST_WAIT)
@@ -3527,7 +3522,7 @@ def view_auto_pk():
             QtBind.setText(gui,auto_pk_enemy_key_field,str(profile.get('target_enemy_key') or ''))
             if math.isfinite(radius) and radius >= 1:
                 QtBind.setText(gui, auto_pk_radius_field, '%g' % min(radius, AUTO_PK_MAX_RADIUS))
-            if page in ('F1','F2'):QtBind.setText(gui,auto_pk_page_field,page)
+            if page in PVP_EDIT_PAGES:QtBind.setText(gui,auto_pk_page_field,page)
             anchor=profile.get('anchor')
             if isinstance(anchor,dict) and all(k in anchor for k in ('x','y','region')):
                 values={k:float(anchor.get(k,0)) for k in ('x','y','z')}
@@ -3553,7 +3548,7 @@ def read_auto_pk_settings():
         radius = AUTO_PK_MAX_RADIUS
         QtBind.setText(gui, auto_pk_radius_field, str(AUTO_PK_MAX_RADIUS))
     page=QtBind.text(gui,auto_pk_page_field)
-    if page not in ('F1','F2'):raise ValueError('Chọn nhóm Auto pk F1 hoặc F2.')
+    if page not in PVP_EDIT_PAGES:raise ValueError('Chọn nhóm Auto PK F1, F2 hoặc F3.')
     return owner,radius,page
 
 
@@ -4298,17 +4293,12 @@ def auto_pk_ally_sets(character=None):
 
 def auto_pk_ally_skip_reason(runtime, uid, player, character=None, allies=None):
     """Skip ONLY same party or same guild. Never alliance/color/job/unknown."""
-    if not isinstance(player, dict):
-        return ''
+    player = player if isinstance(player, dict) else {}
     runtime = runtime or {}
     try:
         uid_i = int(uid or 0)
     except (TypeError, ValueError):
         uid_i = 0
-    # PartyLeader prefer UID is chủ's enemy — never ally-skip it.
-    party_uid = int(runtime.get('party_sync_uid') or 0)
-    if runtime.get('party_lock') and party_uid and uid_i == party_uid:
-        return ''
     allies = allies or auto_pk_ally_sets(character)
 
     name_tokens = set()
@@ -4402,28 +4392,25 @@ def auto_pk_player_attack_range(uid, runtime=None):
 
     [FIX never abort PvP in attack range] Self can be outside while target stays inside —
     that must NOT count as leave-range.
-    Party prefer / locked UID: get_players() often omits opposing-faction enemies —
-    treat as still attackable by packet UID (do not stall).
     """
     runtime = runtime if runtime is not None else auto_pk_runtime
     if not runtime or not uid:
         return False, 'chưa bật Auto PK / thiếu UID'
-    anchor = runtime.get('anchor') or {}
+    anchor = runtime['anchor']
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
-    party_prefer = is_party_sync_prefer_uid(uid, runtime)
-    locked = party_prefer or uid in (pvp_target, direct_target)
+    if auto_pk_ally_skip_reason(runtime, uid, target):
+        return False, 'mục tiêu là đồng đội'
     if not isinstance(target, dict):
-        if party_prefer or locked:
-            return True, 'cast theo UID · Player list thiếu (phe địch)'
         return False, 'tạm thiếu dữ liệu Player'
     unavailable = auto_pk_target_unavailable(runtime, uid, target, monotonic())
     if unavailable:
         return False, unavailable
+    # A leader-commanded fight is not tied to the stationary camp anchor.
+    if is_party_sync_prefer_uid(uid, runtime):
+        return True, 'mục tiêu do leader chỉ định'
     distance = auto_pk_target_distance(target, anchor, runtime)
     if distance is None:
-        if party_prefer or locked:
-            return True, 'cast theo UID · thiếu tọa độ Player'
         return False, 'tạm thiếu dữ liệu Player'
     if distance > runtime['radius']:
         return False, AUTO_PK_OUTSIDE_TARGET
@@ -4440,30 +4427,19 @@ def auto_pk_radius_check(uid):
         return True, attack_detail
     if attack_detail == AUTO_PK_OUTSIDE_TARGET:
         return False, AUTO_PK_OUTSIDE_TARGET
-    if attack_detail in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
+    if attack_detail in ('mục tiêu đã chết', AUTO_PK_PROTECTED, 'mục tiêu là đồng đội'):
         return False, attack_detail
-    party_prefer = is_party_sync_prefer_uid(uid, runtime)
-    # Prefer / locked: missing Player list is already treated as in-attack above.
-    # Keep a hard allow here too so cast never stalls on list flicker.
-    if party_prefer and attack_detail == 'tạm thiếu dữ liệu Player':
-        return True, 'party prefer · Player list thiếu · cast theo UID'
     anchor = runtime['anchor']
     position = get_position() or {}
     own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
     if own_distance is None:
-        if party_prefer:
-            return True, 'party prefer · thiếu tọa độ self · cast theo UID'
         return False, attack_detail if attack_detail == 'tạm thiếu dữ liệu Player' else 'thiếu tọa độ hoặc đã đổi vùng'
     if own_distance > runtime['radius']:
         # Engaged chase: self outside alone is not a hard fail when Player list is thin.
         if attack_detail == 'tạm thiếu dữ liệu Player' and (pvp_target == uid or direct_target == uid):
-            if party_prefer:
-                return True, 'party prefer · Player list thiếu · cast theo UID'
             return False, 'tạm thiếu dữ liệu Player'
         return False, AUTO_PK_OUTSIDE_SELF
     if attack_detail == 'tạm thiếu dữ liệu Player':
-        if party_prefer or uid in (pvp_target, direct_target):
-            return True, 'khóa UID · Player list thiếu · cast theo UID'
         return False, 'tạm thiếu dữ liệu Player'
     return False, attack_detail
 
@@ -4484,10 +4460,11 @@ def auto_pk_ready_to_cast(runtime, uid, now):
     """While fighting a locked UID: keep casting — never force camp-radius return.
 
     Party prefer uses the same approach/range gate as solo Auto PK (no bare
-    long-range 7074 spam). Prefer never retires on chase stall.
+    long-range 7074 → B074 03 00 04 40 ActionRefusal flood). Prefer never
+    retires on chase stall.
     """
     party_prefer = is_party_sync_prefer_uid(uid, runtime)
-    anchor = runtime.get('anchor') or current_auto_pk_anchor() or {}
+    anchor = runtime.get('anchor') or {}
     position = get_position() or {}
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
@@ -5161,6 +5138,8 @@ def auto_pk_select_reply(data):
             QtBind.setText(gui, auto_pk_status_label,
                            'Đã chọn quái UID %d · đánh mob · vẫn canh địch.' % confirmed)
             return
+    if runtime.get('party_hold_fight') or party_sync_has_target(runtime.get('party_sync_uid') or 0):
+        return
     uid = runtime['requested']
     if not uid or now >= runtime['select_until']:
         return
@@ -5261,7 +5240,7 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
         if page in PVP_EDIT_PAGES:
             QtBind.setText(gui, auto_pk_page_field, page)
         if auto_pk_running:
-            if page in PVP_EDIT_PAGES:
+            if page in PVP_EDIT_PAGES and page != (auto_pk_runtime or {}).get('page'):
                 try:
                     party_sync_apply_page(page)
                 except ValueError as error:
@@ -5270,9 +5249,6 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
                 if auto_pk_runtime is not None:
                     auto_pk_runtime['party_sync_source'] = source
                     auto_pk_runtime['party_lock'] = True
-                    if prefer_uid:
-                        auto_pk_runtime['party_sync_uid'] = int(prefer_uid)
-                        auto_pk_runtime['requested'] = int(prefer_uid)
             log('[%s] party_sync: Auto PK đã chạy · page=%s · prefer_uid=%s · src=%s'
                 % (NAME, QtBind.text(gui, auto_pk_page_field), prefer_uid, source))
             if prefer_uid:
@@ -5290,9 +5266,6 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
             if auto_pk_runtime is not None:
                 auto_pk_runtime['party_sync_source'] = source
                 auto_pk_runtime['party_lock'] = True
-                if prefer_uid:
-                    auto_pk_runtime['party_sync_uid'] = int(prefer_uid)
-                    auto_pk_runtime['requested'] = int(prefer_uid)
         log('[%s] party_sync: đã bật Auto PK · nhóm %s · src=%s'
             % (NAME, QtBind.text(gui, auto_pk_page_field), source))
         if prefer_uid:
@@ -5315,11 +5288,22 @@ def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
         return False
 
 
+def party_sync_has_target(uid):
+    with pvp_lock:
+        runtime = auto_pk_runtime
+        return bool(auto_pk_running and runtime and not runtime.get('party_hold_fight')
+                    and not auto_pk_returning and not pvp_paused
+                    and runtime.get('party_sync_uid') == uid
+                    and pvp_target == direct_target == uid
+                    and (pvp_armed or (pvp_activation and pvp_activation.get('target') == uid)))
+
+
 def party_sync_select_uid(uid, source='PartyLeader'):
     """Party prefer: lock UID + immediately cast Ghost F skills. NO 7045.
 
-    First Prefer: soft-lock + 7074 Ghost F ngay (solo post-B045 path) — no
-    7081 cut before skill #1. Same UID re-Prefer: quiet debounce, no re-log.
+    Never skill_probe / never retire this UID. B070 miss → soft-wait + retry.
+    If Auto PK was F4-stopped, re-arm first then prefer (no UI click needed).
+    After B074: ignore Prefer same UID for ≥PARTY_PREFER_B074_BACKOFF if armed.
     """
     global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
     global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
@@ -5337,44 +5321,31 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         return bool(party_sync_arm_auto_pk(page=page, prefer_uid=uid, source=source))
     now = monotonic()
     page = None
-    quiet_reselect = False
     with pvp_lock:
         runtime = auto_pk_runtime if auto_pk_running else None
         if runtime is None:
             return False
-        # Prefer re-arm debounce after B074: same UID already armed → ignore ≥1.5s.
+        players = auto_pk_players() or {}
+        if auto_pk_ally_skip_reason(runtime, uid, players.get(uid) or players.get(str(uid))):
+            return False
+        if runtime['retired'].get(uid, 0) > now:
+            return False
+        if party_sync_has_target(uid):
+            return True
+        # Debounce Prefer re-select same UID (Leader F spam / B070 echo).
+        last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
+        last_at = float(runtime.get('party_sync_select_at') or 0)
+        if (last_uid == uid and (now - last_at) < PARTY_PREFER_RESELECT_DEBOUNCE
+                and runtime.get('party_sync_uid') == uid and not runtime.get('party_hold_fight')):
+            return True
+        # After B074: ignore Prefer same UID for ≥PARTY_PREFER_B074_BACKOFF if armed.
         b074_until = float(runtime.get('party_b074_backoff_until') or 0)
         b074_uid = int(runtime.get('party_b074_uid') or 0)
-        armed_same = (pvp_armed and not pvp_paused
-                      and int(runtime.get('party_sync_uid') or 0) == uid
-                      and (pvp_target == uid or direct_target == uid))
-        if armed_same and uid == b074_uid and now < b074_until:
+        if uid == b074_uid and now < b074_until and runtime.get('party_sync_uid') == uid:
             return True
-        last_at = float(runtime.get('party_sync_select_at') or 0)
-        last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
-        # Same UID after first cast while locked → absolute silence (no Log).
-        if (int(runtime.get('party_sync_uid') or 0) == uid
-                and (pvp_target == uid or direct_target == uid)
-                and runtime.get('first_cast_sent')):
-            runtime['party_sync_select_at'] = now
-            return True
-        # Same UID already locked/armed → quiet keep-alive (no re-log / no reset).
-        # Still fall through if skill #1 never left (first_cast_sent False).
-        if armed_same and uid == last_uid:
-            quiet_reselect = True
-            if ((now - last_at) < PARTY_PREFER_RESELECT_DEBOUNCE
-                    and (runtime.get('first_cast_sent') or direct_expected is not None)):
-                return True
-            if runtime.get('first_cast_sent') or direct_expected is not None:
-                runtime['party_sync_select_at'] = now
-                return True
-            # first cast still pending → fall through to cast immediately
-        # Prefer lock — clear any prior retire so Auto PK never skips this UID.
-        try:
-            runtime['retired'].pop(uid, None)
-            runtime['retired'].pop(str(uid), None)
-        except Exception:
-            pass
+        target = players.get(uid) or players.get(str(uid))
+        if isinstance(target, dict) and auto_pk_target_unavailable(runtime, uid, target, now):
+            return False
         runtime['party_sync_uid'] = uid
         runtime['party_sync_source'] = source
         runtime['party_lock'] = True
@@ -5382,104 +5353,49 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         runtime['party_hold_fight'] = False
         runtime['party_sync_select_at'] = now
         runtime['party_sync_select_uid_last'] = uid
-        runtime['requested'] = uid
+        runtime['requested'] = 0
         runtime['native_uid'] = uid
         runtime['native_source'] = 'PartyLeader prefer'
         runtime['target_seen_at'] = now
         runtime['target_sent_at'] = now
         runtime['target_locked_at'] = now
-        runtime['select_until'] = now + 30.0
+        runtime['select_until'] = 0.0
+        runtime['native_probe_until'] = 0.0
         # Locked prefer fight — NOT disposable skill_probe (probe releases on B070 miss).
         runtime['skill_probe_uid'] = 0
-        # Only reset first_cast on NEW prefer UID — never on same-UID spam.
-        if last_uid != uid:
-            runtime['first_cast_sent'] = False
-            runtime.pop('approach', None)
-            runtime.setdefault('party_b074_skills', set()).clear()
-            # Do NOT set party_need_cut here — that blocked skill #1 for ~90s.
-            runtime.pop('party_need_cut', None)
-            runtime.pop('party_all_b074_need_prep', None)
+        runtime['first_cast_sent'] = False
         runtime.pop('missing_since', None)
+        runtime.pop('approach', None)
         runtime.pop('target_outside', None)
         auto_pk_returning = False
         runtime.pop('withdraw', None)
         runtime.pop('return_progress', None)
-        pvp_selection_request = direct_select_request = uid
+        pvp_selection_request = direct_select_request = 0
         pvp_target = direct_target = uid
         pvp_paused = False
         page = runtime.get('page') or QtBind.text(gui, auto_pk_page_field) or 'F2'
-    # Arm Ghost F page only when not already fighting this prefer UID.
-    need_arm = not (pvp_armed and not pvp_paused and pvp_target == uid and direct_skills)
-    if need_arm:
-        try:
-            if page:
-                try:
-                    party_sync_apply_page(page)
-                except Exception:
-                    pass
-                request_pvp_page(page)
-        except Exception as error:
-            log('[%s] party_sync prefer arm page: %s' % (NAME, error))
-        # Force-arm if activation stalled (missing get_players / gear wait).
-        with pvp_lock:
-            if not pvp_armed and direct_skills and pvp_target == uid:
-                if pvp_activation is not None:
-                    pvp_activation = None
-                pvp_armed = True
-                pvp_paused = False
-                current_page = page or current_page
-                direct_index = 0
-                direct_blocked_target = 0
-                active_sequence = None
-                sequence_index = 0
-                if runtime_skill_groups and page:
-                    try:
-                        use_skill_group(page, runtime=True)
-                    except Exception:
-                        pass
-    # Soft-lock like solo Auto PK after B045 — cast Ghost F immediately (no 7045).
-    casted = False
-    try:
-        waiting = (direct_expected is not None and direct_expected[1] == uid)
-        if (pvp_armed and direct_skills and direct_target == uid and not pvp_paused
-                and not waiting and auto_pk_runtime is not None):
-            before = direct_expected
-            character = get_character_data() or {}
-            rotate_direct(character, gate_checked=True)
-            # True cast = skill packet armed (direct_expected changed).
-            casted = (direct_expected is not None and direct_expected != before)
-    except Exception as error:
-        log('[%s] party_sync prefer cast: %s' % (NAME, error))
-    with pvp_lock:
-        runtime = auto_pk_runtime
-        log_at = float((runtime or {}).get('party_sync_log_at') or 0)
-        log_uid = int((runtime or {}).get('party_sync_log_uid') or 0)
-        # Same UID: log at most once / 60s (stop 3s Prefer spam).
-        should_log = not quiet_reselect and not (
-            uid == log_uid and (now - log_at) < PARTY_PREFER_LOG_INTERVAL)
-        if runtime is not None and should_log:
-            runtime['party_sync_log_at'] = now
-            runtime['party_sync_log_uid'] = uid
-    if casted:
-        state = 'Ghost F cast'
-    elif (auto_pk_runtime or {}).get('first_cast_sent'):
-        state = 'đang đánh'
-    else:
-        state = 'armed → cast'
-    msg = 'Party prefer UID %d · %s · src=%s' % (uid, state, source)
-    QtBind.setText(gui, auto_pk_status_label, msg)
-    if should_log:
-        log('[%s] %s · auto_pk=%s · armed=%s' % (NAME, msg, auto_pk_running, pvp_armed))
-    return True
+        request_pvp_page(page)
+        if pvp_activation is not None:
+            prepare_pvp_page(get_client() or {})
+        if pvp_target != uid or (not pvp_armed and pvp_activation is None):
+            report_error('Đã nhận UID %d nhưng chưa kích hoạt được Ghost %s; xem trạng thái nhóm/vũ khí.' %
+                         (uid, page))
+            return False
+        if pvp_armed:
+            rotate_direct(get_character_data() or {}, gate_checked=True)
+        log('[%s] Party UID %d · Ghost %s · %s.' %
+            (NAME, uid, page, 'đã kích hoạt' if pvp_armed else 'đang chuẩn bị nhóm/vũ khí'))
+        return True
 
 
-def party_sync_clear_target(reason=None, source='PartyLeader'):
-    """Soft clear: stop Ghost cast in memory — NO 7046/7074 inject (Stable DC)."""
+def party_sync_clear_target(reason=None, source='PartyLeader', cancel_action=True):
+    """Clear the local target and optionally cancel the active action."""
     global pvp_target, pvp_selection_request, direct_target, direct_select_request
     global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
     global pvp_armed, active_sequence, sequence_index, auto_pk_returning
     reason = reason or ('clear bởi %s' % source)
     with pvp_lock:
+        had_target = bool(pvp_target or direct_target)
         runtime = auto_pk_runtime if auto_pk_running else None
         if runtime is not None:
             runtime['party_sync_uid'] = 0
@@ -5500,8 +5416,10 @@ def party_sync_clear_target(reason=None, source='PartyLeader'):
         direct_expected = direct_retry_state = None
         pvp_cast_deadline = 0.0
         pvp_paused = True
-    # Never inject_joymax here — spam 7046/7074 while tracing DCs the client.
-    msg = 'Party sync soft-clear · %s (no inject)' % reason
+        if had_target and cancel_action:
+            if inject_joymax(0x7074, b'\x02', False) is False:
+                report_error('phBot từ chối hủy tác vụ đang chạy.')
+    msg = 'Party sync bỏ khóa · %s' % reason
     QtBind.setText(gui, auto_pk_status_label, msg)
     log('[%s] %s' % (NAME, msg))
     return True
@@ -5668,10 +5586,27 @@ def _party_prefer_unreachable_reason(reason):
     ))
 
 
-def party_prefer_prepare_cast(runtime, uid, now=None):
-    """Mirror solo Auto PK post-lock cast prep: Ghost 7081/B074 cut, then range.
+def party_prefer_wait_timeout(runtime, now):
+    """B070 miss after confirm window → soft-wait same skill (never unlock prefer)."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    if direct_expected is None:
+        return
+    skill_id, uid = direct_expected
+    soft_wait_b070_without_attempt(
+        skill_id, uid,
+        'Party UID %d · chưa nhận B070 skill %d · giữ prefer, thử lại'
+        % (uid, skill_id))
+    _auto_pk_debounced_log(
+        runtime, 'party_wait_b070_at',
+        'Party UID %d · chưa nhận B070 skill %d · giữ mục tiêu (không bỏ khóa).'
+        % (uid, skill_id),
+        interval=5.0)
 
-    No 7045 player inject (DC). Returns True if caller should wait this tick.
+
+def party_prefer_prepare_cast(runtime, uid, now=None):
+    """Mirror solo Auto PK: Ghost 7081/B074 cut, then range. No 7045.
+
+    Returns True if caller should wait this tick.
     """
     global direct_expected, direct_retry_state, pvp_cast_deadline, blocked_until
     if not isinstance(runtime, dict):
@@ -5683,13 +5618,11 @@ def party_prefer_prepare_cast(runtime, uid, now=None):
         uid = 0
     if not uid:
         return False
-    # Already mid-cut / exchange — wait.
     if direct_exchange_wait is not None or pending is not None:
         return True
     character = get_character_data() or {}
     owner = owner_of(character)
     cut_at = float(runtime.get('party_cut_at') or 0)
-    # Debounce cut spam: at most one interrupt every 1.2s.
     if owner and uid and (now - cut_at) >= 1.2:
         runtime['party_cut_at'] = now
         client = get_client() or {}
@@ -5712,7 +5645,6 @@ def party_prefer_prepare_cast(runtime, uid, now=None):
                 runtime, 'party_cut_log_at',
                 'Party prefer UID %d · cut fallback 7074 cancel (%s)' % (uid, error),
                 interval=PARTY_PREFER_B074_LOG_INTERVAL)
-    # After cut attempt: require in-range before allowing cast.
     if not auto_pk_ready_to_cast(runtime, uid, now):
         return True
     direct_expected = direct_retry_state = None
@@ -5720,9 +5652,11 @@ def party_prefer_prepare_cast(runtime, uid, now=None):
 
 
 def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đánh (B074)'):
-    """B074 on party prefer = skill fail → cooldown skill, rotate next, KEEP prefer.
+    """B074 03 00 04 40 ActionRefusal on party prefer.
 
-    After every skill in the F group refuses: pause 2.5s then one interrupt+range retry.
+    Skill fail → cooldown that skill, rotate next, KEEP prefer.
+    After every F-group skill refuses: pause 2.5s then one interrupt+range retry.
+    NEVER soft-clear / 'bỏ khóa' on B074 exhaustion.
     """
     global direct_expected, direct_retry_state, pvp_cast_deadline
     runtime = auto_pk_runtime
@@ -5744,6 +5678,7 @@ def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đ�
     runtime['party_lock'] = True
     runtime['party_follow_mode'] = True
     runtime['party_need_cut'] = True  # next cast must 7081/B074 cut + range
+    runtime.pop('party_refusal_count', None)  # legacy soft-clear counter — unused
     if uid:
         runtime['party_sync_uid'] = uid
         runtime['requested'] = uid
@@ -5765,14 +5700,14 @@ def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đ�
         pvp_cast_deadline = now + PARTY_PREFER_ALL_B074_PAUSE
         _auto_pk_debounced_log(
             runtime, 'party_b074_log_at',
-            'Party prefer UID %d · cả nhóm F B074 · pause %.1fs rồi retry cut+range (giữ prefer)'
+            'Party prefer UID %d · cả nhóm F B074 (03 00 04 40) · pause %.1fs rồi retry cut+range (giữ prefer)'
             % (uid, PARTY_PREFER_ALL_B074_PAUSE),
             interval=PARTY_PREFER_B074_LOG_INTERVAL)
         return True
     pvp_cast_deadline = now + 0.55
     _auto_pk_debounced_log(
         runtime, 'party_b074_log_at',
-        'Party prefer UID %d · B074 skill %s · next Ghost + cut/range (giữ prefer)'
+        'Party prefer UID %d · B074 03 00 04 40 skill %s · next Ghost + cut/range (giữ prefer)'
         % (uid, skill_id or '?'),
         interval=PARTY_PREFER_B074_LOG_INTERVAL)
     return True
@@ -5791,28 +5726,7 @@ def soft_clear_party_prefer(runtime, uid, reason):
         uid = int(uid or 0)
     except (TypeError, ValueError):
         uid = 0
-    runtime['party_sync_uid'] = 0
-    runtime['party_hold_fight'] = True
-    runtime['party_lock'] = True  # stay in party mode; wait for next prefer / trace
-    runtime.update(requested=0, native_uid=0, select_until=0.0, scan_at=0.0,
-                   native_probe_until=0.0, skill_probe_uid=0)
-    runtime.pop('missing_since', None)
-    runtime.pop('approach', None)
-    runtime.pop('target_outside', None)
-    runtime.pop('select_in_event', None)
-    clear_pending()
-    reset_pvp_activation()
-    direct_target = direct_select_request = 0
-    direct_expected = direct_retry_state = None
-    pvp_cast_deadline = 0.0
-    active_sequence = None
-    sequence_index = 0
-    pvp_paused = True
-    _auto_pk_debounced_log(
-        runtime, 'party_prefer_clear_log_at',
-        'Party prefer UID %d soft-clear · %s · chờ Leader/trace' % (uid, reason),
-        error=False)
-    return True
+    return party_sync_clear_target(reason, cancel_action=False)
 
 
 def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY,
@@ -6015,16 +5929,12 @@ def tick_auto_pk(from_event=False):
             runtime.pop('missing_since', None)
             return True
         if active and reason == 'tạm thiếu dữ liệu Player':
-            # Opposing-faction enemies often omitted from get_players — CAST by UID.
+            # Opposing-faction enemies often omitted from get_players — keep lock briefly.
             runtime.pop('missing_since', None)
-            partyish = party_follow or is_party_sync_prefer_uid(pvp_target, runtime)
             _auto_pk_debounced_log(
                 runtime, 'missing_notice_at',
-                ('Party prefer UID %d · Player list thiếu · cast Ghost F theo UID'
-                 if partyish else
-                 'Giữ UID %d · Player list thiếu · cast Ghost F theo UID') % pvp_target,
-                interval=PARTY_PREFER_MISSING_PLAYER_LOG if partyish else 15.0)
-            # Do not stall/hold-only — keep tick True so rotate_direct fires.
+                'Giữ UID %d · Player list thiếu (thường gặp phe địch).' % pvp_target,
+                interval=5.0)
             return True
         runtime.pop('missing_since', None)
         if eligible:
@@ -6862,6 +6772,9 @@ def handle_silkroad(opcode, data):
     if (auto_pk_running and opcode in (0x7045, 0x7046, 0x7074)
             and status_blocks_auto_pk()):
         return True
+    if (auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight')
+            and opcode == 0x7074 and data and data[0] == 1):
+        return False
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
             return auto_pk_outgoing_selection(data)
@@ -7130,7 +7043,8 @@ def handle_joymax(opcode, data):
             return True
         if pvp_pause_controls and pvp_paused:
             return True
-        if not (pvp_delays or boss_interrupt_delays) or get_status():
+        busy = status_blocks_auto_pk() if auto_pk_running else get_status()
+        if not (pvp_delays or boss_interrupt_delays) or busy:
             return True
         character = get_character_data() or {}
         owner = owner_of(character)
@@ -7141,7 +7055,8 @@ def handle_joymax(opcode, data):
         if monsters is None:
             return True
         now = monotonic()
-        is_boss = target in monsters
+        is_boss = target in monsters and not (auto_pk_running and target == pvp_target
+                                                and pvp_person_target(target, character, monsters))
         if is_boss:
             if (skill_id not in boss_interrupt_delays or settings is None
                     or not target_matches_boss(target, monsters, (settings[1], settings[3]))):
@@ -7167,17 +7082,20 @@ def handle_joymax(opcode, data):
             direct_action_ended = False
             confirm_direct_native_skill(skill_id)
             runtime = auto_pk_runtime if auto_pk_running else None
+            if runtime is not None:
+                runtime.pop('party_refusal_count', None)
+                runtime.pop('party_b074_skills', None)
+                runtime.pop('party_all_b074_need_prep', None)
+                runtime.pop('party_need_cut', None)
+            if runtime is not None and is_party_sync_prefer_uid(target, runtime):
+                if runtime.get('party_b070_logged_lock') != runtime.get('target_locked_at'):
+                    runtime['party_b070_logged_lock'] = runtime.get('target_locked_at')
+                    log('[%s] B070 xác nhận skill %d của acc này trên UID %d.' % (NAME, skill_id, target))
             if runtime is not None and runtime.get('skill_probe_uid') == target:
                 runtime.update(skill_probe_uid=0, target_locked_at=now)
                 message = 'Đã khóa UID %d qua B070 · server đã nhận skill %d.' % (target, skill_id)
                 QtBind.setText(gui, auto_pk_status_label, message)
                 log('[%s] Auto PK: %s' % (NAME, message))
-            # Prefer got a real hit — clear all-B074 refuse set / pause.
-            if runtime is not None and is_party_sync_prefer_uid(target, runtime):
-                runtime['party_b074_skills'] = set()
-                runtime.pop('party_all_b074_pause_until', None)
-                runtime.pop('party_all_b074_need_prep', None)
-                runtime.pop('party_need_cut', None)
             if not pvp_trigger_mode:delay *= DIRECT_DELAY_FACTOR
             if direct_chain_mode:
                 confirm_direct_chain(skill_id,target,owner,now,delay)
@@ -7537,7 +7455,7 @@ def observe_push_packet(outgoing, opcode, data):
                     and not attempt.get('push_rejected')):
                 # Party prefer: B074 = skill interrupt → retry next skill, keep prefer.
                 if is_party_sync_prefer_uid(pvp_target):
-                    party_prefer_handle_b074_refuse(attempt, 'server từ chối đánh (B074)')
+                    party_prefer_handle_b074_refuse(attempt, 'B074 %s' % raw.hex(' '))
                 else:
                     release_auto_pk_target(
                         pvp_target, 'server từ chối đánh (B074)', AUTO_PK_PROTECTION_DELAY)
@@ -7993,7 +7911,7 @@ def check_direct_exchange():
             return
         if context.get('transport') == 'client_7081':
             try:
-                if get_status():
+                if (status_blocks_auto_pk() if auto_pk_running else get_status()):
                     pause_pvp('bot chính đã bật', cancel_action=False)
                 elif client_exchange_confirmed(context):
                     context['timeout'].cancel()
@@ -8129,7 +8047,8 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
         client = get_client() or {}
         monsters = get_monsters()
         background_pk = not is_boss and auto_pk_in_background(client)
-        if (get_status() or owner_of(character) != owner or character.get('dead')
+        busy = status_blocks_auto_pk() if not is_boss and auto_pk_running else get_status()
+        if (busy or owner_of(character) != owner or character.get('dead')
                 or character.get('player_id') != source or monsters is None
                 or not client.get('running') or client.get('pid') != pid
                 or (client.get('window') != window and not (background_pk and not client.get('window')))):
@@ -8165,7 +8084,8 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
                     and press_key(boss_interrupt_key, window)):
                 report('Ghost Boss: đã gửi phím ngắt %s cho UID=%s.' % (chr(boss_interrupt_key), target))
         elif direct_skills:
-            if (target == direct_target and target not in monsters and target not in (get_npcs() or {})):
+            if (target == direct_target and (pvp_person_target(target, character, monsters)
+                    if auto_pk_running else target not in monsters and target not in (get_npcs() or {}))):
                 party_prefer = is_party_sync_prefer_uid(target)
                 if background_pk:
                     # Force Ghost F interrupt (7081/B074) for party prefer + normal Auto PK.
@@ -9310,8 +9230,71 @@ def report_callback_failure(where, error):
         return was_auto_pk
 
 
+leader_command_keys_held = set()
+leader_command_next_at = 0.0
+
+
+def tick_leader_command_keys():
+    global leader_command_keys_held, leader_command_next_at
+    if not user32 or not party_leader_combat_hook('leader_hotkeys_enabled'):
+        leader_command_keys_held = set()
+        return
+    client = get_client() or {}
+    states = {key: user32.GetAsyncKeyState(key) for key in (0x70, 0x71, ord('3'), 0x73)}
+    keys = {key for key, flags in states.items() if flags & 0x8000}
+    tapped = {key for key, flags in states.items() if flags & 1}
+    fresh = (keys | tapped) - leader_command_keys_held
+    leader_command_keys_held = keys
+    if not client.get('window') or client['window'] != user32.GetForegroundWindow():
+        return
+    if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12)):
+        return
+    if len(fresh) != 1:
+        return
+    key = next(iter(fresh))
+    with pvp_lock:
+        now = monotonic()
+        if key != 0x73 and now < leader_command_next_at:
+            return
+        synthetic = pvp_synthetic_page
+        if synthetic and now <= synthetic['until']:
+            synthetic_key = PAGE_KEYS[PAGES.index(synthetic['page'])]
+            if key == synthetic_key:
+                return
+        if key == 0x73:
+            if auto_pk_running:
+                party_sync_clear_target('leader bấm F4 dừng Ghost')
+            else:
+                pause_pvp('leader bấm F4 dừng Ghost', clear_target=True, notify=False)
+            leader_command_next_at = now + 0.75
+            notify_party_leader_ghost_stop('leader bấm F4 dừng Ghost')
+            return
+        uid = party_leader_combat_hook('leader_has_selected_uid')
+        if not uid:
+            report_error('Chọn mục tiêu trước khi bấm F1/F2/3.')
+            return
+        page = 'F2' if key == 0x71 else ('F1' if key == 0x70 else None)
+        if page is None:
+            page = QtBind.text(gui, auto_pk_page_field) or 'F1'
+        if page not in PVP_EDIT_PAGES:
+            page = 'F1'
+        leader_command_next_at = now + 1.25
+        # Already fighting this UID → silent (stop Leader "đã phát lệnh đánh" spam).
+        if (party_sync_has_target(uid)
+                and party_leader_combat_hook('leader_combat_command_active')):
+            return
+        if party_sync_arm_auto_pk(page=page, prefer_uid=uid, source='Leader phím') and party_sync_has_target(uid):
+            if party_leader_combat_hook('on_leader_ghost_start', page, uid):
+                log('[%s] Leader đã phát lệnh đánh %s · UID %d.' % (NAME, page, uid))
+            else:
+                report_error('Leader đã bật Ghost %s nhưng chưa gửi được lệnh sang acc phụ.' % page)
+        else:
+            report_error('Leader chưa vào Ghost %s cho UID %d; xem trạng thái mục tiêu và nhóm F.' % (page, uid))
+
+
 def event_loop():
     try:
+        tick_leader_command_keys()
         tick_damage_meter()
         tick_armed_boss()
         with pvp_lock:
@@ -9394,4 +9377,4 @@ def finished():
 
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s.' % (NAME, VERSION))
+log('[%s] Đã nạp thành công v%s [F1/F2 danh, F4 dung].' % (NAME, VERSION))
