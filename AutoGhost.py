@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.50'
-# raw-main download stamp: 2026-11-11T00:15Z (UTF-8 no BOM/U+200B) · baseline + buff weapon switch
+VERSION = '1.8.51'
+# raw-main download stamp: 2026-11-11T00:20Z (UTF-8 no BOM/U+200B) · silence Target 7045 log
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -3948,10 +3948,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
                   runtime.get('buff_cast_until', 0))
             or (runtime.get('select_in_event') and not from_event)):
         return
-    native_expired = bool(runtime.pop('native_probe_until', 0))
-    if native_expired and now >= runtime.get('native_notice_at', 0):
-        runtime['native_notice_at'] = now + 5.0
-        log('[%s] Auto PK: game chưa phát 7045 sau phím Target Enemy.' % NAME)
+    runtime.pop('native_probe_until', None)  # expire quietly — no repeating Log spam
     runtime.pop('select_in_event', None)
     if runtime['requested']:
         runtime['retired'][runtime['requested']] = now + AUTO_PK_TARGET_RETRY_DELAY
