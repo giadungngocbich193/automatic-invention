@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.51'
-# raw-main download stamp: 2026-11-11T00:20Z (UTF-8 no BOM/U+200B) · silence Target 7045 log
+VERSION = '1.8.52'
+# raw-main download stamp: 2026-11-11T00:30Z (UTF-8 no BOM/U+200B) · mob farm + Ghost preempt
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -55,6 +55,8 @@ AUTO_PK_RETURN_STEP = 8.0
 AUTO_PK_MAX_RADIUS = 40
 AUTO_PK_REPORT_RADIUS = 60
 AUTO_PK_APPROACH_RANGE = 6.0
+AUTO_PK_MOB_SELECT_TIMEOUT = 1.2
+AUTO_PK_MOB_CAST_GAP = 0.4
 AUTO_PK_OUTSIDE_SELF = 'nhân vật vượt bán kính canh'
 AUTO_PK_OUTSIDE_TARGET = 'mục tiêu vượt bán kính canh'
 NUMERIC_KEY_INTERVAL = 0.02
@@ -3850,6 +3852,153 @@ def auto_pk_buff_gear_ready(page):
     return True
 
 
+def auto_pk_is_farm_monster(uid, monster, players):
+    """True for real mobs only — living dual-listed players are opponents, not farm."""
+    if not isinstance(monster, dict) or monster.get('hp', 0) <= 0:
+        return False
+    if isinstance(players, dict):
+        player = players.get(uid) or players.get(str(uid))
+        if isinstance(player, dict) and not player.get('dead'):
+            return False
+    return True
+
+
+def auto_pk_drop_mob(runtime, reason=''):
+    """Stop mob fight so Ghost PvP can take the target cleanly."""
+    global selected_monster_uid, hunt_request
+    if runtime is None:
+        return False
+    uid = int(runtime.pop('mob_uid', 0) or 0)
+    runtime.pop('mob_requested', None)
+    runtime.pop('mob_select_until', None)
+    runtime.pop('mob_cast_at', None)
+    runtime.pop('mob_skill_index', None)
+    if not uid:
+        return False
+    inject_joymax(0x7046, b'', False)
+    if selected_monster_uid == uid:
+        selected_monster_uid = 0
+    if hunt_request == uid:
+        hunt_request = None
+    if reason:
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Bỏ quái UID %d · %s · chuyển Auto Ghost.' % (uid, reason))
+    return True
+
+
+def auto_pk_mob_cast(runtime, character, uid, now):
+    """Cast Ghost skill IDs at a farm monster (rotate_direct refuses monsters)."""
+    global blocked_until
+    if now < max(blocked_until, runtime.get('mob_cast_at', 0), runtime.get('buff_cast_until', 0)):
+        return True
+    if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
+        return True
+    if pvp_activation is not None or pvp_target:
+        return False
+    skills = list(direct_skills or ())
+    if not skills:
+        group = (runtime_skill_groups or {}).get(runtime.get('page')) or {}
+        skills = list(group.get('order') or group.get('delays') or ())
+        if isinstance(skills, dict):
+            skills = list(skills.keys())
+    if not skills:
+        return False
+    table = skill_table()
+    index = int(runtime.get('mob_skill_index', 0) or 0) % len(skills)
+    for _ in range(len(skills)):
+        skill_id = skills[index]
+        index = (index + 1) % len(skills)
+        data = table.get(skill_id) if isinstance(skill_id, int) else None
+        if not isinstance(skill_id, int):
+            continue
+        if data is not None and data.get('can_cast') is False:
+            continue
+        if inject_joymax(0x7074, struct.pack('<BBIBI', 1, 4, skill_id, 1, uid), False) is False:
+            continue
+        runtime['mob_skill_index'] = index
+        runtime['mob_cast_at'] = now + AUTO_PK_MOB_CAST_GAP
+        cast_time = imbue_seconds(data, 'cast_time') if data else 0.0
+        blocked_until = now + max(0.15, cast_time + 0.05)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đánh quái UID %d · skill %d · vẫn quét địch.' % (uid, skill_id))
+        return True
+    runtime['mob_skill_index'] = index
+    runtime['mob_cast_at'] = now + AUTO_PK_MOB_CAST_GAP
+    return True
+
+
+def tick_auto_pk_idle_mob(runtime, character, now):
+    """Farm nearest monster while Auto PK keeps scanning for opponents."""
+    if (pvp_target or runtime.get('requested') or auto_pk_returning
+            or pvp_stunned_character is not None or now < blocked_until):
+        return False
+    if runtime.get('buff_phase') in ('equip', 'restore'):
+        return False
+    if now < runtime.get('buff_cast_until', 0):
+        return False
+    players = auto_pk_players()
+    monsters = get_monsters() if callable(get_monsters) else None
+    if not isinstance(monsters, dict):
+        return False
+    position = get_position() or {}
+    if 'region' not in position:
+        return False
+    anchor = runtime['anchor']
+    own = auto_pk_distance(position, anchor)
+    if own is None or own > runtime['radius']:
+        return False
+    # Waiting on mob select confirm.
+    mob_req = int(runtime.get('mob_requested') or 0)
+    if mob_req and now < runtime.get('mob_select_until', 0):
+        return True
+    if mob_req and now >= runtime.get('mob_select_until', 0):
+        runtime.pop('mob_requested', None)
+        runtime.pop('mob_select_until', None)
+    mob_uid = int(runtime.get('mob_uid') or 0)
+    if mob_uid:
+        mon = monsters.get(mob_uid) or monsters.get(str(mob_uid))
+        if (isinstance(mon, dict) and auto_pk_is_farm_monster(mob_uid, mon, players)
+                and (auto_pk_target_distance(mon, anchor, runtime) or 1e9) <= runtime['radius']):
+            return auto_pk_mob_cast(runtime, character, mob_uid, now)
+        auto_pk_drop_mob(runtime, 'quái chết/ra vùng')
+    origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
+    best = None
+    self_id = character.get('player_id')
+    for raw_uid, monster in monsters.items():
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        if not 0 < uid <= 0xffffffff or uid == self_id:
+            continue
+        if not auto_pk_is_farm_monster(uid, monster, players):
+            continue
+        if monster.get('region') is not None and int(monster['region']) != anchor['region']:
+            continue
+        anchor_distance = auto_pk_target_distance(monster, anchor, runtime)
+        if anchor_distance is None or anchor_distance > runtime['radius']:
+            continue
+        dist = auto_pk_target_distance(monster, origin, runtime)
+        if dist is None:
+            continue
+        candidate = (dist, uid)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return False
+    stop_auto_pk_patrol(runtime)
+    distance, uid = best
+    runtime['mob_requested'] = uid
+    runtime['mob_select_until'] = now + AUTO_PK_MOB_SELECT_TIMEOUT
+    if inject_joymax(0x7045, struct.pack('<I', uid), False) is False:
+        runtime.pop('mob_requested', None)
+        runtime.pop('mob_select_until', None)
+        return False
+    QtBind.setText(gui, auto_pk_status_label,
+                   'Chọn quái UID %d · %.1f m · vẫn canh địch.' % (uid, distance))
+    return True
+
+
 def tick_auto_pk_idle_buff(runtime, now):
     """Idle buff: optional F-page weapon switch → cast → restore combat page."""
     global blocked_until
@@ -3971,9 +4120,11 @@ def auto_pk_select(character, runtime, now, from_event=False):
         # get_players often omits opposing-faction enemies on Stable; still try Target Enemy.
         if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
             return
+        if tick_auto_pk_idle_mob(runtime, character, now):
+            return
         if not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'phBot chưa trả danh sách Player · gán Target Enemy (Home/End/Insert) để chọn phe địch.')
+                           'phBot chưa trả Player list · đánh quái khi rảnh · gán Target Enemy nếu cần.')
         return
     runtime['retired'] = {uid: until for uid, until in runtime['retired'].items() if until > now}
     best = None
@@ -3999,11 +4150,16 @@ def auto_pk_select(character, runtime, now, from_event=False):
     if best is None:
         if auto_pk_try_native_enemy_key(runtime, client, now, 'không thấy UID trong Player list'):
             return
+        # No opponent in radius → farm monsters while continuing to scan.
+        if tick_auto_pk_idle_mob(runtime, character, now):
+            return
         if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chưa có UID Player · thử Target Enemy nếu đã gán phím.' %
+                           'Đang canh %.0f m · đánh quái khi rảnh · chờ địch.' %
                            runtime['radius'])
         return
+    # Opponent in radius → drop mob fight and switch to Auto Ghost PvP.
+    auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
     distance, uid = best
     failed_pid, until = runtime.get('fast_select_fallback', (None, 0))
@@ -4050,6 +4206,7 @@ def start_auto_pk_skill_probe(runtime, uid):
     global pvp_target, direct_target
     if not direct_native_exchange or not auto_pk_allow_unlisted_target(runtime, uid)[0]:
         return False
+    auto_pk_drop_mob(runtime, 'có địch')
     pvp_target = direct_target = uid
     runtime.pop('approach', None)
     runtime.pop('missing_since', None)
@@ -4063,9 +4220,22 @@ def start_auto_pk_skill_probe(runtime, uid):
 def auto_pk_select_reply(data):
     global pvp_selection_request, direct_select_request, pvp_target, direct_target
     runtime = auto_pk_runtime
-    uid = runtime['requested']
     now = monotonic()
-    if not uid or not data or now >= runtime['select_until']:
+    if not data:
+        return
+    # Mob-farm select confirm (keep scanning for opponents).
+    mob_req = int(runtime.get('mob_requested') or 0)
+    if mob_req and data[0] == 1 and len(data) >= 5:
+        confirmed = struct.unpack_from('<I', data, 1)[0]
+        if confirmed == mob_req:
+            runtime['mob_uid'] = confirmed
+            runtime.pop('mob_requested', None)
+            runtime.pop('mob_select_until', None)
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Đã chọn quái UID %d · đánh mob · vẫn canh địch.' % confirmed)
+            return
+    uid = runtime['requested']
+    if not uid or now >= runtime['select_until']:
         return
     if data[0] != 1:
         runtime['requested'] = runtime['native_uid'] = pvp_selection_request = direct_select_request = 0
@@ -4087,6 +4257,7 @@ def auto_pk_select_reply(data):
         QtBind.setText(gui, auto_pk_status_label,
                        'B045 UID %d nhưng chưa khóa: %s.' % (uid, reason))
         return
+    auto_pk_drop_mob(runtime, 'có địch')
     stop_auto_pk_patrol(runtime)
     pvp_target = direct_target = uid
     runtime.pop('missing_since', None)
@@ -4152,7 +4323,8 @@ def request_auto_pk_arm():
             auto_pk_running = True
             auto_pk_returning = False
         show_auto_pk_anchor()
-        message = 'Đã bật canh %.0f m · nhóm %s.' % (radius,page)
+        message = 'Đã bật canh %.0f m · nhóm %s · đánh quái khi rảnh · địch vào vùng thì Ghost.' % (
+            radius, page)
         if buff_error:
             QtBind.setText(gui, auto_pk_buffs_status, 'Bảng buff: ' + buff_error)
         if disable_buffs:
@@ -4160,11 +4332,15 @@ def request_auto_pk_arm():
             message += ' Buff đã tắt vì ID lỗi.'
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
+        log('[%s] Auto PK v%s: mob farm + scan · địch trong bán kính → bỏ quái → Ghost.' %
+            (NAME, VERSION))
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
 
 
 def stop_auto_pk(reason=None):
+    if auto_pk_runtime is not None:
+        auto_pk_drop_mob(auto_pk_runtime)
     if auto_pk_running:
         stop_clicked()
     message = 'AUTO PK ĐÃ TẮT.'
