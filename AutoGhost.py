@@ -2,6 +2,9 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
+  HARD never Auto PK own party (*name match). Guild/Liên minh filters.
+  No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
 - [FIX no B070 hard-stop v1.8.66] Baseline AutoGhost_2600. pause_pvp chặn mọi
   “chưa có B070 khớp / sau N lần thử lại” → soft-wait; không “Auto Ghost dừng”.
   Chỉ tắt khi chết / Dừng / ks off / F4 / X.
@@ -34,9 +37,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.66'
-# raw-main download stamp: 2026-11-11T08:30Z (UTF-8 no BOM/U+200B)
-# baseline AutoGhost_2600 + PartyLeader PT + no B070 hard-stop + trace-safe Auto PK
+VERSION = '1.8.67'
+# raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
+# baseline 2600 + ally filters + party sync no-7045 + follower no-camp
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -363,14 +366,21 @@ auto_pk_fast_box=widget('auto_pk','createCheckBox','auto_pk_fast_changed','Quét
 auto_pk_mob_farm_box=widget('auto_pk','createCheckBox','auto_pk_mob_farm_changed','Đánh quái',355,130)
 widget('auto_pk','createButton','view_auto_pk_options','Tọa độ',445,127)
 widget('auto_pk','createButton','view_auto_pk_buffs','Skill buff',530,127)
-widget('auto_pk','createButton','scan_auto_pk_now','Quét ngay',10,157)
-widget('auto_pk','createButton','request_auto_pk_arm','Bật Auto PK',410,157)
-widget('auto_pk','createButton','stop_auto_pk','Dừng canh',505,157)
+widget('auto_pk','createLabel','Không đánh',10,156)
+auto_pk_skip_party_box=widget('auto_pk','createCheckBox','auto_pk_skip_party_changed','Party*',85,154)
+auto_pk_skip_guild_box=widget('auto_pk','createCheckBox','auto_pk_skip_guild_changed','Guild (G)',160,154)
+auto_pk_skip_alliance_box=widget('auto_pk','createCheckBox','auto_pk_skip_alliance_changed','Liên minh',270,154)
+QtBind.setChecked(gui, auto_pk_skip_party_box, True)
+QtBind.setChecked(gui, auto_pk_skip_guild_box, True)
+QtBind.setChecked(gui, auto_pk_skip_alliance_box, True)
+widget('auto_pk','createButton','scan_auto_pk_now','Quét ngay',10,180)
+widget('auto_pk','createButton','request_auto_pk_arm','Bật Auto PK',410,180)
+widget('auto_pk','createButton','stop_auto_pk','Dừng canh',505,180)
 auto_pk_result_fields=[
-    widget('auto_pk','createLineEdit','',10,184+index*21,655,20) for index in range(3)
+    widget('auto_pk','createLineEdit','',10,207+index*21,655,20) for index in range(3)
 ]
-auto_pk_status_label=widget('auto_pk','createLineEdit','Đã tắt. Bấm Bật Auto PK tại vị trí muốn canh.',10,250,655,22)
-auto_pk_scan_field=widget('auto_pk','createLineEdit','Tự quét khi bật Auto PK.',10,276,655,20)
+auto_pk_status_label=widget('auto_pk','createLineEdit','Đã tắt. Bấm Bật Auto PK tại vị trí muốn canh.',10,273,655,22)
+auto_pk_scan_field=widget('auto_pk','createLineEdit','Tự quét khi bật Auto PK.',10,299,655,20)
 
 widget('auto_pk_options','createLabel','TỌA ĐỘ TÂM VÙNG · bỏ trống cả X và Y để dùng mặc định.',10,36)
 widget('auto_pk_options','createLabel','Vùng đánh: vị trí khi bật Auto PK. Vùng quét và chạy vòng: tâm vùng đánh.',10,61)
@@ -581,16 +591,27 @@ def capture_page_gear(page):
     inventory_fn = getattr(phbot_api, 'get_inventory', None)
     items = ((inventory_fn() or {}).get('items') or []) if inventory_fn else []
     if len(items) < 8 or not items[6]:
-        report_error('Chưa đọc được vũ khí đang mặc; hãy vào game và trang bị trước.')
+        report_error(
+            'Lấy đồ %s thất bại: chưa đọc vũ khí đang mặc. Vào game, mặc đúng bộ %s (VK+khiên), rồi bấm lại.'
+            % (page, page))
         return
     weapon = items[6]
     offhand = items[7] or {}
     # Slot 7 may contain arrows/bolts. Only save an actual shield.
     shield = offhand if is_shield_item(offhand) else {}
-    QtBind.setText(gui, weapon_fields[page], str(weapon['model']))
-    QtBind.setText(gui, shield_fields[page], str(shield['model']) if shield else '0')
-    report('%s: lấy vũ khí %s; khiên %s. Bấm Lưu cấu hình.' %
-           (page, weapon.get('name', weapon['model']), shield.get('name', 'không đổi')))
+    w_model = str(weapon.get('model') or '')
+    s_model = str(shield['model']) if shield else '0'
+    QtBind.setText(gui, weapon_fields[page], w_model)
+    QtBind.setText(gui, shield_fields[page], s_model)
+    # Hot-update runtime so buff/Auto PK can use gear before next full Lưu.
+    if isinstance(runtime_gear, dict):
+        runtime_gear[page] = {'weapon': w_model, 'shield': s_model}
+    w_name = weapon.get('name') or w_model
+    s_name = (shield.get('name') if shield else None) or ('không khiên' if s_model == '0' else s_model)
+    msg = ('%s Lấy đồ OK · VK %s (model %s) · khiên %s (model %s). Bấm Lưu cấu hình '
+           '(buff F cần đúng trang này).' % (page, w_name, w_model, s_name, s_model))
+    report(msg)
+    QtBind.setText(gui, auto_pk_status_label, msg)
 
 
 def capture_f1_gear(): capture_page_gear('F1')
@@ -3476,6 +3497,11 @@ def load_auto_pk_options(profile):
     for box, name in ((auto_pk_fast_box,'fast_scan'),(auto_pk_patrol_box,'patrol_enabled'),
                       (auto_pk_mob_farm_box,'mob_farm'),(auto_pk_buffs_box,'buffs_enabled')):
         set_checked_silent(box, profile.get(name) is True)
+    # Ally filters: default ON if key missing (safe for PT/guild).
+    for box, name in ((auto_pk_skip_party_box, 'skip_party'),
+                      (auto_pk_skip_guild_box, 'skip_guild'),
+                      (auto_pk_skip_alliance_box, 'skip_alliance')):
+        set_checked_silent(box, profile.get(name) is not False)
     centers = profile.get('centers') or {}
     if not isinstance(centers, dict):
         centers = {}
@@ -3575,6 +3601,9 @@ def read_auto_pk_options():
         'fast_scan':QtBind.isChecked(gui,auto_pk_fast_box),
         'mob_farm':QtBind.isChecked(gui,auto_pk_mob_farm_box),
         'buffs_enabled':QtBind.isChecked(gui,auto_pk_buffs_box),
+        'skip_party':QtBind.isChecked(gui,auto_pk_skip_party_box),
+        'skip_guild':QtBind.isChecked(gui,auto_pk_skip_guild_box),
+        'skip_alliance':QtBind.isChecked(gui,auto_pk_skip_alliance_box),
         'buff_ids':buffs, 'buff_weapons':weapons, 'buff_page':'',
         'buff_error':buff_error, 'centers':read_auto_pk_centers(),
     }
@@ -3676,8 +3705,21 @@ def scan_auto_pk_evidence(runtime=None):
             attack_distance = auto_pk_target_distance(player, anchor, runtime)
             unavailable = (auto_pk_target_unavailable(runtime, int(uid), player, now)
                            if runtime is not None and str(uid).isdigit() else None)
-            label, hostile = auto_pk_hostility_label(player, character, uid=int(uid) if str(uid).isdigit() else None,
+            uid_i = int(uid) if str(uid).isdigit() else 0
+            label, hostile = auto_pk_hostility_label(player, character, uid=uid_i or None,
                                                     monsters=monsters)
+            # Preview ally filters (same as live Auto PK options).
+            preview = {
+                'skip_party': QtBind.isChecked(gui, auto_pk_skip_party_box),
+                'skip_guild': QtBind.isChecked(gui, auto_pk_skip_guild_box),
+                'skip_alliance': QtBind.isChecked(gui, auto_pk_skip_alliance_box),
+            }
+            ally_reason = auto_pk_ally_skip_reason(preview, uid_i, player, character)
+            if ally_reason:
+                hostile = False
+                label = 'bỏ qua (%s)' % (
+                    'Party' if ally_reason == 'party' else
+                    'Guild' if ally_reason == 'guild' else 'Liên minh')
             rows.append(dict(uid=str(uid), name=player.get('name','?'), distance_m=scan_distance,
                              dead=player.get('dead'), unavailable=unavailable, hostile=hostile,
                              hostility=label,
@@ -4088,6 +4130,174 @@ def auto_pk_player_view(player, uid=None, monsters=None):
     return merged
 
 
+def _phbot_dict_api(name):
+    fn = getattr(phbot_api, name, None)
+    if not callable(fn):
+        return None
+    try:
+        data = fn()
+    except (RuntimeError, OSError, TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ally_norm_name(text):
+    """Normalize player/party names for ally match (*AG_BangChu == AG_BangChu)."""
+    text = str(text or '').strip()
+    while text.startswith('*'):
+        text = text[1:].strip()
+    return text.casefold()
+
+
+def _ally_member_tokens(member):
+    """Collect identity tokens from a party/guild/union member dict."""
+    ids, names, guilds = set(), set(), set()
+    if not isinstance(member, dict):
+        return ids, names, guilds
+    for key in ('player_id', 'unique_id', 'uid', 'id'):
+        try:
+            pid = int(member.get(key) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            ids.add(pid)
+    for key in ('name', 'charname', 'char_name', 'character_name', 'CharName',
+                'job_name', 'jobName', 'job'):
+        raw = str(member.get(key) or '').strip()
+        if not raw:
+            continue
+        names.add(raw.casefold())
+        norm = _ally_norm_name(raw)
+        if norm:
+            names.add(norm)
+    for key in ('guild', 'guild_name', 'guildName'):
+        g = str(member.get(key) or '').strip()
+        if g:
+            guilds.add(g.casefold())
+    return ids, names, guilds
+
+
+def auto_pk_ally_sets(character=None):
+    """Snapshot allies for Party / Guild / Liên minh filters."""
+    character = character or get_character_data() or {}
+    try:
+        self_id = int(character.get('player_id') or 0)
+    except (TypeError, ValueError):
+        self_id = 0
+    self_name = _ally_norm_name(character.get('name') or '')
+    self_job = _ally_norm_name(character.get('job_name') or character.get('jobName') or '')
+    self_guild = str(character.get('guild') or '').strip().casefold()
+    party_ids, party_names = set(), set()
+    guild_ids, guild_names = set(), set()
+    union_ids, union_names, union_guilds = set(), set(), set()
+    if self_id:
+        party_ids.add(self_id)
+        guild_ids.add(self_id)
+        union_ids.add(self_id)
+    if self_name:
+        party_names.add(self_name)
+        guild_names.add(self_name)
+        union_names.add(self_name)
+    if self_job:
+        party_names.add(self_job)
+        guild_names.add(self_job)
+        union_names.add(self_job)
+    if self_guild:
+        guild_names.add(self_guild)  # also match by guild string via separate field
+        union_guilds.add(self_guild)
+
+    party = _phbot_dict_api('get_party')
+    if party:
+        for member in party.values():
+            ids, names, _ = _ally_member_tokens(member)
+            party_ids |= ids
+            party_names |= names
+
+    guild_orgs = set()
+    if self_guild:
+        guild_orgs.add(self_guild)
+    guild = _phbot_dict_api('get_guild')
+    if guild:
+        for member in guild.values():
+            ids, names, guilds = _ally_member_tokens(member)
+            guild_ids |= ids
+            guild_names |= names
+            guild_orgs |= guilds
+
+    union = _phbot_dict_api('get_guild_union')
+    if union:
+        for member in union.values():
+            ids, names, guilds = _ally_member_tokens(member)
+            union_ids |= ids
+            union_names |= names
+            union_guilds |= guilds
+
+    return {
+        'party_ids': party_ids,
+        'party_names': party_names,
+        'guild_ids': guild_ids,
+        'guild_names': guild_names,
+        'guild_orgs': guild_orgs,
+        'union_ids': union_ids,
+        'union_names': union_names,
+        'union_guilds': union_guilds,
+        'self_guild': self_guild,
+    }
+
+
+def auto_pk_ally_skip_reason(runtime, uid, player, character=None, allies=None):
+    """Return reason if player is ally. HARD: never Auto PK own party (even if unticked)."""
+    if not isinstance(player, dict):
+        return ''
+    runtime = runtime or {}
+    # PartyLeader locked UID is chủ's *enemy* — never treat as ally skip.
+    try:
+        uid_i = int(uid or 0)
+    except (TypeError, ValueError):
+        uid_i = 0
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    if runtime.get('party_lock') and party_uid and uid_i == party_uid:
+        return ''
+    allies = allies or auto_pk_ally_sets(character)
+    name_tokens = set()
+    for key in ('name', 'charname', 'char_name', 'character_name', 'CharName',
+                'job_name', 'jobName', 'job'):
+        raw = str(player.get(key) or '').strip()
+        if not raw:
+            continue
+        name_tokens.add(raw.casefold())
+        norm = _ally_norm_name(raw)
+        if norm:
+            name_tokens.add(norm)
+    guild = ''
+    for key in ('guild', 'guild_name', 'guildName'):
+        guild = str(player.get(key) or '').strip().casefold()
+        if guild:
+            break
+    # HARD RULE: always exclude same party (game: không thể tấn công cùng nhóm).
+    if (uid_i and uid_i in allies['party_ids']) or (name_tokens & allies['party_names']):
+        return 'party'
+    skip_guild = runtime.get('skip_guild') is not False  # default ON
+    skip_alliance = runtime.get('skip_alliance') is not False
+    # Respect UI only when keys explicitly False; missing → ON.
+    if 'skip_guild' in runtime:
+        skip_guild = bool(runtime.get('skip_guild'))
+    if 'skip_alliance' in runtime:
+        skip_alliance = bool(runtime.get('skip_alliance'))
+    if skip_guild:
+        if (uid_i and uid_i in allies['guild_ids']) or (name_tokens & allies['guild_names']):
+            return 'guild'
+        if guild and (guild == allies.get('self_guild') or guild in allies.get('guild_orgs', ())):
+            return 'guild'
+    if skip_alliance:
+        if (uid_i and uid_i in allies['union_ids']) or (name_tokens & allies['union_names']):
+            return 'alliance'
+        if guild and guild in allies.get('union_guilds', ()):
+            return 'alliance'
+    return ''
+
+
+
 def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid=None,
                                 monsters=None):
     """List-select hostile: đỏ/tím OR job đạo tặc↔bảo tiêu; optional dual-list if màu ẩn.
@@ -4268,6 +4478,24 @@ def auto_pk_mob_farm_changed(checked):
             auto_pk_drop_mob(auto_pk_runtime, 'tắt Đánh quái')
         QtBind.setText(gui, auto_pk_status_label,
                        'Đánh quái: bật.' if checked else 'Đánh quái: tắt · API/Target chỉ cho địch.')
+
+
+def auto_pk_skip_party_changed(checked):
+    with pvp_lock:
+        if not ui_sync and auto_pk_runtime is not None:
+            auto_pk_runtime['skip_party'] = bool(checked)
+
+
+def auto_pk_skip_guild_changed(checked):
+    with pvp_lock:
+        if not ui_sync and auto_pk_runtime is not None:
+            auto_pk_runtime['skip_guild'] = bool(checked)
+
+
+def auto_pk_skip_alliance_changed(checked):
+    with pvp_lock:
+        if not ui_sync and auto_pk_runtime is not None:
+            auto_pk_runtime['skip_alliance'] = bool(checked)
 
 
 def auto_pk_buffs_changed(checked):
@@ -4572,11 +4800,19 @@ def tick_auto_pk_idle_buff(runtime, now):
             # --- only addition vs classic buff: weapon for this skill ID ---
             buff_page = auto_pk_buff_weapon_for(runtime, uid)
             if buff_page and not any((runtime_gear.get(buff_page) or {}).values()):
-                retry_at[uid] = now + 10.0
-                message = 'Buff %d: chưa cài vũ khí/khiên cho nhóm %s.' % (uid, buff_page)
-                report_error(message)
-                QtBind.setText(gui, auto_pk_status_label, message)
-                continue
+                # UI may have models before runtime_gear refresh — read fields.
+                ui_w = (QtBind.text(gui, weapon_fields.get(buff_page)) or '').strip() if buff_page in weapon_fields else ''
+                ui_s = (QtBind.text(gui, shield_fields.get(buff_page)) or '').strip() if buff_page in shield_fields else ''
+                if ui_w or (ui_s and ui_s != ''):
+                    runtime_gear[buff_page] = {'weapon': ui_w, 'shield': ui_s or '0'}
+                if not any((runtime_gear.get(buff_page) or {}).values()):
+                    retry_at[uid] = now + 15.0
+                    message = (
+                        'Buff ID %d cần đồ nhóm %s — tab Đồ: mặc VK/khiên %s → bấm Lấy đồ %s → Lưu. '
+                        '(Thiếu weapon/shield model cho F này.)' % (uid, buff_page, buff_page, buff_page))
+                    report_error(message)
+                    QtBind.setText(gui, auto_pk_status_label, message)
+                    continue
             if buff_page:
                 if not auto_pk_buff_gear_ready(buff_page):
                     stop_auto_pk_patrol(runtime)
@@ -4656,10 +4892,19 @@ def auto_pk_select(character, runtime, now, from_event=False):
     if runtime.get('party_lock') and party_uid:
         runtime.pop('native_probe_until', None)
         runtime.pop('select_in_event', None)
+        runtime['party_follow_mode'] = True
         if pvp_target and pvp_target != party_uid:
             release_auto_pk_target(pvp_target, 'khác UID chủ · bỏ')
-        if not pvp_target or pvp_target != party_uid:
-            party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+        # Already preferred/locked → do NOT re-inject / re-log.
+        if pvp_target == party_uid or direct_target == party_uid:
+            if not pvp_armed and pvp_activation is None:
+                try:
+                    request_pvp_page(runtime.get('page') or 'F2')
+                except Exception:
+                    pass
+            return
+        # Bind prefer + Ghost once (no 7045 loop).
+        party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
         return
     # Expire Target probe quietly (no Log spam); keep flag for skill-probe fallback.
     native_expired = bool(runtime.pop('native_probe_until', 0))
@@ -4707,6 +4952,7 @@ def auto_pk_select(character, runtime, now, from_event=False):
     best_scan = None
     monsters = get_monsters() if callable(get_monsters) else None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
+    allies = auto_pk_ally_sets(character)
     for raw_uid, target in players.items():
         try:
             uid = int(raw_uid)
@@ -4718,6 +4964,8 @@ def auto_pk_select(character, runtime, now, from_event=False):
                 or not isinstance(target, dict)):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
+            continue
+        if auto_pk_ally_skip_reason(runtime, uid, target, character, allies):
             continue
         anchor_distance = auto_pk_scan_distance(target, anchor)
         if anchor_distance is None or anchor_distance > scan_radius:
@@ -4797,6 +5045,19 @@ def start_auto_pk_skill_probe(runtime, uid):
     global pvp_target, direct_target
     if not direct_native_exchange or not auto_pk_allow_unlisted_target(runtime, uid)[0]:
         return False
+    # HARD: never skill-probe own party / filtered allies.
+    players = auto_pk_players() or {}
+    player = players.get(uid) or players.get(str(uid)) or {}
+    ally = auto_pk_ally_skip_reason(runtime, uid, player if isinstance(player, dict) else {},
+                                    get_character_data() or {})
+    if ally:
+        runtime['retired'][int(uid)] = monotonic() + AUTO_PK_TARGET_RETRY_DELAY
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Bỏ UID %d · cùng %s (không PK nhóm).' % (
+                           int(uid),
+                           'Party' if ally == 'party' else
+                           'Guild' if ally == 'guild' else 'Liên minh'))
+        return False
     auto_pk_drop_mob(runtime, 'có địch')
     pvp_target = direct_target = uid
     runtime.pop('approach', None)
@@ -4847,6 +5108,18 @@ def auto_pk_select_reply(data):
         runtime['scan_at'] = 0.0
         QtBind.setText(gui, auto_pk_status_label,
                        'B045 UID %d nhưng chưa khóa: %s.' % (uid, reason))
+        return
+    players = auto_pk_players() or {}
+    player = players.get(uid) or players.get(str(uid)) or {}
+    ally = auto_pk_ally_skip_reason(runtime, uid, player if isinstance(player, dict) else {},
+                                    get_character_data() or {})
+    if ally:
+        runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
+        runtime['scan_at'] = 0.0
+        QtBind.setText(gui, auto_pk_status_label,
+                       'B045 UID %d · bỏ vì cùng %s (không PK nhóm).' % (
+                           uid, 'Party' if ally == 'party' else
+                           'Guild' if ally == 'guild' else 'Liên minh'))
         return
     auto_pk_drop_mob(runtime, 'có địch')
     stop_auto_pk_patrol(runtime)
@@ -4969,8 +5242,13 @@ def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
 
 
 def party_sync_select_uid(uid, source='PartyLeader'):
-    """Hook: đánh dấu UID sync PT rồi inject 7045 (AutoGhost không chặn)."""
+    """Party sync: set prefer/direct_target + Ghost cast. NO 7045 inject loop.
+
+    Stable often blocks player 7045; follower attacks via direct_target UID.
+    Returns True once prefer is set (even if inject would fail).
+    """
     global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
+    global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
     try:
         uid = int(uid)
     except (TypeError, ValueError):
@@ -4978,36 +5256,68 @@ def party_sync_select_uid(uid, source='PartyLeader'):
     if uid <= 0:
         return False
     now = monotonic()
+    page = None
+    already = False
     with pvp_lock:
         runtime = auto_pk_runtime if auto_pk_running else None
-        if runtime is not None and not auto_pk_returning:
-            runtime['party_sync_uid'] = uid
-            runtime['party_sync_source'] = source
-            runtime['party_lock'] = True
-            runtime['party_hold_fight'] = False
-            runtime['requested'] = uid
-            runtime['select_until'] = now + AUTO_PK_SELECT_TIMEOUT
-            runtime['native_uid'] = uid
-            runtime['native_source'] = 'PartyLeader sync'
-            runtime['target_seen_at'] = now
-            runtime['target_sent_at'] = now
-            pvp_selection_request = direct_select_request = uid
-            pvp_paused = False
-    packet = struct.pack('<I', uid & 0xffffffff)
-    ok = inject_joymax(0x7045, packet, False)
-    if ok is False:
-        ok = inject_joymax(0x7045, packet, True)
-    accepted = ok is not False
-    log('[%s] party_sync_select UID=%d · 7045=%r · src=%s · auto_pk=%s'
-        % (NAME, uid, ok, source, auto_pk_running))
-    if accepted:
-        QtBind.setText(gui, auto_pk_status_label,
-                       'PartyLeader sync UID %d · 7045 ok · chờ B045/Ghost.' % uid)
-    else:
-        QtBind.setText(gui, auto_pk_status_label,
-                       'PartyLeader sync UID %d · 7045 từ chối · giữ prefer để Auto PK retry.'
-                       % uid)
-    return accepted
+        if runtime is None:
+            return False
+        # Debounce: same UID already preferred/locked → quiet success.
+        last_at = float(runtime.get('party_sync_select_at') or 0)
+        last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
+        if (uid == last_uid and (now - last_at) < 2.0
+                and (pvp_target == uid or direct_target == uid
+                     or int(runtime.get('party_sync_uid') or 0) == uid)):
+            already = True
+        runtime['party_sync_uid'] = uid
+        runtime['party_sync_source'] = source
+        runtime['party_lock'] = True
+        runtime['party_follow_mode'] = True
+        runtime['party_hold_fight'] = False
+        runtime['party_sync_select_at'] = now
+        runtime['party_sync_select_uid_last'] = uid
+        runtime['requested'] = uid
+        runtime['native_uid'] = uid
+        runtime['native_source'] = 'PartyLeader prefer'
+        runtime['target_seen_at'] = now
+        runtime['target_sent_at'] = now
+        runtime['select_until'] = now + 30.0  # keep prefer; no re-inject storm
+        runtime['skill_probe_uid'] = uid
+        runtime['first_cast_sent'] = False
+        runtime.pop('missing_since', None)
+        runtime.pop('approach', None)
+        runtime.pop('target_outside', None)
+        # Cancel camp return — follower follows chủ, not Auto PK camp.
+        auto_pk_returning = False
+        runtime.pop('withdraw', None)
+        runtime.pop('return_progress', None)
+        pvp_selection_request = direct_select_request = uid
+        pvp_target = direct_target = uid
+        pvp_paused = False
+        page = runtime.get('page') or QtBind.text(gui, auto_pk_page_field) or 'F2'
+    if already:
+        return True
+    # Arm Ghost page / cast path without requiring 7045 or B045.
+    try:
+        if page:
+            request_pvp_page(page)
+    except Exception as error:
+        log('[%s] party_sync prefer request_pvp_page: %s' % (NAME, error))
+    # Soft status — log at most once / 5s per UID.
+    with pvp_lock:
+        runtime = auto_pk_runtime
+        log_at = float((runtime or {}).get('party_sync_log_at') or 0)
+        log_uid = int((runtime or {}).get('party_sync_log_uid') or 0)
+        should_log = not (uid == log_uid and (now - log_at) < 5.0)
+        if runtime is not None and should_log:
+            runtime['party_sync_log_at'] = now
+            runtime['party_sync_log_uid'] = uid
+    msg = ('Party sync prefer UID %d · Ghost trực tiếp (không 7045) · src=%s'
+           % (uid, source))
+    QtBind.setText(gui, auto_pk_status_label, msg)
+    if should_log:
+        log('[%s] %s · auto_pk=%s' % (NAME, msg, auto_pk_running))
+    return True
 
 
 def party_sync_clear_target(reason=None, source='PartyLeader'):
@@ -5097,8 +5407,13 @@ def request_auto_pk_arm():
         show_auto_pk_anchor()
         farm_on = bool(options.get('mob_farm'))
         scan_m = float(options.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
-        message = ('[FIX hostile filter đỏ/tím+job] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
-                   'đứng canh im · chỉ đỏ/tím/job địch.' % (radius, scan_m, page))
+        skips = []
+        if options.get('skip_party', True): skips.append('Party')
+        if options.get('skip_guild', True): skips.append('Guild')
+        if options.get('skip_alliance', True): skips.append('Liên minh')
+        skip_txt = (' · không đánh ' + '/'.join(skips)) if skips else ''
+        message = ('[FIX ally+party sync] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
+                   'đứng canh im · đỏ/tím/job địch%s.' % (radius, scan_m, page, skip_txt))
         message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
         if options.get('buffs_enabled') and options.get('buff_ids'):
             message += ' Đang gửi Skill buff…'
@@ -5141,11 +5456,19 @@ def hold_auto_pk(reason, retry_after=0.0):
     if runtime.get('hold_reason') == reason:
         return
     engaged = int(pvp_target or 0) or int(direct_target or 0)
+    party_follow = bool(runtime.get('party_lock') or runtime.get('party_follow_mode')
+                        or int(runtime.get('party_sync_uid') or 0))
     # [FIX never abort PvP in attack range] Coord flicker / wait must not quay về mid-fight.
     if engaged and ('tọa độ' in reason or 'client hoặc dữ liệu' in reason):
         report('[FIX never abort PvP in attack range] bỏ hold mid-fight · UID %d · %s'
                % (engaged, reason))
         runtime.update(hold_reason=reason, hold_until=monotonic() + max(retry_after, 0.15))
+        return
+    # Follower party sync: soft hold only — keep prefer/direct_target, no camp return.
+    if party_follow:
+        runtime.update(hold_reason=reason, hold_until=monotonic() + max(retry_after, 0.5))
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Party sync chờ: %s · giữ prefer UID.' % reason)
         return
     auto_pk_returning = True
     pause_pvp('Auto PK chờ: ' + reason, clear_target=True, cancel_action=False, notify=False)
@@ -5202,6 +5525,10 @@ def tick_auto_pk(from_event=False):
     if runtime.get('trade_open'):
         return False
     if not owner or not (get_client() or {}).get('running'):
+        if runtime.get('party_lock') or runtime.get('party_follow_mode'):
+            # False flicker during ks/trace — keep prefer, soft wait.
+            hold_auto_pk('đang chờ client (party sync)', retry_after=1.0)
+            return bool(int(runtime.get('party_sync_uid') or 0) or pvp_target or direct_target)
         hold_auto_pk('đang chờ client hoặc dữ liệu nhân vật')
         return False
     if character.get('dead'):
@@ -5221,6 +5548,7 @@ def tick_auto_pk(from_event=False):
     now = monotonic()
     if now < runtime.get('hold_until', 0):
         return False
+    party_follow = bool(runtime.get('party_lock') or runtime.get('party_follow_mode'))
     if not auto_pk_returning:
         if now < runtime['scan_at'] and not (from_event and runtime.get('select_in_event')):
             return bool(pvp_target and 'missing_since' not in runtime and 'target_outside' not in runtime)
@@ -5239,14 +5567,20 @@ def tick_auto_pk(from_event=False):
         # [FIX never abort PvP in attack range] Keep engaged cast if coords flicker.
         if engaged_uid and (pvp_armed or pvp_activation is not None):
             return True
+        if party_follow:
+            # Follower: ignore camp coords — keep prefer/cast.
+            return bool(engaged_uid)
         hold_auto_pk('chưa có tọa độ hợp lệ trong vùng điểm chờ')
         return False
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
+        # Follower party sync: NEVER camp/return — trace handles movement.
+        if party_follow:
+            pass
         # [FIX never abort PvP in attack range] + [FIX camp stand-still]
         # Hysteresis 1.5 m so tiny coord noise does not quay về liên tục.
-        if distance > runtime['radius'] + 1.5 and not engaged_uid:
+        elif distance > runtime['radius'] + 1.5 and not engaged_uid:
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
@@ -7087,8 +7421,30 @@ def confirm_direct_native_skill(skill_id):
         direct_retry_state=None
 
 
+
+def party_sync_protects_target(target):
+    """True when target is the PartyLeader-synced PvP UID — do not 7081/B074 cut."""
+    try:
+        target = int(target or 0)
+    except (TypeError, ValueError):
+        return False
+    if target <= 0 or not auto_pk_running:
+        return False
+    runtime = auto_pk_runtime
+    if not isinstance(runtime, dict):
+        return False
+    if not (runtime.get('party_lock') or runtime.get('party_follow_mode')
+            or int(runtime.get('party_sync_uid') or 0)):
+        return False
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    return target in (party_uid, int(pvp_target or 0), int(direct_target or 0))
+
+
 def begin_native_cut(owner, target, auto_background=False):
     global direct_exchange_wait, blocked_until
+    if party_sync_protects_target(target):
+        report('Party sync: bỏ Ghost nền cắt UID %d (giữ PvP).' % int(target))
+        return
     if direct_action_ended:
         blocked_until = monotonic() + PVP_KEY_INTERVAL
         return
@@ -7385,14 +7741,22 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
         elif direct_skills:
             if (target == direct_target and target not in monsters and target not in (get_npcs() or {})):
                 if background_pk:
-                    if (pvp_armed and pvp_target == target and auto_pk_radius_check(target)[0]
+                    if party_sync_protects_target(target):
+                        # Keep casting party-synced UID — never 7081/B074 cut.
+                        report('Party sync: bỏ cắt nền UID %d · chờ skill tự hết.' % target)
+                        wait_for_background_skill_end(owner, target)
+                    elif (pvp_armed and pvp_target == target and auto_pk_radius_check(target)[0]
                             and auto_pk_can_cut_in_background(client, target)):
                         report('Ghost nền: ngắt UID %d · chờ 7081 và B074.' % target)
                         begin_native_cut(owner, target, auto_background=True)
                     else:
                         wait_for_background_skill_end(owner, target)
                 elif direct_native_exchange:
-                    begin_native_cut(owner, target)
+                    if party_sync_protects_target(target):
+                        report('Party sync: bỏ cắt 7081 UID %d.' % target)
+                        wait_for_background_skill_end(owner, target)
+                    else:
+                        begin_native_cut(owner, target)
                 elif direct_baseline_mode:
                     pause_pvp('ID ĐỐI CHIẾU: hết 8s chưa thấy B074 kết thúc; không gửi skill tiếp, không gửi hủy',cancel_action=False)
                 elif direct_chain_mode:advance_direct_chain(character)
@@ -7409,6 +7773,14 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
 def disconnected():
     global profile_owner
     teleported()
+    # Party follower sync: Stable often fires false disconnect during trace/ks.
+    # Keep Auto PK armed with prefer UID — do not hard-stop.
+    runtime = auto_pk_runtime if auto_pk_running else None
+    if runtime is not None and (runtime.get('party_lock') or runtime.get('party_follow_mode')
+                                or int(runtime.get('party_sync_uid') or 0)):
+        hold_auto_pk('disconnect giả (party sync) · giữ prefer', retry_after=2.0)
+        log('[%s] disconnected: giữ Auto PK party_lock (không tắt).' % NAME)
+        return
     if auto_pk_running:
         stop_auto_pk(reason='mất kết nối game')
     else:

@@ -2,11 +2,11 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
-- v1.0.3: Cần AutoGhost ≥1.8.62. Checkbox vai trò Chủ/Phụ (không combo).
-  HARD Phụ: chỉ đánh UID chủ; chủ F4/dừng Ghost → phụ dừng đánh; chủ >5m →
-  dừng đánh + trace; chủ bỏ target → phụ clear. Lấy tên chủ PT = CharName, job_name.
-  ks→trace + arm F; 7045 sync; Auto PK + tracing OK (không stop_bot).
-- v1.0.2: `ks` → trace + bật AutoGhost Auto PK (nhóm F); sync UID hook + fallback.
+- v1.0.4: Lấy tên chủ PT = CharName thật (không job AG_He) + job_name/*name.
+  Trace dùng CharName. B070 debounce. Không 7045 inject loop — AutoGhost prefer UID.
+  Cần AutoGhost ≥1.8.67.
+- v1.0.3: Checkbox Chủ/Phụ. HARD Phụ UID chủ; >5m → trace; clear/hold.
+- v1.0.2: `ks` → trace + Auto PK F.
 - v1.0.1: Lấy tên mình = name + job_name.
 - v1.0.0: Chat ks / sync B070 + ks#UID. Không ALT.
 """
@@ -45,7 +45,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -81,6 +81,9 @@ state = {
     'last_stop_fight_at': 0.0,
     'last_follow_nudge_at': 0.0,
     'distance_check_at': 0.0,
+    'last_b070_uid': 0,
+    'last_b070_at': 0.0,
+    'last_inject_log_at': 0.0,
 }
 
 QtBind.createLabel(gui, '%s v%s — PT theo chủ' % (NAME, VERSION), 10, 8)
@@ -139,22 +142,48 @@ def config_path():
     return Path(get_config_dir()) / (CONFIG_NAME + '.json')
 
 
+def _strip_job_star(text):
+    """Remove leading job-mode '*' from display names (*AG_BangChu → AG_BangChu)."""
+    text = str(text or '').strip()
+    while text.startswith('*'):
+        text = text[1:].strip()
+    return text
+
+
 def self_name():
     data = get_character_data() or {}
-    return str(data.get('name') or '').strip()
+    # Prefer real character name fields over job display.
+    for key in ('name', 'charname', 'char_name', 'character_name', 'CharName'):
+        val = _strip_job_star(data.get(key) or '')
+        if val:
+            return val
+    return ''
 
 
 def self_job_name():
     data = get_character_data() or {}
-    return str(data.get('job_name') or '').strip()
+    for key in ('job_name', 'jobName', 'job'):
+        val = str(data.get(key) or '').strip()
+        if val:
+            return val
+    # Job-mode: character name field may be "*AG_He" while job_name empty.
+    raw = str(data.get('name') or '').strip()
+    if raw.startswith('*'):
+        return raw
+    return ''
 
 
 def format_leader_display(char_name, job_name):
-    """Bắt buộc CharName, job_name — không nhận chỉ nghề / chỉ tên."""
-    name = str(char_name or '').strip()
+    """Normalize to `CharName, job_name` (accept job-mode *names)."""
+    name = _strip_job_star(char_name)
     job = str(job_name or '').strip()
     if name and job:
         return '%s, %s' % (name, job)
+    if name and not job:
+        # Job-mode fallback: CharName, *CharName so trace gets real char name.
+        return '%s, *%s' % (name, name)
+    if job and not name:
+        return '%s, %s' % (_strip_job_star(job), job if job.startswith('*') else '*%s' % job)
     return ''
 
 
@@ -176,24 +205,21 @@ def parse_leader_identity(text):
         return '', '', ''
     if ',' in raw:
         left, right = raw.split(',', 1)
-        return left.strip(), right.strip(), raw
-    return raw, '', raw
+        return _strip_job_star(left), right.strip(), raw
+    # Single token: treat as CharName (strip *); keep *form as job hint.
+    token = raw.strip()
+    if token.startswith('*'):
+        return _strip_job_star(token), token, raw
+    return token, '', raw
 
 
 def require_full_leader(text, context='Leader'):
-    """Validate/normalize to `CharName, job_name` or raise ValueError."""
+    """Validate/normalize to `CharName, job_name` (job-mode *names OK)."""
     char_name, job_name, _display = parse_leader_identity(text)
     full = format_leader_display(char_name, job_name)
     if full:
         return full
-    if char_name and not job_name:
-        raise ValueError(
-            '%s=%r chỉ có 1 phần — cần `CharName, job_name` (vd ThienHau, AG_He).'
-            % (context, char_name))
-    if job_name and not char_name:
-        raise ValueError(
-            '%s thiếu CharName — cần `CharName, job_name`.' % context)
-    raise ValueError('%s trống — cần `CharName, job_name`.' % context)
+    raise ValueError('%s trống — cần CharName (job-mode *name OK).' % context)
 
 
 def _truthy_flag(value):
@@ -214,9 +240,40 @@ def _member_is_party_master(member):
     return role in ('leader', 'master', 'chu', 'chủ', 'party leader')
 
 
-def _lookup_job_name(char_name, player_id=0):
-    job = ''
-    # get_players near-list (job_name often only here).
+def _member_player_id(member):
+    if not isinstance(member, dict):
+        return 0
+    for key in ('player_id', 'unique_id', 'uid', 'id'):
+        try:
+            pid = int(member.get(key) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            return pid
+    return 0
+
+
+def _is_self_member(member):
+    """True if party member is the local character (avoid picking self as chủ)."""
+    if not isinstance(member, dict):
+        return False
+    pid = _member_player_id(member)
+    if pid and pid == self_player_id():
+        return True
+    name = _strip_job_star(member.get('name') or '').casefold()
+    me = self_name().casefold()
+    me_job = _strip_job_star(self_job_name()).casefold()
+    if name and me and name == me:
+        return True
+    if name and me_job and name == me_job:
+        return True
+    return False
+
+
+def _player_identity_from_near(player_id=0, hint_name=''):
+    """Resolve CharName + job_name from get_players / character (not job-only)."""
+    char_name, job = '', ''
+    hint = _strip_job_star(hint_name).casefold()
     if callable(_get_players):
         try:
             players = _get_players() or {}
@@ -230,23 +287,77 @@ def _lookup_job_name(char_name, player_id=0):
                     pid = int(player.get('player_id') or uid or 0)
                 except (TypeError, ValueError):
                     pid = 0
-                pname = str(player.get('name') or '').strip()
-                if (player_id and pid == player_id) or (
-                        char_name and pname.casefold() == char_name.casefold()):
-                    job = str(player.get('job_name') or player.get('jobName')
-                              or player.get('job') or '').strip()
-                    if job:
-                        return job
-    # Self character fallback.
+                raw_name = str(player.get('name') or '').strip()
+                pname = _strip_job_star(raw_name)
+                match = (player_id and pid == player_id) or (
+                    hint and pname.casefold() == hint)
+                if not match and hint and raw_name.lstrip('*').casefold() == hint:
+                    match = True
+                if not match:
+                    continue
+                # Prefer dedicated char name fields over job display in `name`.
+                for key in ('charname', 'char_name', 'character_name', 'CharName'):
+                    val = _strip_job_star(player.get(key) or '')
+                    if val:
+                        char_name = val
+                        break
+                if not char_name:
+                    # If name has no '*', treat as CharName; if '*', it's job display.
+                    if raw_name.startswith('*'):
+                        char_name = pname  # best guess without real char field
+                    else:
+                        char_name = pname
+                job = str(player.get('job_name') or player.get('jobName')
+                          or player.get('job') or '').strip()
+                if not job and raw_name.startswith('*'):
+                    job = raw_name
+                if char_name:
+                    return char_name, job
     if player_id and player_id == self_player_id():
-        return self_job_name()
-    if char_name and char_name.casefold() == self_name().casefold():
-        return self_job_name()
-    return job
+        return self_name(), self_job_name()
+    if hint and hint == self_name().casefold():
+        return self_name(), self_job_name()
+    return char_name, job
+
+
+def _resolve_member_identity(member):
+    """CharName (real) + job_name/* from party member + near list."""
+    if not isinstance(member, dict):
+        return '', ''
+    player_id = _member_player_id(member)
+    raw_name = str(member.get('name') or '').strip()
+    # Dedicated char fields on party member if present.
+    char_name = ''
+    for key in ('charname', 'char_name', 'character_name', 'CharName'):
+        val = _strip_job_star(member.get(key) or '')
+        if val:
+            char_name = val
+            break
+    job = str(member.get('job_name') or member.get('jobName')
+              or member.get('job') or '').strip()
+    if raw_name.startswith('*') and not job:
+        job = raw_name
+    if not char_name:
+        if raw_name.startswith('*'):
+            char_name = _strip_job_star(raw_name)
+        else:
+            char_name = raw_name
+    near_char, near_job = _player_identity_from_near(player_id, char_name or raw_name)
+    if near_char:
+        # Prefer near CharName when party only had job display.
+        if (not char_name) or (raw_name.startswith('*') and near_char.casefold() != _strip_job_star(raw_name).casefold()):
+            char_name = near_char
+        elif near_char and not raw_name.startswith('*'):
+            char_name = near_char
+        else:
+            char_name = near_char or char_name
+    if near_job and not job:
+        job = near_job
+    return _strip_job_star(char_name), job
 
 
 def party_master_display():
-    """Party master → `CharName, job_name` từ get_party (+ get_players/character)."""
+    """Party master → `CharName, job_name` (CharName thật, không nhầm job AG_He)."""
     party = get_party()
     if not isinstance(party, dict) or not party:
         raise ValueError('Chưa vào party / get_party trống.')
@@ -255,31 +366,40 @@ def party_master_display():
         raise ValueError('Party không có thành viên đọc được.')
     master = None
     for member in members:
-        if _member_is_party_master(member):
+        if _member_is_party_master(member) and not _is_self_member(member):
             master = member
             break
     if master is None:
-        # Một số build: key 0 / partyNumber nhỏ nhất = chủ.
+        for member in members:
+            if _member_is_party_master(member):
+                master = member
+                break
+    if master is None:
+        # Fallback: first non-self by party key order.
         try:
             ordered = sorted(
                 ((int(k) if str(k).isdigit() else 999, v) for k, v in party.items()
                  if isinstance(v, dict)),
                 key=lambda item: item[0])
-            if ordered:
+            for _k, member in ordered:
+                if not _is_self_member(member):
+                    master = member
+                    break
+            if master is None and ordered:
                 master = ordered[0][1]
         except Exception:
-            master = members[0]
+            for member in members:
+                if not _is_self_member(member):
+                    master = member
+                    break
+            if master is None:
+                master = members[0]
     if master is None:
         raise ValueError('Không xác định được chủ PT trong get_party.')
-    char_name = str(master.get('name') or '').strip()
-    try:
-        player_id = int(master.get('player_id') or 0)
-    except (TypeError, ValueError):
-        player_id = 0
-    job = str(master.get('job_name') or master.get('jobName')
-              or master.get('job') or '').strip()
-    if not job:
-        job = _lookup_job_name(char_name, player_id)
+    if _is_self_member(master) and len(members) > 1:
+        raise ValueError(
+            'Chỉ thấy chính mình trong party master — đứng gần chủ / mở PT rồi thử lại.')
+    char_name, job = _resolve_member_identity(master)
     full = format_leader_display(char_name, job)
     if not full:
         raise ValueError(
@@ -290,7 +410,9 @@ def party_master_display():
 
 def identity_tokens(char_name, job_name, display):
     tokens = []
-    for part in (display, char_name, job_name):
+    for part in (display, char_name, job_name,
+                 _strip_job_star(char_name), _strip_job_star(job_name),
+                 ('*' + _strip_job_star(job_name)) if job_name else ''):
         key = str(part or '').strip().casefold()
         if key and key not in tokens:
             tokens.append(key)
@@ -523,6 +645,7 @@ def stop_auto_pk_if_ours(reason):
 
 
 def inject_select(uid, reason):
+    """Prefer AutoGhost direct UID + Ghost. Never 7045 inject storm."""
     try:
         uid = int(uid)
     except (TypeError, ValueError):
@@ -531,41 +654,44 @@ def inject_select(uid, reason):
         return False
     with lock:
         now = monotonic()
-        if uid == state['last_uid'] and (now - state['last_select_at']) < 0.35:
+        # Strong debounce — B070 fires every cast; one prefer per UID/1.5s.
+        if uid == state['last_uid'] and (now - state['last_select_at']) < 1.5:
             return True
         state['last_uid'] = uid
         state['last_select_at'] = now
+        state['fight_held'] = False
+        quiet = (now - state.get('last_inject_log_at', 0)) < 3.0
+        if not quiet:
+            state['last_inject_log_at'] = now
 
-    # Ưu tiên hook AutoGhost (đánh dấu party_sync_uid → không bị chặn 7045).
-    # Giữ trace; không start_bot / stop_bot.
     ghost = find_autoghost()
     if ghost is not None:
         select_hook = getattr(ghost, 'party_sync_select_uid', None)
         if callable(select_hook):
             try:
                 ok = bool(select_hook(uid, source='%s:%s' % (NAME, reason)))
-                set_status('Chọn UID=%d (%s) · AutoGhost hook=%r' % (uid, reason, ok))
-                if ok:
-                    return True
+                if not quiet:
+                    set_status('Prefer UID=%d (%s) · AG hook=%r (no 7045)' % (uid, reason, ok))
+                return True if ok else True  # prefer set path is enough
             except Exception as error:
                 _log('party_sync_select_uid: %s' % error)
-
-    packet = struct.pack('<I', uid & 0xffffffff)
-    ok = inject_joymax(0x7045, packet, False)
-    if ok is False:
-        ok = inject_joymax(0x7045, packet, True)
-    set_status('Chọn UID=%d (%s) · 7045=%r' % (uid, reason, ok))
-    # Nếu Auto PK đang chạy, vẫn giữ prefer_uid qua arm hook.
-    if ok is False and ghost is not None and getattr(ghost, 'auto_pk_running', False):
+        # Fallback: set prefer dict fields without 7045.
         try:
             runtime = getattr(ghost, 'auto_pk_runtime', None)
             if isinstance(runtime, dict):
                 runtime['party_sync_uid'] = uid
+                runtime['party_lock'] = True
+                runtime['party_follow_mode'] = True
                 runtime['requested'] = uid
-                set_status('7045 từ chối · đã gắn prefer UID=%d cho Auto PK retry' % uid)
+                if not quiet:
+                    set_status('Prefer UID=%d gắn runtime (no 7045)' % uid)
+                return True
         except Exception:
             pass
-    return ok is not False
+    # Last resort ONLY if AutoGhost missing — still try once, never loop here.
+    if not quiet:
+        set_status('Không AutoGhost hook · bỏ 7045 loop · UID=%d' % uid)
+    return False
 
 
 def do_follow(reason):
@@ -890,11 +1016,11 @@ def btn_load():
 
 
 def btn_self():
-    me = self_display()
+    name, job = self_name(), self_job_name()
+    me = format_leader_display(name, job)
     if not me:
-        name, job = self_name(), self_job_name()
         set_status(
-            'Chưa đủ name+job_name (name=%r job=%r). Vào game rồi bấm lại.'
+            'Chưa đọc được CharName (name=%r job=%r). Vào game rồi bấm lại.'
             % (name, job))
         return
     QtBind.setText(gui, leader_field, me)
@@ -1039,6 +1165,13 @@ def handle_joymax(opcode, data):
         return True
     if target_uid:
         with lock:
+            now = monotonic()
+            # Debounce B070 spam (mỗi cast của chủ).
+            if (target_uid == state.get('last_b070_uid')
+                    and (now - state.get('last_b070_at', 0)) < 1.2):
+                return True
+            state['last_b070_uid'] = target_uid
+            state['last_b070_at'] = now
             state['fight_held'] = False
         if QtBind.isChecked(gui, arm_box):
             with lock:
@@ -1105,5 +1238,5 @@ def teleported():
     pass
 
 
-log('[%s] Đã nạp v%s. Tick Chủ/Phụ + Lấy tên chủ PT. ks→trace+Auto PK (AG≥1.8.66).'
+log('[%s] Đã nạp v%s. Lấy tên chủ=CharName (không job). Prefer UID no-7045. AG≥1.8.67.'
     % (NAME, VERSION))
