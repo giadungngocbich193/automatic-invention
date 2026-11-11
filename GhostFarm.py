@@ -2,6 +2,11 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.3: Target monster was NativeCut(monster UID) → C→S 7081 + B081 +
+  “Không thấy mục tiêu” / no B074. Fix: inject 0x7045 select monster first,
+  then NativeCut **self UID** (proven interrupt B074). Only Ghost when a
+  living monster/NPC is in radius; Target also requires select. Prefer Self
+  mode for farm interrupt.
 - v1.0.2: When AutoGhost already owns GetTickCount, reuse/adopt its NativeCut
   thunk (same THUNK layout) instead of failing “Không xác minh được đích
   GetTickCount”. close() on adopted hook only arms(0)+CloseHandle (does NOT
@@ -43,10 +48,11 @@ from ctypes import wintypes
 
 import QtBind
 import phBot as phbot_api
-from phBot import get_character_data, get_monsters, get_npcs, get_position, log
+from phBot import (
+    get_character_data, get_monsters, get_npcs, get_position, inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -87,6 +93,7 @@ MAX_RADIUS = 200.0
 SCAN_IDLE_SEC = 0.35
 RESEND_GAP_SEC = 0.75
 NO_TARGET_RETRY_SEC = 1.0
+SELECT_WAIT_SEC = 0.35  # after 7045 before NativeCut self interrupt
 # After GetTickCount / install conflict — do not re-spam NativeCut every 0.75s.
 HOOK_CONFLICT_BACKOFF_SEC = 8.0
 
@@ -146,10 +153,9 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 214)
 
 QtBind.createLabel(
     gui,
-    'Self = NativeCut self UID khi có quái/NPC trong bán kính. '
-    'Target monster = UID quái/NPC gần nhất (ưu tiên 7045). '
-    'v1.0.2: nếu AutoGhost đang giữ GetTickCount → GhostFarm reuse móc đó; '
-    'nếu không reuse được → tắt Ghost/PvP AG hoặc unload AutoGhost.',
+    'Ưu tiên Self: NativeCut self UID (ngắt B074) khi có quái/NPC trong bán kính. '
+    'Target monster: 7045 chọn quái → rồi NativeCut self (không Ghost UID quái — '
+    'tránh B081/Không thấy mục tiêu). AG tick-hook → reuse (v1.0.2).',
     10, 246,
 )
 
@@ -709,25 +715,57 @@ def show_pick(uid, label, kind=''):
         _log_traceback('show_pick TRACE', error)
 
 
-def pick_ghost_target(rows):
-    """Choose NativeCut UID from scan + mode. Returns (uid, label, kind) or None."""
-    mode = current_mode()
+def _pick_monster_row(rows):
+    """Prefer last 7045 selection if still in-range; else nearest living row."""
     if not rows:
         return None
-    if mode == MODE_SELF:
-        uid = read_self_uid()
-        if not uid:
-            return None
-        return uid, 'self', 'self'
-
     with lock:
         selected = int(state.get('selected_uid') or 0)
     if selected:
         for row in rows:
             if row['uid'] == selected:
-                return selected, row['name'], row['kind']
-    nearest = rows[0]
-    return nearest['uid'], nearest['name'], nearest['kind']
+                return row
+    return rows[0]
+
+
+def pick_farm_job(rows):
+    """Build farm job: only when monster/NPC in range. Ghost = always self UID.
+
+    Self: NativeCut(self) interrupt — proven B074.
+    Target monster: inject 7045(monster) first, then NativeCut(self). Never
+    NativeCut(monster UID) — that yields B081 / “Không thấy mục tiêu”.
+    """
+    if not rows:
+        return None
+    self_uid = read_self_uid()
+    if not self_uid:
+        return None
+    monster = _pick_monster_row(rows)
+    if monster is None:
+        return None
+    mode = current_mode()
+    need_select = mode == MODE_TARGET
+    return {
+        'ghost_uid': self_uid,
+        'select_uid': int(monster['uid']) if need_select else 0,
+        'need_select': need_select,
+        'label': 'self' if mode == MODE_SELF else monster['name'],
+        'kind': 'self' if mode == MODE_SELF else monster['kind'],
+        'monster_uid': int(monster['uid']),
+        'monster_name': monster['name'],
+        'mode': mode,
+    }
+
+
+def pick_ghost_target(rows):
+    """UI helper: show what would be Ghosted / selected."""
+    job = pick_farm_job(rows)
+    if not job:
+        return None
+    if job['need_select']:
+        return (job['ghost_uid'], 'self←7045#%d %s' % (
+            job['monster_uid'], _safe_text(job['monster_name'])), 'interrupt')
+    return job['ghost_uid'], 'self (quái gần #%d)' % job['monster_uid'], 'self'
 
 
 def ui_enabled(checked):
@@ -788,9 +826,14 @@ def btn_start():
         state['next_scan_at'] = monotonic()
         state['queue'] = []
         state['active'] = None
+    mode = current_mode()
+    tip = (
+        'NativeCut self khi có quái trong tầm'
+        if mode == MODE_SELF else
+        '7045 chọn quái rồi NativeCut self (không Ghost UID quái)')
     set_status(
-        'START farm · mode=%s · bán kính %gm — NativeCut client_7081'
-        % (current_mode(), read_radius()))
+        'START farm · mode=%s · r=%gm — %s'
+        % (mode, read_radius(), tip))
 
 
 def btn_stop():
@@ -806,39 +849,66 @@ def _pack_uid(uid):
     return struct.pack('<I', int(uid) & 0xffffffff)
 
 
-def queue_native(uid, label, kind='?'):
+def queue_native(farm_job):
+    """Queue NativeCut(self). Optional 7045 select monster first (Target mode)."""
+    if not isinstance(farm_job, dict):
+        set_status('Job farm không hợp lệ.')
+        return False
     try:
-        uid = int(uid)
+        ghost_uid = int(farm_job.get('ghost_uid') or 0)
+        select_uid = int(farm_job.get('select_uid') or 0)
     except (TypeError, ValueError):
         set_status('UID không hợp lệ.')
         return False
-    if not 0 < uid <= 0xffffffff:
-        set_status('UID trống / không hợp lệ.')
+    if not 0 < ghost_uid <= 0xffffffff:
+        set_status('Self UID trống / không hợp lệ.')
         return False
+    need_select = bool(farm_job.get('need_select')) and select_uid > 0
+    label = _safe_text(farm_job.get('label') or 'self')
+    kind = _safe_text(farm_job.get('kind') or '?')
     job = {
-        'uid': uid,
+        'uid': ghost_uid,  # NativeCut / 7081 UID = self (proven B074)
+        'select_uid': select_uid if need_select else 0,
+        'need_select': need_select,
+        'monster_uid': int(farm_job.get('monster_uid') or select_uid or 0),
         'label': label,
         'kind': kind,
+        'mode': farm_job.get('mode') or current_mode(),
         'times': 1,
         'done': 0,
-        'phase': 'ensure',
+        'phase': 'select' if need_select else 'ensure',
         'verify_deadline': 0.0,
         'send_deadline': 0.0,
+        'select_deadline': 0.0,
+        'select_sent': False,
+        'select_observed': False,
         'next_at': monotonic(),
         'observed': False,
         'bridge_done': False,
         'b074': '',
         'ok_any': False,
-        'hex': _hex_bytes(_pack_uid(uid)),
+        'hex': _hex_bytes(_pack_uid(ghost_uid)),
         'error': '',
     }
     with lock:
         state['queue'] = [job]
         state['active'] = job
-    show_pick(uid, label, kind)
-    set_status(
-        'Xếp NativeCut %s UID=%d [%s] · arm(2) event_loop'
-        % (_safe_text(label), uid, _safe_text(kind)))
+    if need_select:
+        show_pick(
+            ghost_uid,
+            'self←7045#%d %s' % (select_uid, label),
+            'interrupt')
+        set_status(
+            'Xếp 7045#%d rồi NativeCut self=%d · mode=Target'
+            % (select_uid, ghost_uid))
+    else:
+        show_pick(
+            ghost_uid,
+            'self (quái #%d trong tầm)' % int(farm_job.get('monster_uid') or 0),
+            'self')
+        set_status(
+            'Xếp NativeCut self=%d · quái gần #%d · mode=Self'
+            % (ghost_uid, int(farm_job.get('monster_uid') or 0)))
     return True
 
 
@@ -919,7 +989,64 @@ def _drive_native_queue(now):
     uid = int(job['uid'])
 
     try:
+        if phase == 'select':
+            select_uid = int(job.get('select_uid') or 0)
+            if select_uid <= 0:
+                job['phase'] = 'ensure'
+                job['next_at'] = now
+                return
+            # Still require monster in radius before select+Ghost.
+            rows = scan_nearby(read_radius())
+            if not any(row['uid'] == select_uid for row in rows):
+                raise ValueError(
+                    'quái/NPC UID=%d không còn trong bán kính — bỏ Ghost.'
+                    % select_uid)
+            packet = _pack_uid(select_uid)
+            try:
+                api = inject_joymax(0x7045, packet, False)
+            except Exception as error:
+                raise RuntimeError('lỗi inject 7045: %s' % error)
+            _log(
+                'C→S 0x7045 select monster UID=%d hex=%s | encrypted=False | API=%r'
+                % (select_uid, _hex_bytes(packet), api))
+            if api is False:
+                raise RuntimeError(
+                    'phBot từ chối 7045 chọn UID=%d — không Ghost.' % select_uid)
+            with lock:
+                state['selected_uid'] = select_uid
+            job['select_sent'] = True
+            job['select_observed'] = False
+            job['phase'] = 'select_wait'
+            job['select_deadline'] = now + SELECT_WAIT_SEC
+            job['next_at'] = now + 0.05
+            set_status(
+                'Đã 7045 chọn quái #%d · chờ rồi NativeCut self=%d'
+                % (select_uid, uid))
+            return
+
+        if phase == 'select_wait':
+            select_uid = int(job.get('select_uid') or 0)
+            if (job.get('select_observed')
+                    or now >= float(job.get('select_deadline') or 0)):
+                _log(
+                    '7045 select UID=%d · observed=%s → NativeCut self=%d'
+                    % (select_uid, bool(job.get('select_observed')), uid))
+                job['phase'] = 'ensure'
+                job['next_at'] = now
+                return
+            job['next_at'] = now + 0.05
+            return
+
         if phase == 'ensure':
+            # Gate: only Ghost while a living monster/NPC remains in radius.
+            rows = scan_nearby(read_radius())
+            if not rows:
+                raise ValueError('không còn quái/NPC trong bán kính — bỏ Ghost.')
+            if job.get('need_select'):
+                select_uid = int(job.get('select_uid') or 0)
+                if select_uid and not any(row['uid'] == select_uid for row in rows):
+                    raise ValueError(
+                        'quái đã chọn UID=%d ra khỏi tầm — bỏ Ghost.' % select_uid)
             session = get_or_create_session(uid)
             if session['verified']:
                 job['phase'] = 'arm'
@@ -1033,17 +1160,16 @@ def _farm_scan_tick(now):
     radius = read_radius()
     rows = scan_nearby(radius)
     show_nearby(rows)
-    pick = pick_ghost_target(rows)
-    if not pick:
+    farm_job = pick_farm_job(rows)
+    if not farm_job:
         with lock:
             state['next_scan_at'] = now + NO_TARGET_RETRY_SEC
         show_pick(0, '', '')
         set_status(
-            'Farm đang chạy — chưa thấy quái/NPC trong %gm (mode=%s).'
+            'Farm đang chạy — cần quái/NPC trong %gm + Self UID (mode=%s).'
             % (radius, current_mode()))
         return
-    uid, label, kind = pick
-    queue_native(uid, _safe_text(label), _safe_text(kind))
+    queue_native(farm_job)
 
 
 def event_loop():
@@ -1085,7 +1211,7 @@ def event_loop():
 
 
 def handle_silkroad(opcode, data):
-    """Observe C→S: 7045 target + NativeCut-emitted 0x7081."""
+    """Observe C→S: 7045 select + NativeCut-emitted 0x7081 (self)."""
     raw = bytes(data or b'')
     if opcode == 0x7045 and len(raw) >= 4:
         uid = struct.unpack_from('<I', raw, 0)[0]
@@ -1094,8 +1220,13 @@ def handle_silkroad(opcode, data):
             if not self_uid or uid != self_uid:
                 with lock:
                     state['selected_uid'] = uid
+                    job = state.get('active')
+                    if (job is not None
+                            and job.get('phase') in ('select', 'select_wait')
+                            and int(job.get('select_uid') or 0) == uid):
+                        job['select_observed'] = True
                 if plugin_enabled():
-                    _log('Quan sát C→S 0x7045 chọn UID=%d (ưu tiên Target monster).' % uid)
+                    _log('Quan sát C→S 0x7045 chọn UID=%d (monster select).' % uid)
         return
 
     if opcode != 0x7081 or len(raw) != 4:
@@ -1111,11 +1242,11 @@ def handle_silkroad(opcode, data):
     if expect and uid == expect and job is not None and job.get('phase') == 'wait':
         job['observed'] = True
         _log(
-            'C→S 0x7081 OBSERVED (NativeCut) UID=%d hex=%s · transport=client_7081'
+            'C→S 0x7081 OBSERVED (NativeCut self) UID=%d hex=%s · transport=client_7081'
             % (uid, hex_out))
     elif watching:
         _log(
-            'C→S 0x7081 (khác/đồng thời) UID=%d hex=%s · expect=%d'
+            'C→S 0x7081 (khác/đồng thời) UID=%d hex=%s · expect self=%d'
             % (uid, hex_out, expect))
 
 
@@ -1163,7 +1294,7 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — bật → chọn Self/Target → Start farm (NativeCut, không inject).'
+        'Nạp %s v%s — ưu tiên Self; Target=7045 rồi NativeCut self.'
         % (NAME, VERSION))
 except Exception as error:
     try:
