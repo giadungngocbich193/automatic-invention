@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX prefer immediate cast v1.8.74] Prefer → lock+7074 Ghost F ngay (<1s);
+  không 7081 cut trước skill đầu; không re-log same UID; PL Prefer debounce ≥2s.
 - [FIX party prefer cast v1.8.73] prefer: range/move trước cast; 7081/B074 cut
   trước skill; full F-group all-B074 → pause 2.5s + retry interrupt+range;
   không 7045 DC; debounce B074 log.
@@ -52,12 +54,14 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.73'
+VERSION = '1.8.74'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + party prefer cast: range + 7081 cut + all-B074 pause
+# baseline 2600 + prefer immediate Ghost cast (no pre-cut / no Prefer spam log)
 PARTY_PREFER_B074_BACKOFF = 1.5
 PARTY_PREFER_ALL_B074_PAUSE = 2.5
 PARTY_PREFER_B074_LOG_INTERVAL = 3.0
+PARTY_PREFER_RESELECT_DEBOUNCE = 2.0
+PARTY_PREFER_LOG_INTERVAL = 60.0
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -2948,14 +2952,21 @@ def rotate_direct(character, gate_checked=False):
             pause_until = float(auto_pk_runtime.get('party_all_b074_pause_until') or 0)
             if now < pause_until:
                 return
-            # Same range/move gate as solo Auto PK (no long-range 7074 spam).
-            if not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
-                return
-            # After all-B074 or refuse: one Ghost 7081/B074 cut before next skill.
-            if (auto_pk_runtime.pop('party_all_b074_need_prep', None)
-                    or auto_pk_runtime.pop('party_need_cut', None)):
-                if party_prefer_prepare_cast(auto_pk_runtime, direct_target, now):
+            # First prefer cast: fire 7074 immediately (solo post-B045 path) —
+            # NEVER 7081-cut before skill #1 (that caused 90s Prefer spam / zero hits).
+            first_prefer_cast = not bool(auto_pk_runtime.get('first_cast_sent'))
+            if not first_prefer_cast:
+                if not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
                     return
+                # After B074 / full-group refuse: cut before NEXT skill only.
+                if (auto_pk_runtime.pop('party_all_b074_need_prep', None)
+                        or auto_pk_runtime.pop('party_need_cut', None)):
+                    if party_prefer_prepare_cast(auto_pk_runtime, direct_target, now):
+                        return
+            else:
+                # Drop stale cut flag so first packet is not blocked.
+                auto_pk_runtime.pop('party_need_cut', None)
+                auto_pk_runtime.pop('party_all_b074_need_prep', None)
         elif not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
             return
     skill_id = direct_skills[direct_index]
@@ -5255,9 +5266,8 @@ def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
 def party_sync_select_uid(uid, source='PartyLeader'):
     """Party prefer: lock UID + immediately cast Ghost F skills. NO 7045.
 
-    Never skill_probe / never retire this UID. B070 miss → soft-wait + retry.
-    If Auto PK was F4-stopped, re-arm first then prefer (no UI click needed).
-    After B074: ignore Prefer same UID for ≥PARTY_PREFER_B074_BACKOFF if armed.
+    First Prefer: soft-lock + 7074 Ghost F ngay (solo post-B045 path) — no
+    7081 cut before skill #1. Same UID re-Prefer: quiet debounce, no re-log.
     """
     global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
     global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
@@ -5275,7 +5285,7 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         return bool(party_sync_arm_auto_pk(page=page, prefer_uid=uid, source=source))
     now = monotonic()
     page = None
-    already = False
+    quiet_reselect = False
     with pvp_lock:
         runtime = auto_pk_runtime if auto_pk_running else None
         if runtime is None:
@@ -5290,10 +5300,17 @@ def party_sync_select_uid(uid, source='PartyLeader'):
             return True
         last_at = float(runtime.get('party_sync_select_at') or 0)
         last_uid = int(runtime.get('party_sync_select_uid_last') or 0)
-        if (uid == last_uid and (now - last_at) < 0.35
-                and (pvp_target == uid or direct_target == uid)
-                and pvp_armed and not pvp_paused):
-            already = True
+        # Same UID already locked/armed → quiet keep-alive (no re-log / no reset).
+        # Still fall through if skill #1 never left (first_cast_sent False).
+        if armed_same and uid == last_uid:
+            quiet_reselect = True
+            if ((now - last_at) < PARTY_PREFER_RESELECT_DEBOUNCE
+                    and (runtime.get('first_cast_sent') or direct_expected is not None)):
+                return True
+            if runtime.get('first_cast_sent') or direct_expected is not None:
+                runtime['party_sync_select_at'] = now
+                return True
+            # first cast still pending → fall through to cast immediately
         # Prefer lock — clear any prior retire so Auto PK never skips this UID.
         try:
             runtime['retired'].pop(uid, None)
@@ -5316,10 +5333,15 @@ def party_sync_select_uid(uid, source='PartyLeader'):
         runtime['select_until'] = now + 30.0
         # Locked prefer fight — NOT disposable skill_probe (probe releases on B070 miss).
         runtime['skill_probe_uid'] = 0
-        if not already:
+        # Only reset first_cast on NEW prefer UID — never on same-UID spam.
+        if last_uid != uid:
             runtime['first_cast_sent'] = False
+            runtime.pop('approach', None)
+            runtime.setdefault('party_b074_skills', set()).clear()
+            # Do NOT set party_need_cut here — that blocked skill #1 for ~90s.
+            runtime.pop('party_need_cut', None)
+            runtime.pop('party_all_b074_need_prep', None)
         runtime.pop('missing_since', None)
-        runtime.pop('approach', None)
         runtime.pop('target_outside', None)
         auto_pk_returning = False
         runtime.pop('withdraw', None)
@@ -5357,41 +5379,35 @@ def party_sync_select_uid(uid, source='PartyLeader'):
                         use_skill_group(page, runtime=True)
                     except Exception:
                         pass
-    # Soft-lock like solo Auto PK after B045 — no 7045 player inject (DC).
-    # Cast only when in range; otherwise approach (same pipeline as solo).
+    # Soft-lock like solo Auto PK after B045 — cast Ghost F immediately (no 7045).
     casted = False
-    approached = False
     try:
         waiting = (direct_expected is not None and direct_expected[1] == uid)
-        with pvp_lock:
-            runtime = auto_pk_runtime
-            if isinstance(runtime, dict) and need_arm:
-                runtime['party_need_cut'] = True
-                runtime.setdefault('party_b074_skills', set()).clear()
         if (pvp_armed and direct_skills and direct_target == uid and not pvp_paused
                 and not waiting and auto_pk_runtime is not None):
-            if auto_pk_ready_to_cast(auto_pk_runtime, uid, now):
-                character = get_character_data() or {}
-                rotate_direct(character, gate_checked=True)
-                casted = True
-            else:
-                approached = True
+            before = direct_expected
+            character = get_character_data() or {}
+            rotate_direct(character, gate_checked=True)
+            # True cast = skill packet armed (direct_expected changed).
+            casted = (direct_expected is not None and direct_expected != before)
     except Exception as error:
         log('[%s] party_sync prefer cast: %s' % (NAME, error))
     with pvp_lock:
         runtime = auto_pk_runtime
         log_at = float((runtime or {}).get('party_sync_log_at') or 0)
         log_uid = int((runtime or {}).get('party_sync_log_uid') or 0)
-        should_log = not (uid == log_uid and (now - log_at) < 5.0)
+        # Same UID: log at most once / 60s (stop 3s Prefer spam).
+        should_log = not quiet_reselect and not (
+            uid == log_uid and (now - log_at) < PARTY_PREFER_LOG_INTERVAL)
         if runtime is not None and should_log:
             runtime['party_sync_log_at'] = now
             runtime['party_sync_log_uid'] = uid
     if casted:
         state = 'Ghost F cast'
-    elif approached:
-        state = 'áp sát rồi cast'
+    elif (auto_pk_runtime or {}).get('first_cast_sent'):
+        state = 'đang đánh'
     else:
-        state = 'armed'
+        state = 'armed → cast'
     msg = 'Party prefer UID %d · %s · src=%s' % (uid, state, source)
     QtBind.setText(gui, auto_pk_status_label, msg)
     if should_log:

@@ -2,6 +2,7 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
+- v1.0.12: Prefer same UID debounce ≥2.0s (stop 3s Prefer re-log storm).
 - v1.0.11: Prefer backoff ≥1.5s after AG B074 refuse same UID (stop re-arm spam).
 - v1.0.10: Trace AG_He/*AG_He hard-allow; >10m clear prefer+chase; persist
   restore on load/joined/deferred; label “tên Leader cần theo”; AG≥1.8.70.
@@ -52,7 +53,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.11'
+VERSION = '1.0.12'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -821,8 +822,8 @@ def inject_select(uid, reason):
         return False
     with lock:
         now = monotonic()
-        # Strong debounce — B070 fires every cast; one prefer per UID/1.5s.
-        if uid == state['last_uid'] and (now - state['last_select_at']) < 1.5:
+        # Strong debounce — same Prefer UID at most once / 2.0s (stop 3s log storm).
+        if uid == state['last_uid'] and (now - state['last_select_at']) < 2.0:
             return True
         # AG reported B074 refuse → back off Prefer spam for that UID.
         if (uid == int(state.get('refuse_uid') or 0)
@@ -831,7 +832,7 @@ def inject_select(uid, reason):
         state['last_uid'] = uid
         state['last_select_at'] = now
         state['fight_held'] = False
-        quiet = (now - state.get('last_inject_log_at', 0)) < 3.0
+        quiet = (now - state.get('last_inject_log_at', 0)) < 5.0
         if not quiet:
             state['last_inject_log_at'] = now
 
