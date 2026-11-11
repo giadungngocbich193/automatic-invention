@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Ghost PvP và Boss nền theo ID cho phBot Stable."""
+"""Ghost PvP và Boss nền theo ID cho phBot Stable.
+
+Changelog (verify in Log / file header):
+- [FIX widen scan 60m] Player early-scan uses Vùng quét (default 60m), not only
+  Vùng đánh (~30–40m). Status reports scan-ring enemies before attack range.
+- [FIX never abort PvP in attack range] Keep casting while engaged player still
+  in vùng đánh; refuse camp return; hold/coord flicker must not quay về mid-fight.
+- [FIX no player 7045] Auto PK player engage prefers Target Enemy key — does not
+  inject player 0x7045 (mob farm select unchanged).
+"""
 
 import ctypes
 import hashlib
@@ -22,9 +31,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.57'
-# raw-main download stamp: 2026-11-11T01:45Z (UTF-8 no BOM/U+200B)
-# [FIX never abort PvP in attack range] refuse camp return while engaged player still in vùng đánh
+VERSION = '1.8.58'
+# raw-main download stamp: 2026-11-11T06:05Z (UTF-8 no BOM/U+200B)
+# [FIX widen scan 60m] + [FIX never abort PvP in attack range] + [FIX no player 7045]
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -3534,10 +3543,10 @@ def scan_auto_pk_evidence(runtime=None):
                      ('trong vùng đánh' if row['in_attack_range'] else 'chỉ báo'))) if row else ''
             QtBind.setText(gui, field, text)
         outside = sum(not row['in_attack_range'] for row in rows)
-        message = ('Quét %g m · %d người · %d ngoài vùng đánh.' %
-                   (scan_radius, len(rows), outside))
+        message = ('[FIX widen scan 60m] Quét %g m · vùng đánh %g m · %d người · %d ngoài vùng đánh.' %
+                   (scan_radius, radius, len(rows), outside))
         if not players:
-            message += ' Chưa có UID từ phBot.'
+            message += ' Chưa có UID từ phBot (giới hạn client/get_players).'
         elif rows:
             # Early report: list nearby players ASAP so Target can engage when they enter.
             nearest = rows[0]
@@ -3700,9 +3709,9 @@ def auto_pk_distance(target, anchor):
 
 
 def auto_pk_target_distance(target, center, runtime):
-    if runtime is not None and runtime.get('fast_scan'):
-        return auto_pk_scan_distance(target, center)
-    return auto_pk_distance(target, center)
+    # [FIX widen scan 60m] Always allow adjacent world-sector neighbours for
+    # Auto PK player distance (was gated behind fast_scan → missed ~40–60m).
+    return auto_pk_scan_distance(target, center)
 
 
 def auto_pk_player_attack_range(uid, runtime=None):
@@ -4239,7 +4248,13 @@ def auto_pk_select(character, runtime, now, from_event=False):
                            + (' · Đánh quái đang bật.' if farming else '.'))
         return
     runtime['retired'] = {uid: until for uid, until in runtime['retired'].items() if until > now}
-    best = None
+    # [FIX widen scan 60m] Detect in Vùng quét; Ghost-lock only in Vùng đánh.
+    attack_radius = float(runtime['radius'])
+    scan_radius = float(runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
+    if scan_radius < attack_radius:
+        scan_radius = attack_radius
+    best_attack = None
+    best_scan = None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
     for raw_uid, target in players.items():
         try:
@@ -4253,66 +4268,73 @@ def auto_pk_select(character, runtime, now, from_event=False):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
             continue
-        anchor_distance = auto_pk_target_distance(target, anchor, runtime)
-        if anchor_distance is None or anchor_distance > runtime['radius']:
+        anchor_distance = auto_pk_scan_distance(target, anchor)
+        if anchor_distance is None or anchor_distance > scan_radius:
             continue
-        candidate = (auto_pk_target_distance(target, origin, runtime), uid)
-        if best is None or candidate < best:
-            best = candidate
-    if best is None:
+        self_distance = auto_pk_scan_distance(target, origin)
+        if self_distance is None:
+            self_distance = anchor_distance
+        candidate = (self_distance, uid, anchor_distance)
+        if anchor_distance <= attack_radius:
+            if best_attack is None or candidate < best_attack:
+                best_attack = candidate
+        elif best_scan is None or candidate < best_scan:
+            best_scan = candidate
+    if best_attack is None and best_scan is not None:
+        # Early ring: enemy visible in scan, not yet in attack — ready Target only.
+        stop_auto_pk_patrol(runtime)
+        distance, uid, anchor_distance = best_scan
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX widen scan 60m] Địch UID %d trong vùng quét %.0f m (cách điểm chờ %.1f m) · '
+                       'sẵn sàng Target khi vào vùng đánh %.0f m.'
+                       % (uid, scan_radius, anchor_distance, attack_radius))
+        if auto_pk_try_native_enemy_key(runtime, client, now, 'địch trong vùng quét'):
+            return
+        return
+    if best_attack is None:
         # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
         if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        # Opponent hunt: API/Target path only (separate from farm).
+        # Opponent hunt: Target path only (separate from farm).
         if auto_pk_try_native_enemy_key(runtime, client, now, 'không thấy UID trong Player list'):
             return
         if not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chờ địch · quét nhanh gần điểm chờ.' %
-                           runtime['radius'])
+                           'Đang canh đánh %.0f m · quét %.0f m · chờ địch.'
+                           % (attack_radius, scan_radius))
         return
-    # Opponent in attack radius → drop mob (if any) and Ghost via API/Target.
+    # Opponent in attack radius → drop mob (if any) and Ghost via Target (no player 7045).
     auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
-    distance, uid = best
+    distance, uid, anchor_distance = best_attack
     failed_pid, until = runtime.get('fast_select_fallback', (None, 0))
     prefer_direct = (runtime.get('fast_scan') and auto_pk_in_background(client)
                      and failed_pid == client.get('pid') and now < until)
     if (native_expired or prefer_direct) and start_auto_pk_skill_probe(runtime, uid):
         return
+    # [FIX no player 7045] Prefer configured Target Enemy; never inject player select.
     sent_at = monotonic()
-    runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
-                   target_seen_at=now, target_sent_at=sent_at)
-    pvp_selection_request = direct_select_request = uid
-    accepted = inject_joymax(0x7045, struct.pack('<I', uid), False)
-    if auto_pk_runtime is not runtime or runtime['requested'] != uid:
-        return  # A synchronous reply already handled this request.
-    if accepted is not False:
-        QtBind.setText(gui, auto_pk_status_label, 'Thử chọn UID %d · cách nhân vật %.1f m.' % (uid, distance))
+    runtime.update(target_seen_at=now, target_sent_at=sent_at)
+    if auto_pk_try_native_enemy_key(runtime, client, now, 'địch trong vùng đánh'):
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX no player 7045] Target Enemy · UID gần nhất %d · cách %.1f m.'
+                       % (uid, distance))
         return
-    runtime.update(requested=0, select_until=0.0)
-    pvp_selection_request = direct_select_request = 0
-    if not from_event:
-        runtime['select_in_event'] = True
-        QtBind.setText(gui, auto_pk_status_label, 'Đợi callback phBot gửi lại UID %d.' % uid)
-        return
-
     if auto_pk_in_background(client) and start_auto_pk_skill_probe(runtime, uid):
         if runtime.get('fast_scan') and client.get('pid'):
             runtime['fast_select_fallback'] = (client['pid'], sent_at + 5.0)
-        return
-    if auto_pk_try_native_enemy_key(runtime, client, monotonic(), 'API từ chối 7045'):
         return
     if start_auto_pk_skill_probe(runtime, uid):
         return
     runtime['retired'][uid] = sent_at + AUTO_PK_TARGET_RETRY_DELAY
     key = runtime.get('native_key', 0)
-    message = ('phBot từ chối 7045 · chưa gửi được phím Target Enemy.'
-               if key else 'phBot từ chối 7045 · thử gán Target Enemy bằng Home, End hoặc Insert.')
+    message = ('[FIX no player 7045] Chưa gửi được Target Enemy · gán Home/End/Insert.'
+               if not key else
+               '[FIX no player 7045] Target Enemy từ chối · thử lại UID %d.' % uid)
     QtBind.setText(gui, auto_pk_status_label, message)
     if sent_at >= runtime.get('select_error_at', 0):
         runtime['select_error_at'] = sent_at + 5.0
-        log('[%s] Auto PK UID %d: API trả False cho 7045 trong event_loop. %s' % (NAME, uid, message))
+        log('[%s] Auto PK: %s' % (NAME, message))
 
 
 def start_auto_pk_skill_probe(runtime, uid):
@@ -4438,7 +4460,9 @@ def request_auto_pk_arm():
             auto_pk_returning = False
         show_auto_pk_anchor()
         farm_on = bool(options.get('mob_farm'))
-        message = 'Đã bật canh %.0f m · nhóm %s · quét nhanh · buff khi rảnh.' % (radius, page)
+        scan_m = float(options.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
+        message = ('[FIX widen scan 60m] Đã bật vùng đánh %.0f m · vùng quét %.0f m · nhóm %s · '
+                   'buff khi rảnh.' % (radius, scan_m, page))
         message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
         if options.get('buffs_enabled') and options.get('buff_ids'):
             message += ' Đang gửi Skill buff…'
@@ -4476,7 +4500,16 @@ def stop_auto_pk(reason=None):
 def hold_auto_pk(reason, retry_after=0.0):
     global auto_pk_returning
     runtime = auto_pk_runtime
+    if runtime is None:
+        return
     if runtime.get('hold_reason') == reason:
+        return
+    engaged = int(pvp_target or 0) or int(direct_target or 0)
+    # [FIX never abort PvP in attack range] Coord flicker / wait must not quay về mid-fight.
+    if engaged and ('tọa độ' in reason or 'client hoặc dữ liệu' in reason):
+        report('[FIX never abort PvP in attack range] bỏ hold mid-fight · UID %d · %s'
+               % (engaged, reason))
+        runtime.update(hold_reason=reason, hold_until=monotonic() + max(retry_after, 0.15))
         return
     auto_pk_returning = True
     pause_pvp('Auto PK chờ: ' + reason, clear_target=True, cancel_action=False, notify=False)
@@ -4484,7 +4517,7 @@ def hold_auto_pk(reason, retry_after=0.0):
     runtime.pop('return_progress', None)
     runtime.pop('patrol_destination', None)
     runtime.update(hold_reason=reason, hold_until=monotonic() + retry_after, move_at=0.0)
-    message = 'Auto PK đang chờ: ' + reason + ' · sẽ tự canh lại.'
+    message = '[FIX never abort PvP in attack range] Auto PK đang chờ: ' + reason + ' · sẽ tự canh lại.'
     QtBind.setText(gui, auto_pk_status_label, message)
     report_error(message)
 
@@ -4551,13 +4584,16 @@ def tick_auto_pk(from_event=False):
         runtime['scan_at'] = now + interval
     position = get_position() or {}
     distance = auto_pk_distance(position, runtime['anchor']) if 'region' in position else None
+    engaged_uid = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
     if distance is None:
+        # [FIX never abort PvP in attack range] Keep engaged cast if coords flicker.
+        if engaged_uid and (pvp_armed or pvp_activation is not None):
+            return True
         hold_auto_pk('chưa có tọa độ hợp lệ trong vùng điểm chờ')
         return False
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
-        engaged_uid = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
         # [FIX never abort PvP in attack range] Idle wander only. Engaged player → never camp return here.
         if distance > runtime['radius'] and not engaged_uid:
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
