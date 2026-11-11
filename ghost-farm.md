@@ -37,4 +37,4 @@ Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 ## jsDelivr
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@<commit>/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@f1d9118b8c8690e6e0374a07239a3901297285a9/GhostFarm.py`
