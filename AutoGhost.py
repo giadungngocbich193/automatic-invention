@@ -3948,7 +3948,8 @@ def auto_pk_select(character, runtime, now, from_event=False):
                   runtime.get('buff_cast_until', 0))
             or (runtime.get('select_in_event') and not from_event)):
         return
-    runtime.pop('native_probe_until', None)  # expire quietly — no repeating Log spam
+    # Expire Target probe quietly (no Log spam); keep flag for skill-probe fallback.
+    native_expired = bool(runtime.pop('native_probe_until', 0))
     runtime.pop('select_in_event', None)
     if runtime['requested']:
         runtime['retired'][runtime['requested']] = now + AUTO_PK_TARGET_RETRY_DELAY
