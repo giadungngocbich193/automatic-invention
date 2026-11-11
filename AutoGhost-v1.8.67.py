@@ -3,7 +3,7 @@
 
 Changelog (verify in Log / file header):
 - [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
-  HARD never Auto PK own party (*name match). Guild/Liên minh filters.
+  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm. PL follow 10m + F4→trace.
   No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
 - [FIX no B070 hard-stop v1.8.66] Baseline AutoGhost_2600. pause_pvp chặn mọi
   “chưa có B070 khớp / sau N lần thử lại” → soft-wait; không “Auto Ghost dừng”.
@@ -7770,16 +7770,52 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
             blocked_until = monotonic() + PVP_KEY_INTERVAL
 
 
+def _party_leader_wants_keep_pk():
+    """True when PartyLeader Phụ+arm is active — disconnect must not kill Auto PK."""
+    try:
+        for module in list(sys.modules.values()):
+            try:
+                if getattr(module, 'NAME', None) != 'PartyLeader':
+                    continue
+            except Exception:
+                continue
+            gui_ref = getattr(module, 'gui', None)
+            enabled = getattr(module, 'enabled_box', None)
+            arm = getattr(module, 'arm_box', None)
+            role_fn = getattr(module, 'role_index', None)
+            role_follower = getattr(module, 'ROLE_FOLLOWER', 0)
+            if gui_ref is None or enabled is None:
+                return False
+            if not QtBind.isChecked(gui_ref, enabled):
+                return False
+            if callable(role_fn) and int(role_fn()) != int(role_follower):
+                return False
+            if arm is not None and not QtBind.isChecked(gui_ref, arm):
+                # Still keep if already party_lock / following via runtime
+                return False
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def disconnected():
     global profile_owner
     teleported()
-    # Party follower sync: Stable often fires false disconnect during trace/ks.
-    # Keep Auto PK armed with prefer UID — do not hard-stop.
+    # Party follower sync / Phụ arm: Stable often fires false disconnect during
+    # enable/ks/trace. Keep Auto PK armed — do not hard-stop.
     runtime = auto_pk_runtime if auto_pk_running else None
+    keep = False
     if runtime is not None and (runtime.get('party_lock') or runtime.get('party_follow_mode')
                                 or int(runtime.get('party_sync_uid') or 0)):
+        keep = True
+    elif auto_pk_running and _party_leader_wants_keep_pk():
+        keep = True
+        if runtime is not None:
+            runtime['party_follow_mode'] = True
+    if keep:
         hold_auto_pk('disconnect giả (party sync) · giữ prefer', retry_after=2.0)
-        log('[%s] disconnected: giữ Auto PK party_lock (không tắt).' % NAME)
+        log('[%s] disconnected: giữ Auto PK (party Phụ) — không tắt.' % NAME)
         return
     if auto_pk_running:
         stop_auto_pk(reason='mất kết nối game')

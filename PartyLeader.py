@@ -2,9 +2,9 @@
 """PartyLeader — PT theo chủ (phBot Stable).
 
 Changelog:
-- v1.0.4: Lấy tên chủ PT = CharName thật (không job AG_He) + job_name/*name.
-  Trace dùng CharName. B070 debounce. Không 7045 inject loop — AutoGhost prefer UID.
-  Cần AutoGhost ≥1.8.67.
+- v1.0.5: Follow threshold **10m**; grace sau Bật/ks; trace CharName (`name, *job`);
+  chủ F4 → phụ stop + trace ngay; không clear storm lúc bật Phụ; không tắt Auto PK.
+- v1.0.4: Lấy tên chủ PT CharName + prefer UID no-7045. AG≥1.8.67.
 - v1.0.3: Checkbox Chủ/Phụ. HARD Phụ UID chủ; >5m → trace; clear/hold.
 - v1.0.2: `ks` → trace + Auto PK F.
 - v1.0.1: Lấy tên mình = name + job_name.
@@ -45,7 +45,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyLeader'
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 CONFIG_NAME = 'PartyLeader'
 
 CMD_FOLLOW = ('ks',)
@@ -57,8 +57,10 @@ ROLE_FOLLOWER = 0
 ROLE_LEADER = 1
 # Nhóm Ghost / Auto PK trên phụ (khớp AutoGhost PVP_EDIT_PAGES)
 GHOST_PAGES = ('F1', 'F2', 'F3')
-# HARD: phụ dừng đánh + trace khi chủ xa hơn khoảng này (mét).
-LEADER_FOLLOW_DISTANCE = 5.0
+# HARD: phụ dừng đánh + trace khi chủ xa hơn khoảng này (mét) — mặc định 10.
+LEADER_FOLLOW_DISTANCE = 10.0
+# Sau Bật plugin / ks / arm: chưa áp khoảng cách (tránh clear storm lúc enable Phụ).
+FOLLOW_DISTANCE_GRACE = 12.0
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
 lock = RLock()
@@ -84,6 +86,7 @@ state = {
     'last_b070_uid': 0,
     'last_b070_at': 0.0,
     'last_inject_log_at': 0.0,
+    'follow_grace_until': 0.0,
 }
 
 QtBind.createLabel(gui, '%s v%s — PT theo chủ' % (NAME, VERSION), 10, 8)
@@ -116,7 +119,7 @@ status_label = QtBind.createLabel(gui, 'Trạng thái: chờ bật.', 10, 184)
 QtBind.createLabel(
     gui,
     'ks = phụ trace + Auto PK · ks off = dừng. Chủ chọn/đánh → phụ cùng UID.\n'
-    'HARD Phụ: chỉ UID chủ · chủ F4/dừng → phụ dừng đánh · chủ >5m → trace · chủ bỏ target → clear.\n'
+    'HARD Phụ: chỉ UID chủ · chủ F4/dừng → phụ dừng đánh · chủ >10m → trace · chủ bỏ target → clear.\n'
     'Phụ: tick Phụ + Lấy tên chủ PT + F + Lưu. Chủ: tick Chủ + Lấy tên mình / chat ks.',
     10, 214,
 )
@@ -432,6 +435,8 @@ def set_role(index, from_ui=False):
     QtBind.setChecked(gui, role_follower_box, index == ROLE_FOLLOWER)
     with lock:
         state['role'] = index
+    if index == ROLE_FOLLOWER:
+        mark_follow_grace()
 
 
 def ui_role_leader(checked):
@@ -513,8 +518,89 @@ def configured_leader():
 
 
 def configured_leader_char():
-    char_name, _job, _display = parse_leader_identity(configured_leader())
-    return char_name
+    """Left side of `CharName, job` after strip *."""
+    char_name, job_name, _display = parse_leader_identity(configured_leader())
+    return _strip_job_star(char_name)
+
+
+def mark_follow_grace(seconds=None):
+    seconds = FOLLOW_DISTANCE_GRACE if seconds is None else float(seconds)
+    with lock:
+        state['follow_grace_until'] = monotonic() + max(0.0, seconds)
+
+
+def in_follow_grace():
+    with lock:
+        return monotonic() < float(state.get('follow_grace_until') or 0)
+
+
+def resolve_trace_char_name():
+    """CharName for start_trace from `name, *job` — NEVER job-only AG_He."""
+    raw = configured_leader()
+    char_name, job_name, _display = parse_leader_identity(raw)
+    char_name = _strip_job_star(char_name)
+    job_bare = _strip_job_star(job_name)
+
+    def _party_real_char(hint_char='', hint_job=''):
+        party = get_party()
+        if not isinstance(party, dict):
+            return ''
+        hint_c = _strip_job_star(hint_char).casefold()
+        hint_j = _strip_job_star(hint_job).casefold()
+        best = ''
+        for member in party.values():
+            if not isinstance(member, dict) or _is_self_member(member):
+                continue
+            m_char, m_job = _resolve_member_identity(member)
+            m_char = _strip_job_star(m_char)
+            m_job_bare = _strip_job_star(m_job)
+            raw_m = str(member.get('name') or '').strip()
+            tokens = {
+                m_char.casefold(), m_job_bare.casefold(),
+                raw_m.casefold(), _strip_job_star(raw_m).casefold(),
+            }
+            tokens.discard('')
+            if hint_c or hint_j:
+                if not ((hint_c and hint_c in tokens) or (hint_j and hint_j in tokens)):
+                    continue
+            if m_char and m_job_bare and m_char.casefold() != m_job_bare.casefold():
+                return m_char
+            if m_char and not raw_m.startswith('*'):
+                best = best or m_char
+            elif m_char:
+                best = best or m_char
+        return best
+
+    if char_name and job_bare and char_name.casefold() != job_bare.casefold():
+        return char_name
+    if char_name:
+        real = _party_real_char(char_name, job_bare or char_name)
+        if real and not (job_bare and real.casefold() == job_bare.casefold()
+                         and char_name.casefold() == job_bare.casefold()):
+            return real
+        if job_bare and char_name.casefold() == job_bare.casefold():
+            real2 = _party_real_char('', job_bare)
+            if real2 and real2.casefold() != job_bare.casefold():
+                return real2
+            try:
+                full = party_master_display()
+                p_char, _p_job, _ = parse_leader_identity(full)
+                p_char = _strip_job_star(p_char)
+                if p_char and p_char.casefold() != job_bare.casefold():
+                    return p_char
+            except ValueError:
+                pass
+            raise ValueError(
+                'Trace cần CharName thật, không dùng job %r. Lấy tên chủ PT lại (`name, *job`).'
+                % char_name)
+        return char_name
+    if job_bare:
+        real = _party_real_char('', job_bare)
+        if real and real.casefold() != job_bare.casefold():
+            return real
+        raise ValueError(
+            'Thiếu CharName — field=%r. Cần `CharName, *job` (không chỉ job).' % raw)
+    raise ValueError('Chưa có CharName chủ PT để trace.')
 
 
 def name_is_leader(player):
@@ -612,6 +698,8 @@ def arm_auto_pk(prefer_uid=0):
         return False
     with lock:
         state['armed_auto_pk'] = bool(ok)
+    if ok:
+        mark_follow_grace()
     set_status('Auto PK %s · nhóm %s · API=%r' % (
         'ON' if ok else 'FAIL', page, ok))
     return ok
@@ -704,21 +792,23 @@ def do_follow(reason):
     except ValueError as error:
         set_status('[%s] %s' % (reason, error))
         return False
-    leader_char = configured_leader_char()
-    if not leader_char:
-        set_status('Chưa có CharName chủ PT.')
+    try:
+        leader_char = resolve_trace_char_name()
+    except ValueError as error:
+        set_status('[%s] %s' % (reason, error))
         return False
+    mark_follow_grace()
     try:
         ok = start_trace(leader_char)
     except Exception as error:
-        set_status('start_trace lỗi: %s' % error)
+        set_status('start_trace lỗi: %s (CharName=%r) — giữ Auto PK.' % (error, leader_char))
         return False
     with lock:
         state['following'] = bool(ok)
     set_status('[%s] Trace → CharName=%r (Leader=%r) · API=%r' % (
         reason, leader_char, full, ok))
-    # ks: arm Auto PK song song trace — chủ đánh → phụ 7045 + Ghost cùng UID.
     arm_auto_pk(prefer_uid=0)
+    mark_follow_grace()
     return bool(ok)
 
 
@@ -799,7 +889,7 @@ def leader_broadcast_stop_fight(reason='F4/dừng Ghost'):
             return False
         state['last_stop_fight_at'] = now
     if party_chat('dungdanh'):
-        set_status('[%s] Chủ broadcast dungdanh → phụ dừng đánh.' % reason)
+        set_status('[%s] Chủ broadcast dungdanh → phụ stop + trace.' % reason)
         return True
     return False
 
@@ -858,6 +948,18 @@ def follower_stop_fight(reason):
         state['last_uid'] = 0
     set_status('[%s] Phụ dừng đánh (chờ chủ).' % reason)
     return True
+
+
+
+def follower_stop_and_follow(reason):
+    """Chủ F4/dừng: phụ stop attack rồi ngay lập tức trace CharName chủ."""
+    follower_stop_fight(reason)
+    # Trace ngay — không chờ >10m tick; giữ Auto PK armed.
+    mark_follow_grace(3.0)  # ngắn: tránh double-clear từ distance tick
+    ok = follower_ensure_trace(reason)
+    if ok:
+        set_status('[%s] Đã stop + trace theo chủ (CharName).' % reason)
+    return ok
 
 
 def leader_xy_from_party():
@@ -997,6 +1099,8 @@ def btn_load():
         if not isinstance(data, dict):
             raise ValueError('JSON không hợp lệ.')
         apply_settings(data)
+        if QtBind.isChecked(gui, enabled_box) and role_index() == ROLE_FOLLOWER:
+            mark_follow_grace()
         raw = str(data.get('leader_name') or '').strip()
         if raw:
             try:
@@ -1054,7 +1158,12 @@ def btn_stop():
 def ui_enabled(checked):
     with lock:
         state['enabled'] = bool(checked)
-    set_status('Đã bật.' if checked else 'Đã tắt.')
+    if checked:
+        mark_follow_grace()
+        set_status('Đã bật · grace %.0fs trước luật >%.0fm.' % (
+            FOLLOW_DISTANCE_GRACE, LEADER_FOLLOW_DISTANCE))
+    else:
+        set_status('Đã tắt.')
 
 
 def ui_sync(checked):
@@ -1085,10 +1194,10 @@ def handle_chat(chat_type, player, msg):
         return
 
     norm = normalize_cmd(text)
-    # HARD: chủ dừng đánh → phụ dừng cast ngay (giữ trace).
+    # HARD: chủ F4/dừng → phụ dừng cast + trace theo chủ ngay.
     if is_stop_fight_cmd(norm):
         if not i_am_leader():
-            follower_stop_fight('chat dungdanh')
+            follower_stop_and_follow('chat dungdanh / F4')
         return
     # HARD: chủ clear target → phụ clear.
     if is_clear_target_cmd(norm):
@@ -1238,5 +1347,5 @@ def teleported():
     pass
 
 
-log('[%s] Đã nạp v%s. Lấy tên chủ=CharName (không job). Prefer UID no-7045. AG≥1.8.67.'
+log('[%s] Đã nạp v%s. Follow>10m · Grace · Trace CharName · F4→stop+trace. AG≥1.8.67.'
     % (NAME, VERSION))
