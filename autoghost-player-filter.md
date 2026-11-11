@@ -1,6 +1,6 @@
 # AutoGhost — nhận diện người chơi (get_players)
 
-**Plugin version:** AutoGhost **v1.8.70** (+ PartyLeader **v1.0.10**)
+**Plugin version:** AutoGhost **v1.8.71** (+ PartyLeader **v1.0.10**)
 
 ## Tóm tắt (VN)
 
@@ -15,7 +15,7 @@
 
 ## Vì sao trước đây camp đứng im?
 
-Filter cũ có thể over-match (union / guild-name-in-names). **1.8.70** chỉ skip đúng cùng Party hoặc cùng Guild.
+Filter cũ có thể over-match (union / guild-name-in-names). **1.8.71** chỉ skip đúng cùng Party hoặc cùng Guild.
 
 ## Doc path
 

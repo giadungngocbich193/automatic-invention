@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX camp return v1.8.71] UID ra vùng đánh → bỏ khóa + quay về điểm chờ;
+  debounce log ≤1/2s; party prefer unreachable soft-clear (no forever cast).
 - [FIX ally Party+Guild only v1.8.70] exclude ONLY same party / same guild;
   remove Liên minh; no unknown=skip; stranger in radius still attacked.
 - [FIX party Ghost nền v1.8.70] prefer UID dùng 7081/B074 interrupt như Ghost thường;
@@ -45,9 +47,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.70'
+VERSION = '1.8.71'
 # raw-main download stamp: 2026-11-11T08:55Z (UTF-8 no BOM/U+200B)
-# baseline 2600 + party Ghost nền 7081 cut + prefer re-arm
+# baseline 2600 + camp return when target leaves attack radius
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -61,7 +63,8 @@ AUTO_PK_FAST_SCAN_INTERVAL = 0.015  # near-camp player scan → Target reacts so
 AUTO_PK_DISPLAY_INTERVAL = 0.25  # refresh player list UI while camping
 AUTO_PK_MAX_SCAN_RADIUS = 120
 AUTO_PK_SCAN_PREVIEW_MARGIN = 20
-AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.10
+AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.50  # confirm left vùng đánh before clear+return
+AUTO_PK_LOG_DEBOUNCE = 2.0  # never flood “ra vùng đánh” / quay về logs
 AUTO_PK_CAST_CONFIRM_TIMEOUT = 0.30
 AUTO_PK_SELECT_TIMEOUT = 0.50
 AUTO_PK_NATIVE_TIMEOUT = 0.20
@@ -5503,7 +5506,70 @@ def hold_auto_pk(reason, retry_after=0.0):
     report_error(message)
 
 
-def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
+def _auto_pk_debounced_log(runtime, key, message, interval=None, error=False):
+    """Status always updates; Log/report at most once per interval (default 2s)."""
+    interval = AUTO_PK_LOG_DEBOUNCE if interval is None else float(interval)
+    now = monotonic()
+    last = float((runtime or {}).get(key) or 0) if isinstance(runtime, dict) else 0.0
+    QtBind.setText(gui, auto_pk_status_label, message)
+    if (now - last) < interval:
+        return False
+    if isinstance(runtime, dict):
+        runtime[key] = now
+    if error:
+        report_error(message)
+    else:
+        log('[%s] %s' % (NAME, message))
+    return True
+
+
+def _party_prefer_unreachable_reason(reason):
+    text = str(reason or '').casefold()
+    if reason == AUTO_PK_OUTSIDE_TARGET:
+        return True
+    return any(token in text for token in (
+        'b074', 'từ chối đánh', 'ra vùng', 'vượt bán kính',
+        'biến mất', 'không còn hợp lệ', 'đã chết', 'protected',
+        AUTO_PK_PROTECTED.casefold(),
+    ))
+
+
+def soft_clear_party_prefer(runtime, uid, reason):
+    """Party prefer UID unreachable → clear prefer lock (no forever Ghost cast)."""
+    global direct_target, direct_select_request, active_sequence, sequence_index
+    global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
+    if not isinstance(runtime, dict):
+        return False
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    runtime['party_sync_uid'] = 0
+    runtime['party_hold_fight'] = True
+    runtime['party_lock'] = True  # stay in party mode; wait for next prefer / trace
+    runtime.update(requested=0, native_uid=0, select_until=0.0, scan_at=0.0,
+                   native_probe_until=0.0, skill_probe_uid=0)
+    runtime.pop('missing_since', None)
+    runtime.pop('approach', None)
+    runtime.pop('target_outside', None)
+    runtime.pop('select_in_event', None)
+    clear_pending()
+    reset_pvp_activation()
+    direct_target = direct_select_request = 0
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
+    active_sequence = None
+    sequence_index = 0
+    pvp_paused = True
+    _auto_pk_debounced_log(
+        runtime, 'party_prefer_clear_log_at',
+        'Party prefer UID %d soft-clear · %s · chờ Leader/trace' % (uid, reason),
+        error=False)
+    return True
+
+
+def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY,
+                           allow_party_clear=False):
     global direct_target, direct_select_request, active_sequence, sequence_index
     global direct_expected, direct_retry_state, pvp_cast_deadline
     runtime = auto_pk_runtime
@@ -5513,30 +5579,28 @@ def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
         uid = int(uid or 0)
     except (TypeError, ValueError):
         return False
-    # HARD: never skip/retire PartyLeader prefer UID — soft-wait / keep casting.
     if is_party_sync_prefer_uid(uid, runtime):
+        # Unreachable / left vùng đánh / B074 refuse → soft-clear prefer.
+        if allow_party_clear or _party_prefer_unreachable_reason(reason):
+            return soft_clear_party_prefer(runtime, uid, reason)
+        # Transient B070 miss only — soft-wait, keep prefer.
         now = monotonic()
-        last = float(runtime.get('party_prefer_soft_log_at') or 0)
         runtime['party_hold_fight'] = False
         runtime.pop('missing_since', None)
         runtime.pop('approach', None)
         runtime.pop('target_outside', None)
-        # Keep prefer + direct_target; clear only pending expect so cast retries.
         if direct_expected and direct_expected[1] == uid:
             soft_wait_b070_without_attempt(
                 direct_expected[0], uid, reason or 'chờ B070 party prefer')
         else:
             direct_expected = direct_retry_state = None
             pvp_cast_deadline = now + 0.25
-        if (now - last) >= 3.0:
-            runtime['party_prefer_soft_log_at'] = now
-            msg = 'Party prefer UID %d · giữ cast Ghost (%s)' % (uid, reason)
-            QtBind.setText(gui, auto_pk_status_label, msg)
-            log('[%s] %s' % (NAME, msg))
+        _auto_pk_debounced_log(
+            runtime, 'party_prefer_soft_log_at',
+            'Party prefer UID %d · giữ cast Ghost (%s)' % (uid, reason),
+            interval=3.0)
         return False
     now = monotonic()
-    # Retire the UID briefly in case the next inventory of nearby players
-    # still contains the entity that just disappeared.
     runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + retry_delay)
     runtime.pop('missing_since', None)
     runtime.pop('approach', None)
@@ -5551,9 +5615,9 @@ def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
     pvp_cast_deadline = 0.0
     active_sequence = None
     sequence_index = 0
-    message = 'UID %d: %s · dò ngay mục tiêu khác.' % (uid, reason)
-    log('[%s] Auto PK: %s' % (NAME, message))
-    QtBind.setText(gui, auto_pk_status_label, message)
+    _auto_pk_debounced_log(
+        runtime, 'release_target_log_at',
+        'UID %d: %s · dò ngay mục tiêu khác.' % (uid, reason))
     return True
 
 
@@ -5645,65 +5709,79 @@ def tick_auto_pk(from_event=False):
             runtime.pop('missing_since', None)
             return True
         if reason == AUTO_PK_OUTSIDE_SELF:
-            # Self left camp while chasing — keep engage; do not quay về.
+            # Self left camp while chasing a target still in vùng đánh — keep engage.
             runtime.pop('target_outside', None)
             runtime.pop('missing_since', None)
-            report('[FIX never abort PvP in attack range] self ngoài bán kính · giữ UID %d · %s'
-                   % (pvp_target, attack_detail))
+            _auto_pk_debounced_log(
+                runtime, 'self_outside_log_at',
+                'Self ngoài bán kính · giữ UID %d · %s' % (pvp_target, attack_detail))
             return True
         if reason == AUTO_PK_OUTSIDE_TARGET:
             uid, since = runtime.get('target_outside', (0, now))
             if uid != pvp_target:
                 runtime['target_outside'] = (pvp_target, now)
                 runtime.pop('missing_since', None)
-                report('[FIX never abort PvP in attack range] chờ xác nhận mục tiêu ngoài vùng · UID %d'
-                       % pvp_target)
+                _auto_pk_debounced_log(
+                    runtime, 'outside_wait_log_at',
+                    'Chờ xác nhận mục tiêu ngoài vùng · UID %d' % pvp_target)
                 return bool(active)
             if now - since < AUTO_PK_TARGET_OUTSIDE_CONFIRM:
                 return bool(active)
-            # Confirmed left vùng đánh — release lock without camp-return pause; reselect.
+            # Confirmed left vùng đánh from camp point.
+            left_uid = pvp_target
             runtime.pop('target_outside', None)
-            report_error('[FIX never abort PvP in attack range] UID %d đã ra vùng đánh · bỏ khóa, không quay về.'
-                         % pvp_target)
-            release_auto_pk_target(pvp_target, AUTO_PK_OUTSIDE_TARGET)
+            partyish = party_follow or is_party_sync_prefer_uid(left_uid, runtime)
+            if partyish:
+                # Soft-clear prefer — PartyLeader >10m Trace/chase; no forever cast.
+                soft_clear_party_prefer(runtime, left_uid, AUTO_PK_OUTSIDE_TARGET)
+                _auto_pk_debounced_log(
+                    runtime, 'outside_clear_log_at',
+                    'UID %d ra vùng đánh · soft-clear prefer · chờ Leader/trace' % left_uid,
+                    error=True)
+            else:
+                # Camp Auto PK: clear lock AND quay về điểm chờ.
+                release_auto_pk_target(left_uid, AUTO_PK_OUTSIDE_TARGET)
+                force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_TARGET)
+                _auto_pk_debounced_log(
+                    runtime, 'outside_clear_log_at',
+                    'UID %d ra vùng đánh · bỏ khóa · quay về điểm chờ' % left_uid,
+                    error=True)
             return False
         runtime.pop('target_outside', None)
         if reason in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
-            if is_party_sync_prefer_uid(pvp_target, runtime):
-                # Prefer UID: ignore retire/protected — keep Ghost casting.
-                runtime.pop('missing_since', None)
-                try:
-                    runtime['retired'].pop(int(pvp_target), None)
-                except Exception:
-                    pass
-                return True
-            release_auto_pk_target(pvp_target, reason)
+            left_uid = pvp_target
+            if is_party_sync_prefer_uid(left_uid, runtime):
+                # Dead/unreachable prefer — soft-clear (do not cast forever).
+                soft_clear_party_prefer(runtime, left_uid, reason)
+                return False
+            release_auto_pk_target(left_uid, reason)
+            if not party_follow:
+                force_auto_pk_return(runtime, reason)
             return False
         if eligible and active:
             runtime.pop('missing_since', None)
             return True
         if active and reason == 'tạm thiếu dữ liệu Player':
-            # Opposing-faction enemies are frequently omitted from get_players on
-            # Stable. Keep the server-confirmed lock; 0x3015/0x3016 still release
-            # vanished UIDs. Do not force-return after one second.
+            # Opposing-faction enemies often omitted from get_players — keep lock briefly.
             runtime.pop('missing_since', None)
-            if now >= runtime.get('missing_notice_at', 0):
-                runtime['missing_notice_at'] = now + 5.0
-                QtBind.setText(gui, auto_pk_status_label,
-                               'Giữ UID %d · Player list thiếu (thường gặp phe địch).' % pvp_target)
+            _auto_pk_debounced_log(
+                runtime, 'missing_notice_at',
+                'Giữ UID %d · Player list thiếu (thường gặp phe địch).' % pvp_target,
+                interval=5.0)
             return True
         runtime.pop('missing_since', None)
         if eligible:
             reason = 'chuỗi đánh đã dừng, xem lý do ngay trước dòng này'
-        report_error('[FIX never abort PvP in attack range] bỏ khóa UID %d: %s (không quay về).'
-                     % (pvp_target, reason))
-        # clear_target must NOT start camp return — reselect next tick.
-        pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
-        if auto_pk_returning:
-            auto_pk_returning = False
-            runtime.pop('withdraw', None)
-            report('[FIX never abort PvP in attack range] hủy auto_pk_returning sau bỏ khóa.')
-        QtBind.setText(gui, auto_pk_status_label, 'Bỏ UID · tìm mục tiêu khác (không dừng đánh).')
+        left_uid = pvp_target
+        _auto_pk_debounced_log(
+            runtime, 'drop_lock_log_at',
+            'Bỏ khóa UID %d: %s · quay về điểm chờ' % (left_uid, reason),
+            error=True)
+        release_auto_pk_target(left_uid, reason, allow_party_clear=True)
+        if not party_follow:
+            force_auto_pk_return(runtime, reason)
+        else:
+            pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
     if auto_pk_returning:
         withdraw = runtime.get('withdraw')
         if withdraw and not auxiliary_exchange_ready(withdraw):
@@ -5728,29 +5806,38 @@ def tick_auto_pk(from_event=False):
 
 
 def force_auto_pk_return(runtime, reason):
-    """Camp return. Hard-blocked while a PLAYER engage is still in attack range."""
+    """Camp return. Refuse only while locked UID is STILL inside vùng đánh."""
     global auto_pk_returning
     if auto_pk_returning:
         return
-    engaged = int(pvp_target or 0) or int(direct_target or 0) or int((runtime or {}).get('requested') or 0)
+    if not isinstance(runtime, dict):
+        return
+    # Party follower: movement is Trace — never camp-return mid party sync.
+    if runtime.get('party_lock') or runtime.get('party_follow_mode'):
+        if int(runtime.get('party_sync_uid') or 0):
+            return
+    engaged = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
     if engaged:
         in_attack, detail = auto_pk_player_attack_range(engaged, runtime)
-        # [FIX never abort PvP in attack range] Refuse quay về while target in vùng đánh
-        # OR while self-only outside during an active lock (chase).
-        if in_attack or reason in (AUTO_PK_OUTSIDE_SELF, AUTO_PK_OUTSIDE_TARGET):
-            report_error('[FIX never abort PvP in attack range] từ chối quay về · UID %d · lý do=%s · %s'
-                         % (engaged, reason, detail))
-            QtBind.setText(gui, auto_pk_status_label,
-                           'Giữ đánh UID %d · bỏ qua %s.' % (engaged, reason))
+        if in_attack:
+            # Target still in camp attack radius — keep fighting, no quay về.
+            _auto_pk_debounced_log(
+                runtime, 'refuse_return_log_at',
+                'Giữ đánh UID %d · từ chối quay về (%s)' % (engaged, detail),
+                error=True)
             return
+        # Target left vùng đánh / missing — clear engage then return.
+        release_auto_pk_target(engaged, reason or AUTO_PK_OUTSIDE_TARGET,
+                               allow_party_clear=True)
     auto_pk_returning = True
     runtime.pop('withdraw', None)
     runtime.pop('patrol_destination', None)
     runtime['move_at'] = 0.0
-    pause_pvp('Auto PK: ' + reason, clear_target=True, cancel_action=False, notify=False)
-    report_error('[FIX never abort PvP in attack range] quay về chỉ khi idle/không engage · %s (%.1f m) · quay về điểm bật.'
-                 % (reason, runtime['radius']))
-    QtBind.setText(gui, auto_pk_status_label, 'Quay về điểm chờ · ' + reason + '.')
+    pause_pvp('Auto PK: ' + str(reason), clear_target=True, cancel_action=False, notify=False)
+    _auto_pk_debounced_log(
+        runtime, 'camp_return_log_at',
+        'Quay về điểm chờ · %s (bán kính %.1f m)' % (reason, float(runtime.get('radius') or 0)),
+        error=True)
     move_auto_pk_to_anchor(runtime)
 
 
