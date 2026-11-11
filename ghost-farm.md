@@ -1,22 +1,27 @@
-# GhostFarm v1.0.5
+# GhostFarm v1.0.6
 
-Standalone phBot farm: **7045 select → 7074 cast → wait ms → NativeCut self**.
+Standalone phBot farm with **overlapping Ghost interrupt** (AutoGhost-style timing).
 
-## Skill IDs (per-skill Ghost delay)
+## Why 1.0.6
+
+v1.0.5 waited `ms` **then** installed/verified NativeCut, so `arm(2)` often landed **after** the cast finished (XP already granted). Result: `B074 02 00` without a real skill-reset Ghost feel.
+
+## Timing (AG-like)
+
+1. **7045** select living monster  
+2. **Pre-warm** NativeCut (arm(1) verify) **before** cast  
+3. **7074** cast skill on monster  
+4. Prefer **B070** confirm → wait `ms` → **arm(2)** immediately  
+   Fallback: `ms` from 7074 send if no B070 (~1.2s)  
+5. Hook is already ready — cut overlaps the cast (does not wait for cast end / monster death)
+
+## Skill IDs
 
 ```text
 80031=1;66007=20;54016=0;81019=15
 ```
 
-`skillId=ms` = milliseconds to wait after cast before NativeCut self interrupt.
-Bare ids (`3048,3050`) use delay `0`.
-
-## Loop
-
-1. **SELECT** living monster in radius (7045) — if none, soft-skip cycle (no Ghost)
-2. **CAST** 7074 skill on that UID
-3. **WAIT** the skill’s ms
-4. **NativeCut self** — even if the monster died mid-cast (Ghost is self-UID)
+`skillId=ms` after B070 (preferred) or after 7074 send.
 
 ## Install
 
