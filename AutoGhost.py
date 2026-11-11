@@ -3986,8 +3986,6 @@ def tick_auto_pk_idle_mob(runtime, character, now):
         return False
     anchor = runtime['anchor']
     own = auto_pk_distance(position, anchor)
-    if own is None or own > runtime['radius']:
-        return False
     # Waiting on mob select confirm.
     mob_req = int(runtime.get('mob_requested') or 0)
     if mob_req and now < runtime.get('mob_select_until', 0):
@@ -3998,10 +3996,13 @@ def tick_auto_pk_idle_mob(runtime, character, now):
     mob_uid = int(runtime.get('mob_uid') or 0)
     if mob_uid:
         mon = monsters.get(mob_uid) or monsters.get(str(mob_uid))
-        if (isinstance(mon, dict) and auto_pk_is_farm_monster(mob_uid, mon, players)
-                and (auto_pk_target_distance(mon, anchor, runtime) or 1e9) <= runtime['radius']):
+        # Active farm lock: keep casting even past camp radius (no quay về pause).
+        if isinstance(mon, dict) and auto_pk_is_farm_monster(mob_uid, mon, players):
             return auto_pk_mob_cast(runtime, character, mob_uid, now)
         auto_pk_drop_mob(runtime, 'quái chết/ra vùng')
+    # New farm pick only while still inside camp.
+    if own is None or own > runtime['radius']:
+        return False
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
     best = None
     self_id = character.get('player_id')
@@ -4186,12 +4187,15 @@ def auto_pk_select(character, runtime, now, from_event=False):
     anchor = runtime['anchor']
     position = get_position() or {}
     own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
-    if own_distance is None or own_distance > runtime['radius']:
-        return
     client = get_client() or {}
     if not client.get('running'):
         return
     farming = bool(runtime.get('mob_farm'))
+    # Active farm: keep hitting locked mob even outside camp (no radius return).
+    if farming and runtime.get('mob_uid') and tick_auto_pk_idle_mob(runtime, character, now):
+        return
+    if own_distance is None or own_distance > runtime['radius']:
+        return
     # Idle Skill buff first (on arm / rebuff) before farm or Target.
     if tick_auto_pk_idle_buff(runtime, now):
         return
