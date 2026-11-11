@@ -22,8 +22,8 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.54'
-# raw-main download stamp: 2026-11-11T00:50Z (UTF-8 no BOM/U+200B) · buff logic kept; per-skill VK only
+VERSION = '1.8.55'
+# raw-main download stamp: 2026-11-11T01:25Z (UTF-8 no BOM/U+200B) · buff on arm; fast scan; farm checkbox
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -32,8 +32,9 @@ PAGE_KEYS = (0x70, 0x71, 0x72, 0x73)
 AUTO_HUNT_RADIUS = 50
 AUTO_HUNT_INTERVAL = 0.06
 PVP_KEY_INTERVAL = 0.03
-AUTO_PK_SCAN_INTERVAL = 0.075
-AUTO_PK_FAST_SCAN_INTERVAL = 0.040
+AUTO_PK_SCAN_INTERVAL = 0.045  # locked-target poll
+AUTO_PK_FAST_SCAN_INTERVAL = 0.022  # near-camp player scan → Target reacts sooner
+AUTO_PK_DISPLAY_INTERVAL = 0.25  # refresh player list UI while camping
 AUTO_PK_MAX_SCAN_RADIUS = 120
 AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.35
 AUTO_PK_CAST_RETRY_DELAY = 2.0
@@ -344,8 +345,9 @@ auto_pk_patrol_box=widget('auto_pk','createCheckBox','auto_pk_patrol_changed','C
 widget('auto_pk','createLabel','Bán kính (m)',117,133)
 auto_pk_patrol_radius_field=widget('auto_pk','createLineEdit','10',200,128,50,22)
 auto_pk_fast_box=widget('auto_pk','createCheckBox','auto_pk_fast_changed','Quét nhanh',270,130)
-widget('auto_pk','createButton','view_auto_pk_options','Tọa độ',410,127)
-widget('auto_pk','createButton','view_auto_pk_buffs','Skill buff',505,127)
+auto_pk_mob_farm_box=widget('auto_pk','createCheckBox','auto_pk_mob_farm_changed','Đánh quái',355,130)
+widget('auto_pk','createButton','view_auto_pk_options','Tọa độ',445,127)
+widget('auto_pk','createButton','view_auto_pk_buffs','Skill buff',530,127)
 widget('auto_pk','createButton','scan_auto_pk_now','Quét ngay',10,157)
 widget('auto_pk','createButton','request_auto_pk_arm','Bật Auto PK',410,157)
 widget('auto_pk','createButton','stop_auto_pk','Dừng canh',505,157)
@@ -3319,7 +3321,7 @@ def load_auto_pk_options(profile):
     QtBind.setText(gui, auto_pk_scan_radius_field, str(profile.get('scan_radius', AUTO_PK_REPORT_RADIUS)))
     QtBind.setText(gui, auto_pk_patrol_radius_field, str(profile.get('patrol_radius', 10)))
     for box, name in ((auto_pk_fast_box,'fast_scan'),(auto_pk_patrol_box,'patrol_enabled'),
-                      (auto_pk_buffs_box,'buffs_enabled')):
+                      (auto_pk_mob_farm_box,'mob_farm'),(auto_pk_buffs_box,'buffs_enabled')):
         set_checked_silent(box, profile.get(name) is True)
     centers = profile.get('centers') or {}
     if not isinstance(centers, dict):
@@ -3418,6 +3420,7 @@ def read_auto_pk_options():
         'patrol_radius':auto_pk_option_radius(auto_pk_patrol_radius_field,'Bán kính chạy vòng',AUTO_PK_MAX_RADIUS),
         'patrol_enabled':QtBind.isChecked(gui,auto_pk_patrol_box),
         'fast_scan':QtBind.isChecked(gui,auto_pk_fast_box),
+        'mob_farm':QtBind.isChecked(gui,auto_pk_mob_farm_box),
         'buffs_enabled':QtBind.isChecked(gui,auto_pk_buffs_box),
         'buff_ids':buffs, 'buff_weapons':weapons, 'buff_page':'',
         'buff_error':buff_error, 'centers':read_auto_pk_centers(),
@@ -3529,10 +3532,18 @@ def scan_auto_pk_evidence(runtime=None):
                      'đã chết' if row['dead'] else row['unavailable'] or
                      ('trong vùng đánh' if row['in_attack_range'] else 'chỉ báo'))) if row else ''
             QtBind.setText(gui, field, text)
+        outside = sum(not row['in_attack_range'] for row in rows)
         message = ('Quét %g m · %d người · %d ngoài vùng đánh.' %
-                   (scan_radius,len(rows),sum(not row['in_attack_range'] for row in rows)))
+                   (scan_radius, len(rows), outside))
         if not players:
             message += ' Chưa có UID từ phBot.'
+        elif rows:
+            # Early report: list nearby players ASAP so Target can engage when they enter.
+            nearest = rows[0]
+            if nearest.get('in_attack_range'):
+                message += ' Sẵn sàng Target/Ghost.'
+            else:
+                message += ' Địch trong vùng quét · sẵn sàng Target khi vào vùng đánh.'
         QtBind.setText(gui, auto_pk_scan_field, message)
         return {'players': rows}
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as error:
@@ -3785,6 +3796,17 @@ def auto_pk_fast_changed(checked):
     with pvp_lock:
         if not ui_sync and auto_pk_runtime is not None:
             auto_pk_runtime['fast_scan'] = bool(checked)
+
+
+def auto_pk_mob_farm_changed(checked):
+    with pvp_lock:
+        if ui_sync or auto_pk_runtime is None:
+            return
+        auto_pk_runtime['mob_farm'] = bool(checked)
+        if not checked:
+            auto_pk_drop_mob(auto_pk_runtime, 'tắt Đánh quái')
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đánh quái: bật.' if checked else 'Đánh quái: tắt · API/Target chỉ cho địch.')
 
 
 def auto_pk_buffs_changed(checked):
@@ -4048,7 +4070,9 @@ def tick_auto_pk_idle_buff(runtime, now):
         return False
     if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
         return False
-    if pvp_activation is not None:
+    # Allow buff while gear_only (weapon switch) or no PvP target yet.
+    # Blocking on any pvp_activation prevented cast after arm / after VK switch.
+    if pvp_activation is not None and pvp_target and not pvp_activation.get('gear_only'):
         return True
     if now < runtime.get('buff_check_at', 0):
         return False
@@ -4171,15 +4195,20 @@ def auto_pk_select(character, runtime, now, from_event=False):
     client = get_client() or {}
     if not client.get('running'):
         return
+    farming = bool(runtime.get('mob_farm'))
+    # Idle Skill buff first (on arm / rebuff) before farm or Target.
+    if tick_auto_pk_idle_buff(runtime, now):
+        return
     if players is None:
-        # get_players often omits opposing-faction enemies on Stable; still try Target Enemy.
-        if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
+        # Farm never shares Target/API with PK. Target Enemy is opponent-only.
+        if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        if tick_auto_pk_idle_mob(runtime, character, now):
+        if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
             return
         if not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'phBot chưa trả Player list · đánh quái khi rảnh · gán Target Enemy nếu cần.')
+                           'phBot chưa trả Player list · gán Target Enemy cho địch'
+                           + (' · Đánh quái đang bật.' if farming else '.'))
         return
     runtime['retired'] = {uid: until for uid, until in runtime['retired'].items() if until > now}
     best = None
@@ -4203,17 +4232,18 @@ def auto_pk_select(character, runtime, now, from_event=False):
         if best is None or candidate < best:
             best = candidate
     if best is None:
+        # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
+        if farming and tick_auto_pk_idle_mob(runtime, character, now):
+            return
+        # Opponent hunt: API/Target path only (separate from farm).
         if auto_pk_try_native_enemy_key(runtime, client, now, 'không thấy UID trong Player list'):
             return
-        # No opponent in radius → farm monsters while continuing to scan.
-        if tick_auto_pk_idle_mob(runtime, character, now):
-            return
-        if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
+        if not tick_auto_pk_patrol(runtime, position, now):
             QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · đánh quái khi rảnh · chờ địch.' %
+                           'Đang canh %.0f m · chờ địch · quét nhanh gần điểm chờ.' %
                            runtime['radius'])
         return
-    # Opponent in radius → drop mob fight and switch to Auto Ghost PvP.
+    # Opponent in attack radius → drop mob (if any) and Ghost via API/Target.
     auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
     distance, uid = best
@@ -4373,13 +4403,17 @@ def request_auto_pk_arm():
             auto_pk_runtime = {'owner': owner, 'radius': radius, 'page': page, 'anchor': anchor,
                                'move_at': 0.0, 'scan_at': 0.0, 'requested': 0, 'select_until': 0.0,
                                'native_uid': 0, 'native_key': AUTO_PK_NATIVE_KEYS.get(key_name, 0),
-                               'retired': {}, 'dead_uids': set()}
+                               'retired': {}, 'dead_uids': set(),
+                               'buff_check_at': 0.0, 'armed_at': monotonic()}
             auto_pk_runtime.update(options)
             auto_pk_running = True
             auto_pk_returning = False
         show_auto_pk_anchor()
-        message = 'Đã bật canh %.0f m · nhóm %s · đánh quái khi rảnh · địch vào vùng thì Ghost.' % (
-            radius, page)
+        farm_on = bool(options.get('mob_farm'))
+        message = 'Đã bật canh %.0f m · nhóm %s · quét nhanh · buff khi rảnh.' % (radius, page)
+        message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
+        if options.get('buffs_enabled') and options.get('buff_ids'):
+            message += ' Đang gửi Skill buff…'
         if buff_error:
             QtBind.setText(gui, auto_pk_buffs_status, 'Bảng buff: ' + buff_error)
         if disable_buffs:
@@ -4387,8 +4421,13 @@ def request_auto_pk_arm():
             message += ' Buff đã tắt vì ID lỗi.'
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
-        log('[%s] Auto PK v%s: mob farm + scan · địch trong bán kính → bỏ quái → Ghost.' %
-            (NAME, VERSION))
+        log('[%s] Auto PK v%s: buff-on-arm · fast scan · Đánh quái=%s · API/Target≠farm.' %
+            (NAME, VERSION, 'on' if farm_on else 'off'))
+        # Kick idle buff immediately on arm (before Target/farm).
+        if options.get('buffs_enabled') and options.get('buff_ids') and not disable_buffs:
+            with pvp_lock:
+                if auto_pk_runtime is not None:
+                    tick_auto_pk_idle_buff(auto_pk_runtime, monotonic())
     except (ValueError,TypeError,KeyError,OSError) as error:
         QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
 
@@ -4474,7 +4513,13 @@ def tick_auto_pk(from_event=False):
     if not auto_pk_returning:
         if now < runtime['scan_at'] and not (from_event and runtime.get('select_in_event')):
             return bool(pvp_target and 'missing_since' not in runtime and 'target_outside' not in runtime)
-        interval = AUTO_PK_FAST_SCAN_INTERVAL if not pvp_target and runtime.get('fast_scan') else AUTO_PK_SCAN_INTERVAL
+        # Near camp without a lock: always poll players fast so Target/API engage sooner.
+        if not pvp_target:
+            interval = AUTO_PK_FAST_SCAN_INTERVAL
+            if runtime.get('fast_scan'):
+                interval = min(interval, 0.018)
+        else:
+            interval = AUTO_PK_SCAN_INTERVAL
         runtime['scan_at'] = now + interval
     position = get_position() or {}
     distance = auto_pk_distance(position, runtime['anchor']) if 'region' in position else None
@@ -4488,6 +4533,9 @@ def tick_auto_pk(from_event=False):
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
+            # Buff on idle/arm before opponent Target or Đánh quái.
+            if tick_auto_pk_idle_buff(runtime, now):
+                return False
             auto_pk_select(character, runtime, now, from_event=from_event)
             return False
         eligible, reason = auto_pk_radius_check(pvp_target)
@@ -7639,7 +7687,8 @@ def event_loop():
             runtime = auto_pk_runtime
             now = monotonic()
             if auto_pk_running and runtime and now >= runtime.get('display_at', 0):
-                runtime['display_at'] = now + 0.75
+                runtime['display_at'] = now + (
+                    AUTO_PK_DISPLAY_INTERVAL if not pvp_target else max(AUTO_PK_DISPLAY_INTERVAL, 0.5))
                 scan_auto_pk_evidence(runtime)
         with _boss_engine.LOCK:
             message = _boss_engine.updates[-1] if _boss_engine.updates else None
