@@ -2,6 +2,14 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX approach per page] Auto PK: F1 áp sát 6 m, F2 12 m (character→enemy);
+  move_to dừng tại range trang (không kéo cung về 4 m). Vùng đánh 40 m giữ.
+- [UI meter layout] Đo ngắt ms: cột cân đối (#/ID/Tên/B070→hit/cut/mẫu),
+  LineEdit rộng — hết clip tên; công thức + n/a cung/đạn.
+- [FIX no-cut block basic] Khi F còn skill không ngắt: chặn 7074 đánh thường
+  (01 01 01) xen giữa (port v4.3) — không đổi cut ms.
+- [FIX meter bow/projectile] Đo ngắt: B070 cast confirm có thể target=0 /
+  action khác hit; chờ hit inline cùng skill+UID; hết giờ → UI “n/a cung/đạn”.
 - [FIX Follow arm + Target steal] PartyLeader arm không còn phụ thuộc tick
   tab Auto PK; Target Enemy/B045 không khóa địch local khi Follow/AutoKS owns.
 - [FIX Follow/AutoKS > local Auto PK] Khi Bật Auto KS hoặc PartyLeader
@@ -100,7 +108,10 @@ AUTO_PK_RETURN_MOVE_INTERVAL = 2.0
 AUTO_PK_RETURN_STEP = 8.0
 AUTO_PK_MAX_RADIUS = 40
 AUTO_PK_REPORT_RADIUS = 60
+# Approach = character→enemy. Attack radius stays AUTO_PK_MAX_RADIUS from anchor.
+# F1 đại đao 6 m; F2 cung 12 m; other pages default 6 m.
 AUTO_PK_APPROACH_RANGE = 6.0
+AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 12.0, 'F3': 6.0}
 AUTO_PK_MOB_SELECT_TIMEOUT = 1.2
 AUTO_PK_MOB_CAST_GAP = 0.4
 AUTO_PK_OUTSIDE_SELF = 'nhân vật vượt bán kính canh'
@@ -4514,6 +4525,19 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
     return None
 
 
+def auto_pk_approach_range(runtime=None):
+    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 12 m)."""
+    page = None
+    if isinstance(runtime, dict):
+        page = runtime.get('page')
+    if not page:
+        page = current_page or QtBind.text(gui, auto_pk_page_field) or 'F2'
+    try:
+        return float(AUTO_PK_APPROACH_BY_PAGE.get(str(page), AUTO_PK_APPROACH_RANGE))
+    except (TypeError, ValueError):
+        return float(AUTO_PK_APPROACH_RANGE)
+
+
 def auto_pk_ready_to_cast(runtime, uid, now):
     """While fighting a locked UID: keep casting — never force camp-radius return."""
     # Party prefer: cast immediately — no approach / move_to gate.
@@ -4539,7 +4563,8 @@ def auto_pk_ready_to_cast(runtime, uid, now):
         runtime.pop('approach', None)
         return True
     distance = math.hypot(dx, dy)
-    if distance <= AUTO_PK_APPROACH_RANGE:
+    approach_range = auto_pk_approach_range(runtime)
+    if distance <= approach_range:
         runtime.pop('approach', None)
         return True
 
@@ -4555,13 +4580,17 @@ def auto_pk_ready_to_cast(runtime, uid, now):
         return False
     if now >= approach['move_at']:
         approach['move_at'] = now + 2.0
-        fraction = (distance - 4.0) / distance if distance else 0
+        # Stop at page approach range (F2 12 m) — never pull bow into ~4 m melee.
+        stop_at = max(1.0, approach_range - 0.5)
+        fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
         z = float(position.get('z', anchor['z']))
         if phbot_api.move_to(x + dx * fraction, y + dy * fraction, z) is False:
             runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
             runtime.pop('approach', None)
             return False
-        QtBind.setText(gui, auto_pk_status_label, 'Đang áp sát UID %d · cách %.1f m.' % (uid, distance))
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đang áp sát UID %d · cách %.1f m · mục tiêu %.0f m (%s).'
+                       % (uid, distance, approach_range, runtime.get('page') or '?'))
     return False
 
 
@@ -6854,6 +6883,12 @@ def handle_silkroad(opcode, data):
     if (auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight')
             and opcode == 0x7074 and data and data[0] == 1):
         return False
+    # F2/F* no-cut chain: block client basic attack so it cannot wedge mid-cast.
+    if (auto_pk_running and pvp_armed and not pvp_paused and runtime_natural_skills
+            and pvp_target and opcode == 0x7074 and len(data or b'') == 7
+            and data[:3] == b'\x01\x01\x01'
+            and struct.unpack_from('<I', data, 3)[0] == pvp_target):
+        return False
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
             return auto_pk_outgoing_selection(data)
@@ -8950,38 +8985,43 @@ damage_meter_lock = RLock()
 damage_meter_update = None
 DAMAGE_METER_SAMPLES = 3
 DAMAGE_METER_F1_ROWS = 6
+# Cast→hit wait: bows need room for projectile travel + late impact B070.
+DAMAGE_METER_CAST_TIMEOUT_NS = 12_000_000_000
 
 widget('meter', 'createLabel', 'ĐO MS NGẮT F1 · mỗi skill: B070 → hit → cut ms (không mất dame, Ghost nhanh)', 10, 34)
 widget('meter', 'createButton', 'start_damage_meter', 'Bắt đầu đo', 10, 56)
-widget('meter', 'createButton', 'stop_damage_meter', 'Dừng', 111, 56)
-widget('meter', 'createLabel', 'Bù ms', 180, 61)
-damage_margin_field = widget('meter', 'createLineEdit', '20', 230, 56, 42, 20)
-widget('meter', 'createButton', 'load_damage_meter_f1', 'Nạp F1', 285, 56)
-widget('meter', 'createButton', 'apply_damage_meter_f1', 'Ghi vào F1', 365, 56)
+widget('meter', 'createButton', 'stop_damage_meter', 'Dừng', 108, 56)
+widget('meter', 'createLabel', 'Bù ms', 175, 60)
+damage_margin_field = widget('meter', 'createLineEdit', '20', 222, 56, 40, 20)
+widget('meter', 'createButton', 'load_damage_meter_f1', 'Nạp F1', 272, 56)
+widget('meter', 'createButton', 'apply_damage_meter_f1', 'Ghi vào F1', 350, 56)
+damage_suggested_field = widget('meter', 'createLineEdit', '', 448, 56, 52, 20)
+damage_conclusion_field = widget('meter', 'createLabel', '', 510, 60)
 damage_status_field = widget('meter', 'createLabel', 'Nạp F1 hoặc đo tay · 3 mẫu/skill · cùng đối thủ.', 10, 82)
-# phBot QtBind Labels keep the pixel width of their create-time text ("—"),
-# so Tên/B070→hit must be LineEdits with an explicit width or names clip to ~2 chars.
+# Balanced columns (~655). QtBind Labels size to create-time text ("—") → clip;
+# Tên / B070→hit / mẫu use LineEdits with explicit widths (see truncation mock).
 widget('meter', 'createLabel', '#', 10, 104)
 widget('meter', 'createLabel', 'ID', 28, 104)
-widget('meter', 'createLabel', 'Tên', 105, 104)
-widget('meter', 'createLabel', 'B070→hit', 365, 104)
-widget('meter', 'createLabel', 'cut ms', 455, 104)
-widget('meter', 'createLabel', 'mẫu', 520, 104)
+widget('meter', 'createLabel', 'Tên', 108, 104)
+widget('meter', 'createLabel', 'B070→hit', 368, 104)
+widget('meter', 'createLabel', 'cut ms', 462, 104)
+widget('meter', 'createLabel', 'mẫu', 532, 104)
 damage_meter_f1_fields = []
 for _meter_row in range(DAMAGE_METER_F1_ROWS):
-    _y = 122 + _meter_row * 22
-    widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 3)
-    _id = widget('meter', 'createLineEdit', '', 28, _y, 70, 20)
-    _name = widget('meter', 'createLineEdit', '—', 105, _y, 250, 20)
-    _hit = widget('meter', 'createLineEdit', '—', 365, _y, 78, 20)
-    _cut = widget('meter', 'createLineEdit', '', 455, _y, 55, 20)
-    _samples = widget('meter', 'createLineEdit', '0/3', 520, _y, 42, 20)
+    _y = 124 + _meter_row * 22
+    widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 2)
+    _id = widget('meter', 'createLineEdit', '', 28, _y, 72, 20)
+    _name = widget('meter', 'createLineEdit', '—', 108, _y, 250, 20)
+    _hit = widget('meter', 'createLineEdit', '—', 368, _y, 84, 20)
+    _cut = widget('meter', 'createLineEdit', '', 462, _y, 58, 20)
+    _samples = widget('meter', 'createLineEdit', '0/3', 532, _y, 48, 20)
     damage_meter_f1_fields.append((_id, _name, _hit, _cut, _samples))
-damage_suggested_field = widget('meter', 'createLineEdit', '', 560, 56, 55, 20)
-damage_conclusion_field = widget('meter', 'createLabel', '', 560, 82)
-damage_formula_field = widget('meter', 'createLabel', 'Công thức: ceil(B070→hit chậm nhất) + bù ms. Đo xong skill này → skill F1 khác.', 10, 258)
-damage_result_list = widget('meter', 'createList', 10, 278, 655, 40)
-widget('meter', 'createLabel', 'Giữ khoảng cách; đợi hồi giữa mẫu. Ghi vào F1 cập nhật cột ms nhóm Ghost F1.', 10, 322)
+damage_formula_field = widget(
+    'meter', 'createLabel',
+    'Công thức: ceil(B070→hit chậm nhất) + bù. Cung/đạn: chờ hit muộn; n/a = nhập cut tay.',
+    10, 262)
+damage_result_list = widget('meter', 'createList', 10, 282, 655, 40)
+widget('meter', 'createLabel', 'Giữ khoảng cách; đợi hồi giữa mẫu. Ghi vào F1 cập nhật cột ms nhóm Ghost F1.', 10, 326)
 
 
 def _damage_meter_skill_name(uid):
@@ -9151,6 +9191,21 @@ def inline_first_damage(raw, target):
     return damage if damage > 0 else None
 
 
+def mark_damage_meter_unmeasurable(uid, reason):
+    """Show n/a in the F1 meter row when hit inline never arrives (bow/buff)."""
+    uid_text = str(int(uid or 0))
+    if not uid_text or uid_text == '0':
+        return
+    for uid_field, name_label, hit_label, cut_field, sample_label in damage_meter_f1_fields:
+        if QtBind.text(gui, uid_field).strip() != uid_text:
+            continue
+        QtBind.setText(gui, name_label, _damage_meter_skill_name(int(uid_text)))
+        QtBind.setText(gui, hit_label, 'n/a')
+        QtBind.setText(gui, sample_label, '0/3')
+        break
+    report('Đo ms: ID %s không đo được — %s' % (uid_text, reason))
+
+
 def observe_damage_meter(outgoing, opcode, data):
     global damage_meter, damage_meter_update
     if damage_meter is None or opcode not in ((0x7074,) if outgoing else (0xB070, 0xB071)):
@@ -9172,7 +9227,7 @@ def observe_damage_meter(outgoing, opcode, data):
             # Multi-skill F1 table: allow switching skill after a completed sample set.
             if job['skill'] is not None and uid != job['skill'] and job['samples']:
                 return
-            if cast and now - cast['sent'] <= 8_000_000_000:
+            if cast and now - cast['sent'] <= DAMAGE_METER_CAST_TIMEOUT_NS:
                 cast['repeated'] = True
                 return
             if job['target'] is not None and target != job['target']:
@@ -9184,34 +9239,51 @@ def observe_damage_meter(outgoing, opcode, data):
             job['skill'] = uid
             job['cast'] = dict(target=target, sent=now, ack=None, action=None, repeated=False)
             return
-        if not cast or now - cast['sent'] > 8_000_000_000:
+        if not cast or now - cast['sent'] > DAMAGE_METER_CAST_TIMEOUT_NS:
             return
         if opcode == 0xB071:
+            # B071 is logged for capture; meter still needs B070 inline ST (stack path).
             if cast['ack'] is not None and not cast.get('saw_b071'):
                 cast['saw_b071'] = True
-                report('Đo ms: B071 chờ đối chiếu ID=%d | %s' % (job['skill'], raw[:64].hex(' ').upper()))
+                report('Đo ms: B071 sau B070 ID=%d (chờ hit inline B070) | %s' %
+                       (job['skill'], raw[:64].hex(' ').upper()))
             return
         if len(raw) < 19 or raw[0] != 1:
             return
         uid, source, action, target = struct.unpack_from('<IIII', raw, 3)
-        if (uid, source, target) != (job['skill'], job['source'], cast['target']):
+        if uid != job['skill'] or source != job['source']:
             return
+        # Bow/projectile: cast confirm often has target=0; impact B070 carries UID.
+        # Melee: both packets usually carry the same target.
+        expected = cast['target']
         if cast['ack'] is None:
+            if target not in (0, expected):
+                return
             cast.update(ack=now, action=action)
-        elif cast['action'] != action:
+            if target == 0 and not cast.get('logged_zero_target'):
+                cast['logged_zero_target'] = True
+                report('Đo ms: B070 confirm ID=%d target=0 · chờ hit UID %d (cung/đạn?).' %
+                       (uid, expected))
+        elif target not in (0, expected):
             return
-        damage = inline_first_damage(raw, target)
+        # Impact often uses a different action id than cast confirm — do not require match.
+        damage = inline_first_damage(raw, expected)
         if damage is None:
             if not cast.get('logged'):
                 cast['logged'] = True
-                report('Đo ms: B070 đúng skill, chưa đọc được hit trực tiếp ID=%d | %s' %
+                report('Đo ms: B070 đúng skill ID=%d, chưa có hit inline · chờ gói ST | %s' %
                        (uid, raw[:64].hex(' ').upper()))
+            lines = damage_meter_update[0] if damage_meter_update else []
+            damage_meter_update = (
+                lines,
+                'ID %d · đã B070 · đang chờ hit inline (cung/đạn có thể muộn)…' % uid,
+                None)
             return
         job['cast'] = None
         if cast['repeated']:
             report('Đo ms: bỏ lượt ID=%d do có nhiều lệnh chồng nhau. Bấm đúng một lần.' % uid)
             return
-        job['target'] = cast['target']
+        job['target'] = expected
         ack_ms = (cast['ack'] - cast['sent']) / 1_000_000
         hit_ms = (now - cast['ack']) / 1_000_000
         samples = job['samples']
@@ -9249,10 +9321,26 @@ def tick_damage_meter():
                 end_damage_meter('Dừng đo vì đổi nhân vật, đã chết hoặc bot chính đang chạy.')
             elif now >= job['deadline']:
                 end_damage_meter('Hết giờ đo. Ghi các mốc đã có vào F1 nếu đủ.')
-            elif job['cast'] and now - job['cast']['sent'] > 8_000_000_000:
+            elif job['cast'] and now - job['cast']['sent'] > DAMAGE_METER_CAST_TIMEOUT_NS:
+                cast = job['cast']
+                uid = job.get('skill')
+                had_ack = bool(cast.get('ack'))
                 job['cast'] = None
                 lines = damage_meter_update[0] if damage_meter_update else []
-                damage_meter_update = (lines, 'Chưa nhận diện được hit ở lượt vừa rồi. Xem log Đo ms.', None)
+                if had_ack and uid:
+                    reason = ('B070 OK nhưng không có hit inline trong %.0fs '
+                              '(cung/đạn/buff hoặc layout khác) — nhập cut ms tay'
+                              % (DAMAGE_METER_CAST_TIMEOUT_NS / 1e9))
+                    mark_damage_meter_unmeasurable(uid, reason)
+                    damage_meter_update = (
+                        lines,
+                        'ID %d · không đo được: %s' % (uid, reason),
+                        None)
+                else:
+                    damage_meter_update = (
+                        lines,
+                        'Chưa nhận diện được hit ở lượt vừa rồi. Xem log Đo ms.',
+                        None)
         update, damage_meter_update = damage_meter_update, None
     if update:
         lines, status, value = update
