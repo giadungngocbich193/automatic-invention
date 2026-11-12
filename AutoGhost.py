@@ -2,6 +2,9 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX AOS-49] Chạy vòng (Kick ô) 10m/20m: Target Enemy miss-gate sai
+  (`not native_expired or misses<2`) + dừng patrol khi có người trong vùng quét
+  → orbit không bao giờ chạy; sửa miss limit + cho patrol khi idle.
 - [FIX AOS-48] Tay phép PvP: combo bị frame đè → không mở/chọn được; remount
   checkbox+combo+Quét sau frame (cùng tọa độ). Auto PK gate sau khi chọn ID.
 - [FIX AOS-44] Auto PK: chặn mọi 7074 đánh thường (01 01 01) khi đang armed —
@@ -61,8 +64,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '4.4.14'
-# raw-main download stamp: 2026-11-12T13:55Z (UTF-8 no BOM/U+200B)
+VERSION = '4.4.15'
+# raw-main download stamp: 2026-11-12T14:05Z (UTF-8 no BOM/U+200B)
+# [FIX AOS-49] Chạy vòng 10/20m: fix Target Enemy miss gate + allow patrol idle.
 # [FIX AOS-48] Tay phép: remount combo/checkbox after PvP frame so Quét→chọn được.
 # ghep-2.6: Auto PK layout + F1 cut-ms table; baseline 2600 + party prefer B074
 PARTY_PREFER_B074_BACKOFF = 1.5
@@ -88,6 +92,7 @@ PARTY_CAST_CONFIRM_TIMEOUT = 1.20
 PARTY_CAST_RETRY_GAP = 1.00
 AUTO_PK_SELECT_TIMEOUT = 0.50
 AUTO_PK_NATIVE_TIMEOUT = 0.20
+AUTO_PK_NATIVE_MISS_LIMIT = 2  # then allow Chạy vòng; do not re-spam Target Enemy forever
 AUTO_PK_NATIVE_KEYS = {
     '`': 0xC0,  # VK_OEM_3 on US keyboards
     **{'F%d' % number: 0x6F + number for number in range(9, 13)},
@@ -5218,7 +5223,11 @@ def auto_pk_select(character, runtime, now, from_event=False, on_return=False):
         # Farm never shares Target/API with PK. Target Enemy is opponent-only.
         if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
+        if native_expired:
+            runtime['native_misses'] = runtime.get('native_misses', 0) + 1
+        # [FIX AOS-49] Cap Target Enemy retries so Chạy vòng can move.
+        if (runtime.get('native_misses', 0) < AUTO_PK_NATIVE_MISS_LIMIT
+                and auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list')):
             return
         if tick_auto_pk_patrol(runtime, position, now):
             return
@@ -5275,8 +5284,9 @@ def auto_pk_select(character, runtime, now, from_event=False, on_return=False):
         distance, uid, anchor_distance = best_scan
         if farming:
             tick_auto_pk_idle_mob(runtime, character, now)
-        else:
-            stop_auto_pk_patrol(runtime)
+        # [FIX AOS-49] Keep Chạy vòng while someone is only in scan ring (not attack).
+        if tick_auto_pk_patrol(runtime, position, now):
+            return
         QtBind.setText(gui, auto_pk_status_label,
                        'Người chơi UID %d cách điểm chờ %.1f m · sẵn sàng Ghost %s khi vào vùng đánh %.0f m.'
                        % (uid, anchor_distance, runtime['page'], attack_radius))
@@ -5285,11 +5295,14 @@ def auto_pk_select(character, runtime, now, from_event=False, on_return=False):
         # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
         if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        # No list hostile: Target Enemy still for màu ẩn; then stand still unless Chạy vòng.
-        if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
-                runtime, client, now, 'chưa thấy người chơi trong vùng'):
-            if native_expired:
-                runtime['native_misses'] = runtime.get('native_misses', 0) + 1
+        # No list hostile: Target Enemy still for màu ẩn; then Chạy vòng / stand still.
+        if native_expired:
+            runtime['native_misses'] = runtime.get('native_misses', 0) + 1
+        # [FIX AOS-49] Was `(not native_expired or misses < 2)` → forever re-fire
+        # Target Enemy on later ticks and starve Chạy vòng 10m/20m.
+        if (runtime.get('native_misses', 0) < AUTO_PK_NATIVE_MISS_LIMIT
+                and auto_pk_try_native_enemy_key(
+                    runtime, client, now, 'chưa thấy người chơi trong vùng')):
             return
         if tick_auto_pk_patrol(runtime, position, now):
             return
