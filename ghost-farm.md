@@ -40,4 +40,8 @@ Solo monster/boss only. No self primary. No player neighbor. No `inject_joymax(0
 
 ## jsDelivr
 
-*(pin filled after ship commit)*
+## jsDelivr
+
+https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@c0078f5b8921aa841b0ab81c2a43325bcf512ae1/GhostFarm.py
+
+Raw: https://github.com/giadungngocbich193/automatic-invention/raw/c0078f5b8921aa841b0ab81c2a43325bcf512ae1/GhostFarm.py
