@@ -80,6 +80,6 @@ Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 ## jsDelivr
 
-Pin after merge/ship (this file updated when commit lands):
+jsDelivr pin:
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@COMMIT/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@b7ccf1ee8cd767e511d417c86d98c7b60021e3b1/GhostFarm.py`
