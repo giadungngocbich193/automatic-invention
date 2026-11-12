@@ -1,6 +1,18 @@
-# GhostFarm v1.0.9
+# GhostFarm v1.0.10
 
 Standalone phBot farm with **overlapping Ghost interrupt** via the proven AutoGhost / GhostNativeProbe `NativeCut` path (`client_7081`).
+
+## Why 1.0.10
+
+Prefill **Skill IDs** from the confirmed Auto PK **F1 skill+Ngắt** table (filled ID + ms only; skip blank IDs; ignore blank-ID ms 850; **no 81037**).
+
+Default field:
+
+```text
+80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5
+```
+
+If the UI still shows an old empty/config value after reload, paste that string into **Skill IDs (F1)**.
 
 ## Why 1.0.9 (fix “toàn đánh thường”)
 
@@ -39,7 +51,7 @@ Farm mirrors that:
 ## Skill IDs
 
 ```text
-80031=1;66007=20;54016=0;81019=15
+80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5
 ```
 
 `skillId=ms` after **B070** (AG), not after 7074.
@@ -47,7 +59,7 @@ Farm mirrors that:
 ## User must set
 
 1. Tick **Bật**
-2. Fill **Skill IDs** (required — empty = no 7074 / no Ghost)
+2. Confirm **Skill IDs** (prefilled; empty = no 7074 / no Ghost)
 3. **Start farm**
 4. Prefer **Self** mode
 5. Disable phBot **Training combat** (farm drops basic, but Training still fights the bot)
@@ -80,6 +92,6 @@ Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 ## jsDelivr
 
-jsDelivr pin:
+jsDelivr pin (update after push to the commit that ships 1.0.10):
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@e03913630c9a94c5fe69497367ea8b2306e2f427/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@PIN/GhostFarm.py`

@@ -2,6 +2,9 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.10: Prefill Skill IDs from confirmed Auto PK F1 skill+Ngắt table
+  (skip blank IDs; ignore blank-ID ms 850; no 81037):
+  `80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5`.
 - v1.0.9: Fix “toàn đánh thường” farm — after 7045, phBot training / client
   basic `7074 01 01 01` stole combat while NativeCut prewarmed, so 7074 skill
   never got B070 and Ghost looked absent. While farming: DROP basic attacks,
@@ -76,8 +79,9 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.9'
-SKILL_FIELD_EXAMPLE = '80031=1;66007=20;54016=0;81019=15'
+VERSION = '1.0.10'
+# Confirmed Auto PK F1 skill+Ngắt (filled ID + ms; blank IDs skipped; no 81037).
+SKILL_FIELD_EXAMPLE = '80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -176,7 +180,7 @@ QtBind.createButton(gui, 'btn_refresh', 'Làm mới', 280, 66)
 QtBind.createButton(gui, 'btn_close', 'Tháo móc', 400, 66)
 
 QtBind.createLabel(gui, 'Skill IDs (F1)', 10, 98)
-skill_field = QtBind.createLineEdit(gui, '', 110, 94, 450, 22)
+skill_field = QtBind.createLineEdit(gui, SKILL_FIELD_EXAMPLE, 110, 94, 450, 22)
 
 self_uid_label = QtBind.createLabel(gui, 'Self UID: (chưa đọc)', 10, 126)
 nearby_label = QtBind.createLabel(gui, 'Gần: 0 quái/NPC trong bán kính', 10, 148)
@@ -187,8 +191,8 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 236)
 
 QtBind.createLabel(
     gui,
-    'v1.0.9: Bật+Start+Skill IDs → 7045→(drop basic)→7074→B070→Timer→arm(2). '
-    'Tắt Training/AG Ghost nếu móc conflict. VD: 80031=1;66007=20.',
+    'v1.0.10: Bật+Start+Skill IDs → 7045→(drop basic)→7074→B070→Timer→arm(2). '
+    'Tắt Training/AG Ghost nếu móc conflict. VD: 80031=1;66007=5;…',
     10, 268,
 )
 
@@ -607,8 +611,8 @@ def read_skill_entries():
     """Parse Skill IDs field as [(skill_id, ghost_delay_ms), ...].
 
     Formats:
-      80031=1;66007=20;54016=0;81019=15
-      80031=1,66007=20
+      80031=1;66007=5;54016=1;81019=5
+      80031=1,66007=5
       3048,3050          → delay DEFAULT_GHOST_DELAY_MS
     """
     raw = (QtBind.text(gui, skill_field) or '').strip()
