@@ -2,15 +2,19 @@
 """GhostCutProbe — solo mid-cast Ghost probe (NativeCut client_7081).
 
 Changelog:
+- v1.0.1: Real compare — Cut Self NativeCut target=self UID; Cut Monster
+  NativeCut target=monster/boss UID (arm page + 7081 with that UID). Was
+  wrongly always self. Logs cut_uid clearly.
 - v1.0.0: Manual Self / Monster|Boss cut tool. Cast skill → delay ms after
-  7074 → NativeCut arm(2) self (NOT inject 7081). Buttons: Cut Self |
+  7074 → NativeCut arm(2) (NOT inject 7081). Buttons: Cut Self |
   Cut Monster (selected/nearest). Boss+monster/NPC only — no Player cut.
   Log: UID, since_7074, 7081 observed, B074 MID-CUT vs FULL-CAST.
   Solo, no neighbor trade. Independent of AutoGhost / GhostFarm.
 
-Path (same as GhostNativeProbe / GhostFarm interrupt):
-  NativeCut({pid, window, target=self}) → arm(1) verify → cast 7074 →
-  wait delay_ms → arm(2) client_7081 → observe 7081 + B074 02 00.
+Path:
+  NativeCut({pid, window, target=cut_uid}) → arm(1) verify → cast 7074 on
+  monster → wait delay_ms → arm(2) client_7081 for cut_uid → observe 7081.
+  cut_uid = self (Cut Self) | monster/boss (Cut Monster).
 """
 
 from __future__ import print_function
@@ -33,7 +37,7 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostCutProbe'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 
 CLIENT_SHA256 = {
     'bd2aba5bb7ac74890f3a73795106339e556bd1499f019f4d637f0528fc3baa30',
@@ -120,8 +124,8 @@ stats_label = QtBind.createLabel(
 
 QtBind.createLabel(
     gui,
-    'Interrupt = NativeCut client_7081 self only (NOT inject 7081). '
-    'Boss/monster only — no Player. Log: UID · since_7074 · 7081 · MID-CUT|FULL-CAST.',
+    'v1.0.1: Cut Self → 7081 self UID; Cut Monster → 7081 monster/boss UID. '
+    'NativeCut only (NOT inject 7081). Log: cut_uid · since_7074 · MID-CUT|FULL-CAST.',
     10, 250,
 )
 
@@ -620,7 +624,7 @@ def ui_enabled(checked):
     show_monster_pick()
     show_client()
     set_status(
-        'BẬT — Cut Self / Cut Monster (NativeCut client_7081).'
+        'BẬT — Cut Self=7081 self · Cut Monster=7081 monster/boss (NativeCut).'
         if on else 'TẮT — đã tháo móc.')
 
 
@@ -685,7 +689,7 @@ def _verdict_for_job(job):
 
 
 def queue_cut(mode):
-    """Queue one cast→delay→NativeCut(self) cycle. mode: self|monster."""
+    """Queue cast→delay→NativeCut(cut_uid). mode self→self UID; monster→monster UID."""
     if not plugin_enabled():
         set_status('Plugin đang TẮT — bật trước khi Cut.')
         return False
@@ -715,17 +719,28 @@ def queue_cut(mode):
         set_status('Từ chối Player UID=%d — chỉ monster/boss.' % monster['uid'])
         return False
 
+    monster_uid = int(monster['uid'])
+    # Real compare: Cut Self → 7081 self; Cut Monster → 7081 monster/boss.
+    if mode == 'monster':
+        cut_uid = monster_uid
+        cut_label = 'monster'
+    else:
+        cut_uid = self_uid
+        cut_label = 'self'
+        mode = 'self'
+
     show_monster_pick(rows)
     job = {
         'mode': mode,
-        'uid': self_uid,  # NativeCut / 7081 = self interrupt always
-        'select_uid': int(monster['uid']),
-        'monster_uid': int(monster['uid']),
+        'uid': cut_uid,  # NativeCut / 7081 target (self OR monster)
+        'self_uid': self_uid,
+        'select_uid': monster_uid,
+        'monster_uid': monster_uid,
         'monster_name': monster['name'],
         'kind': monster['kind'],
         'skill_id': skill_id,
         'ghost_delay_ms': delay_ms,
-        'label': '%s→#%d' % (mode, monster['uid']),
+        'label': '%s cut_uid=%d cast→#%d' % (mode, cut_uid, monster_uid),
         'phase': 'select',
         'next_at': monotonic(),
         'verify_deadline': 0.0,
@@ -742,7 +757,7 @@ def queue_cut(mode):
         'bridge_done': False,
         'b074': '',
         'full_cast_seen': False,
-        'hex': _hex_bytes(_pack_uid(self_uid)),
+        'hex': _hex_bytes(_pack_uid(cut_uid)),
         'error': '',
         'verdict': '',
     }
@@ -750,13 +765,13 @@ def queue_cut(mode):
         state['queue'] = [job]
         state['active'] = job
     set_status(
-        'Queued %s · monster=#%d %s · skill=%d · delay=%dms · interrupt=self %d'
-        % (mode, monster['uid'], monster['name'], skill_id, delay_ms, self_uid))
+        'Queued %s · NativeCut cut_uid=%d (%s) · cast monster=#%d · skill=%d · delay=%dms'
+        % (mode, cut_uid, cut_label, monster_uid, skill_id, delay_ms))
     _log(
-        'QUEUE %s · self=%d · monster=%d [%s] %s · skill=%d · delay_after_7074=%dms · '
-        'path=NativeCut client_7081 (NOT inject)'
-        % (mode, self_uid, monster['uid'], monster['kind'], monster['name'],
-           skill_id, delay_ms))
+        'QUEUE %s · cut_uid=%d (%s) · self=%d · monster=%d [%s] %s · skill=%d · '
+        'delay_after_7074=%dms · path=NativeCut client_7081 (NOT inject)'
+        % (mode, cut_uid, cut_label, self_uid, monster_uid, monster['kind'],
+           monster['name'], skill_id, delay_ms))
     return True
 
 
@@ -777,12 +792,12 @@ def _prewarm_native(job, uid, now):
         session['bridge'].arm(1)
         job['prewarm_started'] = True
         job['prewarm_deadline'] = now + 3.0
-        _log('NativeCut PREWARM arm(1) · self=%d' % uid)
+        _log('NativeCut PREWARM arm(1) · cut_uid=%d · mode=%s' % (uid, job.get('mode')))
         return False
     if session['bridge'].completed(4):
         session['verified'] = True
         job['prewarm_ready'] = True
-        _log('NativeCut PREWARM OK · self=%d' % uid)
+        _log('NativeCut PREWARM OK · cut_uid=%d · mode=%s' % (uid, job.get('mode')))
         return True
     if now >= float(job.get('prewarm_deadline') or 0):
         raise ValueError(
@@ -802,16 +817,36 @@ def _retarget_bridge(session, uid):
     bridge.write(
         bridge.page,
         struct.pack('<IIII', state_w, tid, new_target, original))
-    _log('NativeCut retarget %d → %d' % (old_target, new_target))
+    _log('NativeCut retarget cut_uid %d → %d' % (old_target, new_target))
+
+
+def _resolve_cut_uid(job):
+    """Cut Self → live self UID; Cut Monster → monster/boss UID (never force self)."""
+    mode = job.get('mode') or 'self'
+    if mode == 'monster':
+        cut_uid = int(job.get('monster_uid') or job.get('uid') or 0)
+        if not cut_uid:
+            raise ValueError('Cut Monster thiếu monster UID.')
+        if _is_player_uid(cut_uid):
+            raise ValueError('Cut Monster từ chối Player UID=%d.' % cut_uid)
+        return cut_uid
+    # mode self — refresh player_id in case of relog mid-probe
+    live = read_self_uid()
+    cut_uid = live or int(job.get('self_uid') or job.get('uid') or 0)
+    if not cut_uid:
+        raise ValueError('Cut Self thiếu self UID.')
+    return cut_uid
 
 
 def _fire_native_cut(job, uid, now):
-    live_uid = read_self_uid() or int(uid)
-    if live_uid and live_uid != int(uid):
-        _log('CUT self UID refresh %d → %d' % (int(uid), live_uid))
-        uid = live_uid
-        job['uid'] = uid
-        job['hex'] = _hex_bytes(_pack_uid(uid))
+    cut_uid = _resolve_cut_uid(job)
+    if cut_uid != int(uid):
+        _log(
+            'CUT cut_uid resolve %d → %d · mode=%s'
+            % (int(uid), cut_uid, job.get('mode')))
+    uid = cut_uid
+    job['uid'] = uid
+    job['hex'] = _hex_bytes(_pack_uid(uid))
     session = get_or_create_session(uid)
     if not session.get('verified'):
         if not _prewarm_native(job, uid, now):
@@ -836,14 +871,14 @@ def _fire_native_cut(job, uid, now):
         state['active'] = job
     _log(
         'NativeCut arm(2) CUT NOW · transport=client_7081 · NOT inject · '
-        'mode=%s · self=%d · monster=%d · skill=%d · delay_cfg=%dms · '
+        'mode=%s · cut_uid=%d · self=%d · monster=%d · skill=%d · delay_cfg=%dms · '
         'since_7074=%dms · hex=%s'
-        % (job.get('mode'), uid, int(job.get('monster_uid') or 0),
-           int(job.get('skill_id') or 0), int(job.get('ghost_delay_ms') or 0),
-           since_7074, job.get('hex') or '?'))
+        % (job.get('mode'), uid, int(job.get('self_uid') or 0),
+           int(job.get('monster_uid') or 0), int(job.get('skill_id') or 0),
+           int(job.get('ghost_delay_ms') or 0), since_7074, job.get('hex') or '?'))
     set_status(
-        'CUT arm(2) self=%d · since_7074=%dms · monster=%d'
-        % (uid, since_7074, int(job.get('monster_uid') or 0)))
+        'CUT arm(2) cut_uid=%d (%s) · since_7074=%dms · monster=%d'
+        % (uid, job.get('mode'), since_7074, int(job.get('monster_uid') or 0)))
     return True
 
 
@@ -876,15 +911,17 @@ def _finish_job(job, note):
     cut_at = float(job.get('cut_fired_at') or 0)
     since_7074 = int(round((cut_at - cast_at) * 1000)) if cast_at and cut_at else -1
     _log(
-        'RESULT %s · verdict=%s · self=%d · monster=%d · skill=%d · '
+        'RESULT %s · verdict=%s · cut_uid=%d · self=%d · monster=%d · skill=%d · '
         'since_7074=%dms · 7081=%s · B074=%s · %s'
         % (job.get('mode'), verdict, int(job.get('uid') or 0),
-           int(job.get('monster_uid') or 0), int(job.get('skill_id') or 0),
-           since_7074, 'YES' if job.get('observed') else 'NO',
+           int(job.get('self_uid') or 0), int(job.get('monster_uid') or 0),
+           int(job.get('skill_id') or 0), since_7074,
+           'YES' if job.get('observed') else 'NO',
            job.get('b074') or '(none)', note))
     set_status(
-        '%s · 7081=%s · since_7074=%dms · B074=%s'
-        % (verdict, 'YES' if job.get('observed') else 'NO', since_7074,
+        '%s · cut_uid=%d · 7081=%s · since_7074=%dms · B074=%s'
+        % (verdict, int(job.get('uid') or 0),
+           'YES' if job.get('observed') else 'NO', since_7074,
            job.get('b074') or '(none)'))
     if loop and mode in ('self', 'monster'):
         # Re-queue after a short gap so user can hold Loop for cast→cut→cast…
@@ -988,8 +1025,8 @@ def _drive_queue(now):
             if api is False:
                 _log('7074 API=False — vẫn hẹn cut theo delay (client có thể vẫn cast)')
             set_status(
-                'Cast skill %d → Ghost self sau %dms (since_7074)'
-                % (skill_id, delay_ms))
+                'Cast skill %d → NativeCut cut_uid=%d (%s) sau %dms'
+                % (skill_id, uid, job.get('mode'), delay_ms))
             return
 
         if phase == 'cut_wait':
@@ -1156,7 +1193,7 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — điền skill ID + delay (default %dms) → Cut Self / Cut Monster.'
+        'Nạp %s v%s — Cut Self=7081 self · Cut Monster=7081 monster · delay default %dms.'
         % (NAME, VERSION, DEFAULT_DELAY_MS))
 except Exception:
     pass
