@@ -4,7 +4,8 @@
 Changelog (verify in Log / file header):
 - [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); Tìm Skill: gõ ID số
   hiện tên ngay + lọc prefix; không đổi layout Auto PK/PvP.
-- [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 12 m;
+- [AOS-41 F2] Auto PK áp sát F2 = 15 m (F1 vẫn 6 m); camp/attack vẫn 40 m.
+- [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 15 m;
   meter bow target=0 + n/a; Tên/hit LineEdit cùng tọa độ cột (hết clip).
 - [UI ghep-2.6] Auto PK full tab: skill buff inline + ID số → tên ngay + 1 dòng copy ID;
   ẩn □ AutoKS (session = Bật Auto KS). Đo ngắt: bảng F1 nhiều skill (B070→hit → cut ms).
@@ -98,9 +99,9 @@ AUTO_PK_RETURN_STEP = 8.0
 AUTO_PK_MAX_RADIUS = 40
 AUTO_PK_REPORT_RADIUS = 60
 # Approach = character→enemy. Camp/attack radius stays AUTO_PK_MAX_RADIUS from anchor.
-# F1 đại đao 6 m; F2 cung 12 m; F3 default 6 m.
+# F1 đại đao 6 m; F2 cung 15 m (independent); F3 default 6 m.
 AUTO_PK_APPROACH_RANGE = 6.0
-AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 12.0, 'F3': 6.0}
+AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 15.0, 'F3': 6.0}
 AUTO_PK_APPROACH_MOVE_INTERVAL = 0.35
 AUTO_PK_APPROACH_STALL_TIMEOUT = 1.5
 AUTO_PK_TARGET_COORD_GRACE = 0.25
@@ -4615,7 +4616,7 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
 
 
 def auto_pk_approach_range(runtime=None):
-    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 12 m)."""
+    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 15 m)."""
     page = None
     if isinstance(runtime, dict):
         page = runtime.get('page')
@@ -4669,7 +4670,7 @@ def auto_pk_ready_to_cast(runtime, uid, now):
         return False
     if now >= approach['move_at']:
         approach['move_at'] = now + AUTO_PK_APPROACH_MOVE_INTERVAL
-        # Stop at page approach range (F2 12 m) — never pull bow into ~4 m melee.
+        # Stop at page approach range (F2 15 m) — never pull bow into ~4 m melee.
         stop_at = max(1.0, approach_range - 0.5)
         fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
         z = float(position.get('z', anchor['z']))
@@ -7857,7 +7858,7 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
         if not minimum <= distance <= 20:
             push_trace_note('Áp sát: khoảng cách %.1f m ngoài khoảng %.1f–20 m.' % (distance, minimum), after_hit=True)
             return False
-        # Prefer page approach range (F2 12 m) over hard-coded ~4 m melee stop.
+        # Prefer page approach range (F2 15 m) over hard-coded ~4 m melee stop.
         stop_at = max(float(minimum), auto_pk_approach_range() - 0.5)
         stop_at = min(stop_at, distance - 0.5) if distance > 1.0 else max(1.0, distance * 0.5)
         fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
