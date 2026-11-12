@@ -1,5 +1,46 @@
 # -*- coding: utf-8 -*-
-"""Ghost PvP và Boss nền theo ID cho phBot Stable."""
+"""Ghost PvP và Boss nền theo ID cho phBot Stable.
+
+Changelog (verify in Log / file header):
+- [UI AOS-59] Skill rows F1–F3 (PvP + Auto PK): compact ↑↓ createButton
+  beside ID (after LineEdits, styled narrow); no 1–10 column.
+- [FIX AOS-48] Tay phép PvP: combo bị frame đè → không mở/chọn được; remount
+  checkbox+combo+Quét sau frame (cùng tọa độ). Auto PK gate sau khi chọn ID.
+- [FIX AOS-44] Auto PK: chặn mọi 7074 đánh thường (01 01 01) khi đang armed —
+  không cần khớp UID / natural set (F2 cung hết xen đánh thường).
+- [UI AOS-43] Tìm Skill: bảng 1 hàng trống mặc định; gõ ID → chỉ hiện skill đó;
+  Copy / Thêm F1–F3 (Auto PK hoặc PvP). Không dump list. Tab khác nguyên.
+- [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); không đổi Auto PK/PvP.
+- [AOS-41 F2] Auto PK áp sát F2 = 15 m (F1 vẫn 6 m); camp/attack vẫn 40 m.
+- [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 15 m;
+  meter bow target=0 + n/a; Tên/hit LineEdit cùng tọa độ cột (hết clip).
+- [UI ghep-2.6] Auto PK full tab: skill buff inline + ID số → tên ngay + 1 dòng copy ID;
+  ẩn □ AutoKS (session = Bật Auto KS). Đo ngắt: bảng F1 nhiều skill (B070→hit → cut ms).
+- [FIX party B074 loop v1.8.72] prefer UID: B074 = retry next skill (giữ prefer);
+  không soft-clear; Prefer re-arm debounce ≥1.5s after B074.
+- [FIX camp return v1.8.71] UID ra vùng đánh → bỏ khóa + quay về điểm chờ;
+  debounce log ≤1/2s; party prefer unreachable soft-clear (no forever cast).
+- [FIX ally Party+Guild only v1.8.70] exclude ONLY same party / same guild;
+  remove Liên minh; no unknown=skip; stranger in radius still attacked.
+- [FIX party Ghost nền v1.8.70] prefer UID dùng 7081/B074 interrupt như Ghost thường;
+  F4 tắt → prefer re-arm Auto PK; không natural-attack lock.
+- [FIX party prefer cast v1.8.69] prefer UID → Ghost F cast ngay; NEVER retire
+  party prefer; B070 miss = soft-wait (no spam “bỏ qua UID”); PL Trace AG_He.
+- [FIX party soft-hold v1.8.68] hold/clear không inject 7046/7074 (tránh DC);
+  soft-stop Ghost giữ Auto PK armed.
+- [FIX party sync no-7045 v1.8.67] prefer/direct Ghost; follower no camp;
+  HARD never Auto PK own party. Disconnect giữ PK khi Phụ+arm.
+  No Ghost nền cut party-sync UID. Buff F-gear capture clearer.
+- [FIX no B070 hard-stop v1.8.66] Baseline AutoGhost_2600. pause_pvp chặn mọi
+  “chưa có B070 khớp / sau N lần thử lại” → soft-wait; không “Auto Ghost dừng”.
+  Chỉ tắt khi chết / Dừng / ks off / F4 / X.
+- [FIX Auto PK + trace] get_status tracing KHÔNG chặn arm/cast/7045. Không stop_bot.
+- [FIX party sync] party_sync_arm/stop/select/clear/hold + nhóm F (PartyLeader).
+  HARD: chỉ UID chủ; chủ dừng → hold; chủ clear → clear.
+- [FIX stale B070 ID] ID không thuộc nhóm F → bỏ ID.
+- [FIX hostile filter đỏ/tím+job] + camp stand-still + scan 60m + never-abort.
+- [FIX no player 7045] Target Enemy key; mob farm select unchanged.
+"""
 
 import ctypes
 import hashlib
@@ -22,8 +63,12 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '1.8.44'
-# raw-main download stamp: 2026-11-10T23:30Z (UTF-8 no BOM/U+200B)
+VERSION = '4.4.17'
+# raw-main download stamp: 2026-11-12T18:55Z (UTF-8 no BOM/U+200B)
+# [UI AOS-59] ↑↓ compact buttons after ID/ms (z-order + stylesheet width).
+# [FIX AOS-48] Tay phép: remount combo/checkbox after PvP frame so Quét→chọn được.
+# ghep-2.6: Auto PK layout + F1 cut-ms table; baseline 2600 + party prefer B074
+PARTY_PREFER_B074_BACKOFF = 1.5
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
 PAGES = ('F1', 'F2', 'F3', 'F4')
 PVP_EDIT_PAGES = PAGES[:3]
@@ -32,15 +77,22 @@ PAGE_KEYS = (0x70, 0x71, 0x72, 0x73)
 AUTO_HUNT_RADIUS = 50
 AUTO_HUNT_INTERVAL = 0.06
 PVP_KEY_INTERVAL = 0.03
-AUTO_PK_SCAN_INTERVAL = 0.075
-AUTO_PK_FAST_SCAN_INTERVAL = 0.040
+AUTO_PK_SCAN_INTERVAL = 0.015  # locked-target poll
+AUTO_PK_FAST_SCAN_INTERVAL = 0.015  # near-camp player scan → Target reacts sooner
+AUTO_PK_DISPLAY_INTERVAL = 0.25  # refresh player list UI while camping
 AUTO_PK_MAX_SCAN_RADIUS = 120
-AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.35
-AUTO_PK_CAST_RETRY_DELAY = 2.0
-AUTO_PK_SELECT_TIMEOUT = 1.5
-AUTO_PK_NATIVE_TIMEOUT = 0.75
-AUTO_PK_NATIVE_MISS_LIMIT = 2
+AUTO_PK_SCAN_PREVIEW_MARGIN = 20
+AUTO_PK_TARGET_OUTSIDE_CONFIRM = 0.50  # confirm left vùng đánh before clear+return
+AUTO_PK_LOG_DEBOUNCE = 2.0  # never flood “ra vùng đánh” / quay về logs
+AUTO_PK_CAST_CONFIRM_TIMEOUT = 0.50
+AUTO_PK_LOCKED_SKILL_RETRY = 0.65
+AUTO_PK_PROBE_CONFIRM_TIMEOUT = 0.65
+PARTY_CAST_CONFIRM_TIMEOUT = 1.20
+PARTY_CAST_RETRY_GAP = 1.00
+AUTO_PK_SELECT_TIMEOUT = 0.50
+AUTO_PK_NATIVE_TIMEOUT = 0.20
 AUTO_PK_NATIVE_KEYS = {
+    '`': 0xC0,  # VK_OEM_3 on US keyboards
     **{'F%d' % number: 0x6F + number for number in range(9, 13)},
     'HOME': 0x24, 'END': 0x23, 'INSERT': 0x2D, 'PAGEUP': 0x21, 'PAGEDOWN': 0x22,
 }
@@ -49,13 +101,22 @@ AUTO_PK_PROTECTION_DELAY = 5.0
 AUTO_PK_PROTECTED = 'tạm bỏ qua UID này'
 AUTO_PK_RETURN_STALL_TIMEOUT = 8.0
 AUTO_PK_RETURN_MIN_PROGRESS = 0.5
-AUTO_PK_RETURN_FORCE_AFTER = 3.0
-AUTO_PK_RETURN_CANCEL_GAP = 0.15
-AUTO_PK_RETURN_MOVE_INTERVAL = 2.0
+AUTO_PK_RETURN_FORCE_AFTER = 0.90
+AUTO_PK_RETURN_CANCEL_GAP = 0.080
+AUTO_PK_RETURN_MOVE_INTERVAL = 0.45
 AUTO_PK_RETURN_STEP = 8.0
 AUTO_PK_MAX_RADIUS = 40
 AUTO_PK_REPORT_RADIUS = 60
+# Approach = character→enemy. Camp/attack radius stays AUTO_PK_MAX_RADIUS from anchor.
+# F1 đại đao 6 m; F2 cung 15 m (independent); F3 default 6 m.
 AUTO_PK_APPROACH_RANGE = 6.0
+AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 15.0, 'F3': 6.0}
+AUTO_PK_APPROACH_MOVE_INTERVAL = 0.35
+AUTO_PK_APPROACH_STALL_TIMEOUT = 1.5
+AUTO_PK_TARGET_COORD_GRACE = 0.25
+AUTO_PK_POST_CUT_TIMEOUT = 1.5
+AUTO_PK_MOB_SELECT_TIMEOUT = 1.2
+AUTO_PK_MOB_CAST_GAP = 0.4
 AUTO_PK_OUTSIDE_SELF = 'nhân vật vượt bán kính canh'
 AUTO_PK_OUTSIDE_TARGET = 'mục tiêu vượt bán kính canh'
 NUMERIC_KEY_INTERVAL = 0.02
@@ -122,7 +183,9 @@ ui_views = {}
 ui_sync = False
 run_section = 'pvp'
 pvp_right_editor = 'F2'
+auto_pk_right_editor = 'F2'
 hidden_game = None
+_ui_current_view = 'pvp'
 
 
 def get_client():
@@ -149,17 +212,27 @@ def widget(view, kind, *args):
     return handle
 
 def show_view(view):
-    global run_section
+    global run_section, _ui_current_view
+    _ui_current_view = view
     if view in ('pvp', 'boss'):
         run_section = view
     for name, controls in ui_views.items():
-        visible = name == view or (view == 'pvp' and name == 'pvp_' + pvp_right_editor)
+        visible = (name == view or (view == 'pvp' and name == 'pvp_' + pvp_right_editor)
+                   or (view == 'auto_pk' and name == 'auto_pk_' + auto_pk_right_editor))
         for handle, x, y in controls:
             QtBind.move(gui, handle, x if visible else -10000, y)
     for handle,x,y in globals().get('shared_combat_controls',()):
-        QtBind.move(gui,handle,-10000 if view in ('tools','auto_pk','auto_pk_options','auto_pk_buffs','presets','boss','meter') else x,y)
+        QtBind.move(gui,handle,-10000 if view in ('tools','auto_pk','auto_pk_options','auto_pk_buffs','auto_pk_advanced','auto_ks','presets','boss','meter') else x,y)
+    if view == 'meter' and 'refresh_damage_meter_f1_table' in globals():
+        refresh_damage_meter_f1_table()
+    if view == 'tools' and 'resolve_finder_id' in globals():
+        resolve_finder_id(force=True)
+        _finder_sync_dest_default()
 
-def view_pvp(): show_view('pvp')
+def view_pvp():
+    show_view('pvp')
+    if 'pvp_trigger_boxes' in globals():
+        sync_pvp_trigger_boxes()
 def view_boss(): show_view('boss')
 def view_gear(): show_view('gear')
 def view_damage_meter(): show_view('meter')
@@ -167,24 +240,28 @@ def view_tools():
     show_view('tools')
     if 'refresh_skill_finder' in globals():refresh_skill_finder()
 
-QtBind.createButton(gui, 'view_pvp', 'PvP', 10, 5)
-QtBind.createButton(gui, 'view_tools', 'Tìm ID skill', 198, 5)
-QtBind.createButton(gui, 'view_damage_meter', 'Đo ms ngắt', 294, 5)
-QtBind.createButton(gui, 'view_auto_pk', 'Auto pk', 104, 5)
-QtBind.createButton(gui, 'view_presets', 'Bộ cấu hình', 575, 5)
+_pvp_tab_switch = QtBind.createCheckBox(gui, '_pvp_tab_changed', '', 10, 6)
+QtBind.createButton(gui, 'view_pvp', 'PvP', 29, 5)
+_ks_tab_switch = QtBind.createCheckBox(gui, '_ks_tab_changed', '', 109, 6)
+QtBind.createButton(gui, 'view_auto_ks', 'AutoKS', 128, 5)
+_pk_tab_switch = QtBind.createCheckBox(gui, '_pk_tab_changed', '', 208, 6)
+QtBind.createButton(gui, 'view_auto_pk', 'Auto PK', 227, 5)
+QtBind.createButton(gui, 'view_tools', 'Tìm Skill', 323, 5)
+QtBind.createButton(gui, 'view_damage_meter', 'Đo ngắt ms', 419, 5)
+QtBind.createButton(gui, 'view_presets', 'Bộ cấu hình', 523, 5)
 
-
-
-QtBind.createLabel(gui, '%s v%s' % (NAME, VERSION), 465, 10)
-start_button = QtBind.createButton(gui, 'start_clicked', 'Bật', 10, 273)
-stop_button = QtBind.createButton(gui, 'stop_clicked', 'Dừng', 90, 273)
-save_button = QtBind.createButton(gui, 'save_clicked', 'Lưu cấu hình', 175, 273)
-status_label = QtBind.createLabel(gui, 'Đang tắt', 10, 297)
+start_button = QtBind.createButton(gui, 'start_selected_pvp', 'Bật', 10, 278)
+stop_button = QtBind.createButton(gui, 'stop_selected_pvp', 'Dừng', 90, 278)
+save_button = QtBind.createButton(gui, 'save_clicked', 'Lưu cấu hình', 175, 278)
+status_label = QtBind.createLineEdit(gui, 'Đang tắt', 258, 278, 170, 20)
 reclick_box = QtBind.createCheckBox(gui, 'reclick_changed', 'Reclick tối đa 3 lần', 325, 276)
 reclick_wait_label = QtBind.createLabel(gui, 'Chờ ms', 478, 277)
 reclick_wait_field = QtBind.createLineEdit(gui, '650', 530, 273, 55, 20)
-shared_combat_controls=[(start_button,10,273),(stop_button,90,273),(save_button,175,273),
-                        (status_label,10,297),(reclick_box,325,276),(reclick_wait_label,478,277),(reclick_wait_field,530,273)]
+shared_combat_controls=[(start_button,10,278),(stop_button,90,278),(save_button,175,278),
+                        (status_label,258,278)]
+ui_views.setdefault('hidden', []).extend([
+    (reclick_box, 325, 276), (reclick_wait_label, 478, 277), (reclick_wait_field, 530, 273),
+])
 
 # All views share one phBot tab. Off-screen widgets retain their settings.
 pvp_box = widget('pvp', 'createCheckBox', 'pvp_changed', 'Auto Ghost', 10, 36)
@@ -266,7 +343,7 @@ for index, page in enumerate(PAGES):
     widget('gear', 'createButton', 'capture_' + page.lower() + '_gear', 'Lấy đồ', 470, y - 5)
 widget('gear', 'createLabel', 'Mặc bộ đồ muốn dùng rồi bấm Lấy đồ ở dòng F tương ứng.', 10, 165)
 imbue_box = widget('gear', 'createCheckBox', 'imbue_mode_changed', 'Tự duy trì tay phép', 10, 189)
-imbue_field = widget('gear', 'createCombobox', 10, 212, 270, 22)
+imbue_field = widget('gear', 'createCombobox', 10, 212, 248, 22)
 QtBind.append(gui, imbue_field, '(Không dùng)')
 widget('gear', 'createButton', 'refresh_imbues', 'Quét tay phép', 420, 209)
 # Imbue applies globally; Stop disables maintenance.
@@ -287,72 +364,121 @@ widget('hidden', 'createButton', 'copy_probe_to_pvp', 'Chép dãy sang PvP', 215
 widget('hidden', 'createButton', 'clear_probe_draft', 'Xóa dãy nháp', 420, 173)
 widget('hidden', 'createLabel', 'Dãy nháp tự gom: ID=ms; ... — sửa tại đây, Ctrl+A / Ctrl+C để copy', 10, 199)
 probe_draft_field = widget('hidden', 'createLineEdit', '', 10, 216, 580, 20)
-# The old probe widgets remain hidden compatibility storage. The visible finder
-# only reads learned skills and the clipboard; it never edits combat settings.
-widget('tools','createLabel','Tìm tên / ID',10,36)
-finder_query_field=widget('tools','createLineEdit','',100,32,340,22)
-widget('tools','createButton','search_skill_finder','Tìm',450,31)
-widget('tools','createButton','refresh_skill_finder','Quét lại',510,31)
-widget('tools','createButton','clear_skill_finder','Xóa lọc',590,31)
-finder_status_label=widget('tools','createLabel','Tìm theo tên không dấu hoặc ID. Copy ID ngay tại bảng.',10,64)
-widget('tools','createLabel','ID skill',10,87)
-widget('tools','createLabel','Tên skill',110,87)
-widget('tools','createLabel','Cấp',540,87)
-finder_row_fields=[]
-for index in range(6):
-    y=107+index*23
-    uid=widget('tools','createLineEdit','',10,y,85,21)
-    name=widget('tools','createLineEdit','',105,y,425,21)
-    level=widget('tools','createLineEdit','',540,y,42,21)
-    callback='copy_finder_id_'+str(index)
-    globals()[callback]=lambda index=index:copy_finder_id(index)
-    widget('tools','createButton',callback,'Copy ID',595,y-1)
-    finder_row_fields.append((uid,name,level))
-widget('tools','createButton','finder_previous','Trước',10,247)
-finder_page_label=widget('tools','createLabel','0 kết quả',110,251)
-widget('tools','createButton','finder_next','Sau',350,247)
-widget('tools','createLabel','Có thể Ctrl+A / Ctrl+C trực tiếp trong ô ID.',440,251)
-finder_owner=None
-finder_skills=[]
-finder_matches=[]
-finder_offset=0
-finder_visible_ids=[]
-widget('tools','createButton','start_hotbar_finder','Dò ô số',10,273)
-widget('tools','createButton','stop_hotbar_finder','Dừng dò',105,273)
-hotbar_slot_label=widget('tools','createLabel','Ô: —',185,277)
-hotbar_id_field=widget('tools','createLineEdit','',240,273,90,22)
-hotbar_name_field=widget('tools','createLineEdit','',340,273,245,22)
-widget('tools','createButton','copy_hotbar_id','Copy ID',595,272)
-hotbar_status_label=widget('tools','createLabel','Bấm Dò ô số → sang game bấm skill → quay lại copy ID.',10,299)
-hotbar_found=None
+# The old probe widgets remain hidden compatibility storage.
+# AOS-43: empty one-row table by default; typing an ID shows ONLY that skill.
+FINDER_PAGE_ROWS = 1
+widget('tools', 'createLabel', 'ID skill', 10, 36)
+finder_query_field = widget('tools', 'createLineEdit', '', 80, 32, 120, 22)
+finder_pick_field = finder_query_field
+finder_id_preview = widget(
+    'tools', 'createLabel',
+    'Bảng trống · gõ ID → hiện đúng 1 skill. Không dump cả list.', 220, 36)
+widget('tools', 'createLabel', 'ID', 28, 68)
+widget('tools', 'createLabel', 'Tên', 118, 68)
+widget('tools', 'createLabel', 'Lv', 500, 68)
+# Single result row — empty until an ID resolves.
+finder_result_id = widget('tools', 'createLineEdit', '', 28, 88, 82, 20)
+finder_pick_name = widget('tools', 'createLineEdit', '', 118, 88, 372, 20)
+finder_level_field = widget('tools', 'createLineEdit', '', 500, 88, 42, 20)
+widget('tools', 'createButton', 'copy_finder_pick_id', 'Copy', 552, 87)
+finder_row_fields = [(finder_result_id, finder_pick_name, finder_level_field)]
+widget('tools', 'createLabel', 'Thêm vào', 10, 124)
+finder_dest_field = widget('tools', 'createCombobox', 80, 120, 160, 22)
+for _finder_dest in (
+        'Auto PK · F1', 'Auto PK · F2', 'Auto PK · F3',
+        'PvP · F1', 'PvP · F2', 'PvP · F3'):
+    QtBind.append(gui, finder_dest_field, _finder_dest)
+QtBind.setText(gui, finder_dest_field, 'Auto PK · F2')
+widget('tools', 'createButton', 'copy_finder_line', 'Copy dòng', 260, 119)
+widget('tools', 'createButton', 'add_finder_skill', 'Thêm', 370, 119)
+widget('tools', 'createButton', 'clear_skill_finder', 'Xóa', 450, 119)
+finder_status_label = widget(
+    'tools', 'createLabel',
+    'Chưa có ID · hàng kết quả đang trống.', 10, 152)
+finder_owner = None
+finder_skills = []
+finder_matches = []
+finder_offset = 0
+finder_visible_ids = []
+_finder_live_query = None
+_finder_list_sig = None
+finder_list = None
+finder_page_label = finder_status_label
+widget('tools', 'createButton', 'start_hotbar_finder', 'Dò ô số', 10, 184)
+widget('tools', 'createButton', 'stop_hotbar_finder', 'Dừng', 105, 184)
+hotbar_slot_label = widget('tools', 'createLabel', 'Ô: —', 175, 188)
+hotbar_id_field = widget('tools', 'createLineEdit', '', 220, 184, 90, 22)
+hotbar_name_field = widget('tools', 'createLineEdit', '', 320, 184, 235, 22)
+widget('tools', 'createButton', 'copy_hotbar_id', 'Copy', 565, 183)
+hotbar_status_label = widget(
+    'tools', 'createLabel',
+    'Dò ô số (tuỳ chọn): bấm skill trong game → điền ID vào ô trên.', 10, 216)
+hotbar_found = None
 
-widget('auto_pk','createLabel','AUTO PK · tự lấy điểm chờ khi bật · vùng đánh tối đa 40 m.',10,35)
-widget('auto_pk','createLabel','Vùng đánh (m)',10,69)
-auto_pk_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_MAX_RADIUS),106,65,45,22)
-widget('auto_pk','createLabel','Vùng quét (m)',171,69)
-auto_pk_scan_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_REPORT_RADIUS),265,65,55,22)
-widget('auto_pk','createLabel','Nhóm Ghost',340,69)
-auto_pk_page_field=widget('auto_pk','createCombobox',427,65,75,22)
-for page in ('F1','F2'):QtBind.append(gui,auto_pk_page_field,page)
-QtBind.setText(gui,auto_pk_page_field,'F2')
-widget('auto_pk','createButton','save_auto_pk_settings','Lưu Auto PK',545,64)
-auto_pk_anchor_label=widget('auto_pk','createLabel','Điểm chờ: tự lấy khi bật.',10,103)
-widget('auto_pk','createLabel','Target Enemy',465,103)
-auto_pk_enemy_key_field=widget('auto_pk','createLineEdit','',560,98,92,22)
-auto_pk_patrol_box=widget('auto_pk','createCheckBox','auto_pk_patrol_changed','Chạy vòng',10,130)
-widget('auto_pk','createLabel','Bán kính (m)',117,133)
-auto_pk_patrol_radius_field=widget('auto_pk','createLineEdit','10',200,128,50,22)
-auto_pk_fast_box=widget('auto_pk','createCheckBox','auto_pk_fast_changed','Quét nhanh',270,130)
-widget('auto_pk','createButton','view_auto_pk_options','Tọa độ',410,127)
-widget('auto_pk','createButton','view_auto_pk_buffs','Skill buff',505,127)
-widget('auto_pk','createButton','scan_auto_pk_now','Quét ngay',10,157)
-widget('auto_pk','createButton','request_auto_pk_arm','Bật Auto PK',410,157)
-widget('auto_pk','createButton','stop_auto_pk','Dừng canh',505,157)
-auto_pk_result_fields=[
-    widget('auto_pk','createLineEdit','',10,184+index*21,655,20) for index in range(3)
+# Auto PK main tab: camp controls above its independent Ghost editor.
+widget('auto_pk','createLabel','Vùng đánh (m)',10,36)
+auto_pk_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_MAX_RADIUS),106,32,45,22)
+widget('auto_pk','createLabel','Vùng quét (m)',171,36)
+auto_pk_scan_radius_field=widget('auto_pk','createLineEdit',str(AUTO_PK_REPORT_RADIUS),265,32,55,22)
+widget('auto_pk','createButton','save_auto_pk_settings','Lưu',350,31)
+auto_pk_anchor_label=widget('auto_pk','createLabel','Điểm chờ: tự lấy khi bật.',10,58)
+_pk_inner_switch = widget('auto_pk','createCheckBox','_pk_tab_changed','Bật Auto PK',10,81)
+widget('auto_pk','createButton','stop_tab_auto_pk','Dừng canh',110,80)
+widget('auto_pk','createButton','view_auto_pk_advanced','Tùy chọn',210,80)
+widget('auto_pk','createButton','view_auto_pk_options','Tọa độ',306,80)
+auto_pk_nearby_labels = [
+    widget('auto_pk', 'createLineEdit', '', 410, 53 + index * 17, 255, 17)
+    for index in range(3)
 ]
-auto_pk_status_label=widget('auto_pk','createLineEdit','Đã tắt. Bấm Bật Auto PK tại vị trí muốn canh.',10,250,655,22)
-auto_pk_scan_field=widget('auto_pk','createLineEdit','Tự quét khi bật Auto PK.',10,276,655,20)
+auto_pk_nearby_next = 0.0
+auto_pk_status_label=widget('auto_pk_advanced','createLineEdit','Auto PK đã tắt.',10,232,655,20)
+
+widget('hidden','createLabel','SKILL BUFF · gõ ID số (1–9…) → hiện tên ngay. Dòng copy = mọi ID đã nhập.',10,136)
+widget('hidden','createLabel','ID',30,158)
+widget('hidden','createLabel','VK',110,158)
+widget('hidden','createLabel','Tên skill',215,158)
+auto_pk_buffs_box=widget('auto_pk','createCheckBox','auto_pk_buffs_changed','Buff khi đứng canh',462,105)
+widget('auto_pk','createLabel','ID buff',486,127)
+auto_pk_buff_fields=[]
+auto_pk_buff_weapon_fields=[]
+auto_pk_buff_name_labels=[]
+_AUTO_PK_BUFF_WEAPON_CHOICES = ('(Không đổi)', 'F1', 'F2', 'F3')
+for index in range(5):
+    y = 178 + index * 20
+    buff_y = 144 + index * 22
+    widget('auto_pk','createLabel','%d' % (index+1),462,buff_y+3)
+    auto_pk_buff_fields.append(widget('auto_pk','createLineEdit','',486,buff_y,112,19))
+    weapon_field = widget('hidden','createCombobox',110,y,90,20)
+    for _buff_page in _AUTO_PK_BUFF_WEAPON_CHOICES:
+        QtBind.append(gui, weapon_field, _buff_page)
+    QtBind.setText(gui, weapon_field, '(Không đổi)')
+    auto_pk_buff_weapon_fields.append(weapon_field)
+    auto_pk_buff_name_labels.append(widget('hidden','createLabel','—',215,y+3))
+widget('hidden','createLabel','Copy ID',10,282)
+auto_pk_buff_ids_copy=widget('hidden','createLineEdit','',70,278,470,20)
+widget('hidden','createButton','save_auto_pk_buffs','Lưu buff',550,277)
+auto_pk_buffs_status=widget('auto_pk','createLineEdit','',462,274,205,19)
+_auto_pk_buff_name_cache=''
+
+widget('auto_pk_advanced','createLabel','Target Enemy',10,43)
+auto_pk_enemy_key_field=widget('auto_pk_advanced','createLineEdit','',105,38,92,22)
+auto_pk_patrol_box=widget('auto_pk_advanced','createCheckBox','auto_pk_patrol_changed','Chạy vòng',220,38)
+widget('auto_pk_advanced','createLabel','Bán kính (m)',320,43)
+auto_pk_patrol_radius_field=widget('auto_pk_advanced','createLineEdit','10',407,38,50,22)
+auto_pk_fast_box=widget('auto_pk_advanced','createCheckBox','auto_pk_fast_changed','Quét nhanh',10,72)
+auto_pk_mob_farm_box=widget('auto_pk_advanced','createCheckBox','auto_pk_mob_farm_changed','Đánh quái',116,72)
+widget('auto_pk_advanced','createLabel','Không đánh',225,76)
+auto_pk_skip_party_box=widget('auto_pk_advanced','createCheckBox','auto_pk_skip_party_changed','Party',310,72)
+auto_pk_skip_guild_box=widget('auto_pk_advanced','createCheckBox','auto_pk_skip_guild_changed','Guild',395,72)
+QtBind.setChecked(gui, auto_pk_skip_party_box, True)
+QtBind.setChecked(gui, auto_pk_skip_guild_box, True)
+widget('auto_pk_advanced','createButton','scan_auto_pk_now','Quét ngay',10,106)
+widget('auto_pk_advanced','createButton','save_auto_pk_settings','Lưu Auto PK',110,106)
+widget('auto_pk_advanced','createButton','view_auto_pk','Quay lại Auto PK',220,106)
+auto_pk_result_fields=[
+    widget('auto_pk_advanced','createLineEdit','',10,140+index*21,655,20) for index in range(3)
+]
+auto_pk_scan_field=widget('auto_pk_advanced','createLineEdit','Tự quét khi bật Auto PK.',10,208,655,20)
 
 widget('auto_pk_options','createLabel','TỌA ĐỘ TÂM VÙNG · bỏ trống cả X và Y để dùng mặc định.',10,36)
 widget('auto_pk_options','createLabel','Vùng đánh: vị trí khi bật Auto PK. Vùng quét và chạy vòng: tâm vùng đánh.',10,61)
@@ -366,22 +492,15 @@ for index, (kind, title) in enumerate((('attack','Vùng đánh'),('scan','Vùng 
         widget('auto_pk_options','createLineEdit','',150,y,115,22),
         widget('auto_pk_options','createLineEdit','',324,y,115,22),
     )
+    callback = 'capture_auto_pk_' + kind + '_center'
+    globals()[callback] = lambda selected=kind, name=title: capture_auto_pk_center(selected, name)
+    widget('auto_pk_options', 'createButton', callback, 'Lấy hiện tại', 455, y)
 widget('auto_pk_options','createLabel','Tọa độ áp dụng khi bật Auto PK. Vòng chạy phải nằm trong vùng đánh.',10,205)
 widget('auto_pk_options','createButton','save_auto_pk_settings','Lưu Auto PK',10,238)
 widget('auto_pk_options','createButton','view_auto_pk','Quay lại Auto PK',140,238)
 auto_pk_options_status=widget('auto_pk_options','createLabel','',10,272)
 
-widget('auto_pk_buffs','createLabel','SKILL BUFF AUTO PK · nhập ID skill tự buff. Để trống dòng không dùng.',10,36)
-widget('auto_pk_buffs','createLabel','Chỉ tự buff lúc canh rảnh. Bật lại Auto PK để áp dụng danh sách.',10,61)
-auto_pk_buffs_box=widget('auto_pk_buffs','createCheckBox','auto_pk_buffs_changed','Tự buff',10,86)
-auto_pk_buff_fields=[]
-for index in range(5):
-    y = 113 + index * 25
-    widget('auto_pk_buffs','createLabel','Buff %d' % (index+1),10,y+4)
-    auto_pk_buff_fields.append(widget('auto_pk_buffs','createLineEdit','',95,y,110,22))
-widget('auto_pk_buffs','createButton','save_auto_pk_buffs','Lưu buff',310,113)
-widget('auto_pk_buffs','createButton','view_auto_pk','Quay lại Auto PK',310,146)
-auto_pk_buffs_status=widget('auto_pk_buffs','createLabel','',10,253)
+# Legacy sub-view name kept for show_view hide-list compatibility; buffs live on auto_pk.
 auto_pk_anchor=None
 auto_pk_running=False
 auto_pk_returning=False
@@ -395,9 +514,7 @@ current_page = None
 active_sequence = None
 sequence_index = 0
 profile_owner = None
-imbue_saved_selection = None
 imbue_scan_pending = False
-imbue_save_after = 0.0
 pvp_lock = RLock()
 pvp_delays = {}
 direct_skills = ()
@@ -554,16 +671,27 @@ def capture_page_gear(page):
     inventory_fn = getattr(phbot_api, 'get_inventory', None)
     items = ((inventory_fn() or {}).get('items') or []) if inventory_fn else []
     if len(items) < 8 or not items[6]:
-        report_error('Chưa đọc được vũ khí đang mặc; hãy vào game và trang bị trước.')
+        report_error(
+            'Lấy đồ %s thất bại: chưa đọc vũ khí đang mặc. Vào game, mặc đúng bộ %s (VK+khiên), rồi bấm lại.'
+            % (page, page))
         return
     weapon = items[6]
     offhand = items[7] or {}
     # Slot 7 may contain arrows/bolts. Only save an actual shield.
     shield = offhand if is_shield_item(offhand) else {}
-    QtBind.setText(gui, weapon_fields[page], str(weapon['model']))
-    QtBind.setText(gui, shield_fields[page], str(shield['model']) if shield else '0')
-    report('%s: lấy vũ khí %s; khiên %s. Bấm Lưu cấu hình.' %
-           (page, weapon.get('name', weapon['model']), shield.get('name', 'không đổi')))
+    w_model = str(weapon.get('model') or '')
+    s_model = str(shield['model']) if shield else '0'
+    QtBind.setText(gui, weapon_fields[page], w_model)
+    QtBind.setText(gui, shield_fields[page], s_model)
+    # Hot-update runtime so buff/Auto PK can use gear before next full Lưu.
+    if isinstance(runtime_gear, dict):
+        runtime_gear[page] = {'weapon': w_model, 'shield': s_model}
+    w_name = weapon.get('name') or w_model
+    s_name = (shield.get('name') if shield else None) or ('không khiên' if s_model == '0' else s_model)
+    msg = ('%s Lấy đồ OK · VK %s (model %s) · khiên %s (model %s). Bấm Lưu cấu hình '
+           '(buff F cần đúng trang này).' % (page, w_name, w_model, s_name, s_model))
+    report(msg)
+    QtBind.setText(gui, auto_pk_status_label, msg)
 
 
 def capture_f1_gear(): capture_page_gear('F1')
@@ -674,21 +802,139 @@ def request_pvp_page(page, physical=False):
            ('bấm F' if physical else 'target', page, pvp_target))
 
 
+def is_b070_miss_stop_reason(reason):
+    """True nếu reason là kiểu hard-stop cũ vì thiếu B070 / reclick max / chưa xác nhận skill."""
+    text = str(reason or '').casefold()
+    if not text:
+        return False
+    if 'b070' in text and ('khớp' in text or 'chưa có' in text or 'chưa thấy' in text):
+        return True
+    if 'b070' in text and 'xác nhận' in text:
+        return True
+    if 'chưa xác nhận' in text and ('skill' in text or 'id=' in text or 'b070' in text):
+        return True
+    if 'lần thử lại' in text and ('b070' in text or 'skill' in text or 'id=' in text):
+        return True
+    if 'đang chờ b070' in text or 'đang chờ xác nhận skill' in text:
+        return True
+    if 'phbot từ chối' in text and ('skill' in text or '0x7074' in text or 'gửi lại' in text):
+        return True
+    return False
+
+
+def phbot_status_raw():
+    try:
+        return get_status()
+    except Exception:
+        return None
+
+
+def phbot_is_tracing(status=None):
+    if status is None:
+        status = phbot_status_raw()
+    if not status:
+        return False
+    return 'trac' in str(status).casefold()
+
+
+def status_blocks_ghost_manual(status=None):
+    if status is None:
+        status = phbot_status_raw()
+    if not status:
+        return False
+    if phbot_is_tracing(status):
+        return False
+    text = str(status).casefold()
+    if 'bot' in text:
+        return True
+    return status is True or text in ('1', 'true', 'yes', 'on')
+
+
+def status_blocks_auto_pk(status=None):
+    """Auto PK + PartyLeader: tracing / status mơ hồ KHÔNG chặn."""
+    if status is None:
+        status = phbot_status_raw()
+    if not status:
+        return False
+    if phbot_is_tracing(status):
+        return False
+    text = str(status).casefold()
+    if 'bot' in text and 'trac' not in text:
+        return True
+    return False
+
+
+def party_leader_combat_hook(name, *args):
+    for module in reversed(list(sys.modules.values())):
+        if getattr(module, 'NAME', None) != 'PartyLeader':
+            continue
+        hook = getattr(module, name, None)
+        if callable(hook):
+            return hook(*args)
+    return False
+
+
+def notify_party_leader_ghost_stop(reason):
+    """Chủ F4 / dừng Ghost → PartyLeader broadcast dungdanh cho phụ."""
+    for module in list(sys.modules.values()):
+        try:
+            if getattr(module, 'NAME', None) != 'PartyLeader':
+                continue
+            hook = getattr(module, 'on_leader_ghost_stop', None)
+            if callable(hook):
+                hook(reason)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def notify_party_leader_clear_target(reason):
+    for module in list(sys.modules.values()):
+        try:
+            if getattr(module, 'NAME', None) != 'PartyLeader':
+                continue
+            hook = getattr(module, 'leader_broadcast_clear_target', None)
+            if callable(hook):
+                hook(reason)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+
 def pause_pvp(reason, clear_target=False, cancel_action=True, notify=True):
     global pvp_paused, pvp_armed, pvp_activation, active_sequence, sequence_index
     global pvp_target, pvp_selection_request, pvp_resume_page, direct_target, direct_select_request
-    global auto_pk_returning
+    global auto_pk_returning, direct_expected, direct_retry_state, pvp_cast_deadline
+    # HARD RULE: missing B070 / reclick-max must NEVER become "Auto Ghost dừng".
+    if is_b070_miss_stop_reason(reason):
+        push_trace_note('bỏ pause_pvp (B070 miss): ' + str(reason))
+        if direct_retry_state is not None:
+            soft_wait_b070_focus(direct_retry_state, str(reason))
+        elif direct_expected is not None:
+            soft_wait_b070_without_attempt(direct_expected[0], direct_expected[1], str(reason))
+        else:
+            pvp_cast_deadline = monotonic() + 1.0
+            msg = ('Chờ B070 / thử lại · không dừng Auto Ghost · (%s)'
+                   % str(reason).rstrip('.'))
+            QtBind.setText(gui, status_label, msg)
+            QtBind.setText(gui, auto_pk_status_label, msg)
+            report(msg)
+        return
     push_trace_note('Ghost tạm dừng: ' + reason)
     if clear_target and auto_pk_running:
         if auto_pk_runtime is not None:
             auto_pk_runtime.pop('select_in_event', None)
             auto_pk_runtime.pop('target_outside', None)
             auto_pk_runtime.update(requested=0, select_until=0.0, native_probe_until=0.0, skill_probe_uid=0)
+        # [FIX never abort PvP in attack range] clear_target must NOT start camp return.
+        # Only force_auto_pk_return / hold_auto_pk may set auto_pk_returning.
         if (not auto_pk_returning and auto_pk_runtime is not None and pvp_target and pvp_armed
                 and direct_exchange_wait is None and not auto_pk_in_background(get_client() or {})):
             auto_pk_runtime['withdraw']={'target':pvp_target,'sent':False,'observed':False,
                                          'deadline':monotonic()+2.0}
-        auto_pk_returning=True
     pvp_resume_page = None
     was_active = (pvp_armed or key_attempt is not None or pending is not None or direct_expected is not None
                   or (pvp_activation and pvp_activation.get('emergency'))
@@ -911,6 +1157,7 @@ def pvp_gate_tick(client, character):
         return False
     if x_fresh:
         pause_pvp('bấm X bỏ đối thủ', clear_target=True, notify=False)
+        notify_party_leader_clear_target('X bỏ đối thủ')
         f_keys_held = held
         return False
     fresh = held - f_keys_held
@@ -921,6 +1168,7 @@ def pvp_gate_tick(client, character):
                 and (pvp_armed or (pvp_activation and not pvp_activation.get('gear_only'))
                      or auto_pk_running)):
             pause_pvp('F4: dừng Ghost nền', notify=False)
+            notify_party_leader_ghost_stop('F4 nền')
             if auto_pk_running:
                 stop_auto_pk(reason='bấm F4')
             return False
@@ -929,16 +1177,25 @@ def pvp_gate_tick(client, character):
         if monotonic()<=pvp_synthetic_page['until']:
             fresh.discard(pvp_synthetic_page['page'])
         else:pvp_synthetic_page=None
-    if PVP_STOP_PAGE in fresh and pvp_pause_controls:
+    leader_controls = foreground and party_leader_combat_hook('leader_hotkeys_enabled')
+    if leader_controls:
+        fresh.difference_update(('F1', 'F2', PVP_STOP_PAGE))
+        three_fresh = False
+    if PVP_STOP_PAGE in fresh and (pvp_pause_controls or
+            party_leader_combat_hook('leader_combat_command_active')):
         if auto_pk_running:
             stop_auto_pk_patrol(auto_pk_runtime)
             auto_pk_running = auto_pk_returning = False
             auto_pk_runtime = None
+            reset_auto_pk_switch()
             QtBind.setText(gui, auto_pk_status_label, 'AUTO PK ĐÃ TẮT.')
         pause_pvp('F4: dừng Ghost và đổi bộ thủ', notify=False)
+        notify_party_leader_ghost_stop('F4 dừng Ghost')
         if request_gear_only(PVP_STOP_PAGE):
             prepare_pvp_page(client)
         return False
+    if foreground and PVP_STOP_PAGE in fresh:
+        notify_party_leader_ghost_stop('F4 dừng Ghost')
     if auto_pk_running:
         if not tick_auto_pk():
             return False
@@ -1144,6 +1401,27 @@ def config_path():
     return Path(get_config_dir()) / (CONFIG_NAME + '.json')
 
 
+profile_storage_lock = RLock()
+
+
+def profile_key(profiles, owner):
+    exact = json.dumps(owner)
+    if exact in profiles:
+        return exact
+    normalized = tuple(part.strip().casefold() for part in owner)
+    matches = []
+    for key in profiles:
+        try:
+            pair = json.loads(key)
+        except (TypeError, ValueError):
+            continue
+        if (isinstance(pair, list) and len(pair) == 2
+                and all(isinstance(part, str) for part in pair)
+                and tuple(part.strip().casefold() for part in pair) == normalized):
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else exact
+
+
 def read_profiles():
     try:
         with config_path().open(encoding='utf-8') as stream:
@@ -1155,9 +1433,10 @@ def read_profiles():
     return profiles
 
 
-def write_profiles(profiles):
+def write_profiles(profiles, path=None):
     import tempfile
-    path = config_path()
+    if path is None:
+        path = config_path()
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=str(path.parent), delete=False) as stream:
@@ -1169,36 +1448,29 @@ def write_profiles(profiles):
             os.unlink(temp)
 
 
-def remember_imbue(owner):
-    global imbue_saved_selection, imbue_save_after
-    if not owner or owner != profile_owner or ui_sync:
-        return
-    selection = (QtBind.text(gui, imbue_field), QtBind.isChecked(gui, imbue_box))
-    if selection == imbue_saved_selection or monotonic() < imbue_save_after:
-        return
-    if selection[0] != '(Không dùng)' and not re.search(r'\[\d+\]$', selection[0]):
-        return
-    try:
+def update_character_profile(owner, updates):
+    with profile_storage_lock:
         profiles = read_profiles()
-        profile = profiles.setdefault(json.dumps(owner), {})
-        if not isinstance(profile, dict):
+        key = profile_key(profiles, owner)
+        previous = profiles.get(key, {})
+        if not isinstance(previous, dict):
             raise ValueError('Hồ sơ nhân vật không hợp lệ.')
-        profile.update(imbue_choice=selection[0], imbue_enabled=selection[1])
+        profile = {**previous, **updates}
+        profiles[key] = profile
         write_profiles(profiles)
-    except (OSError, ValueError) as error:
-        imbue_save_after = monotonic() + 5
-        report_error('Chưa lưu được tay phép: %s' % error)
-        return
-    imbue_saved_selection = selection
-    report('Đã nhớ tay phép PvP cho %s: %s.' % (owner[1], selection[0]))
+    return profile
 
 
 def load_profile(owner, profile_override=None):
-    global profile_owner, imbue_saved_selection, imbue_save_after
+    global profile_owner
     stop_clicked()
     profile_owner = owner
     try:
-        profile = (profile_override if profile_override is not None else read_profiles().get(json.dumps(owner), {}))
+        if profile_override is None:
+            profiles = read_profiles()
+            profile = profiles.get(profile_key(profiles, owner), {})
+        else:
+            profile = profile_override
         if not isinstance(profile, dict):
             raise ValueError('Hồ sơ nhân vật không hợp lệ.')
     except (OSError, ValueError) as error:
@@ -1237,8 +1509,6 @@ def load_profile(owner, profile_override=None):
                            (page in saved_pages if isinstance(saved_pages, list) else page != 'F3'))
     set_checked_silent(imbue_box, profile.get('imbue_enabled') is True)
     set_checked_silent(pvp_stun_box, profile.get('resume_after_stun', True) is True)
-    imbue_saved_selection = (QtBind.text(gui, imbue_field), QtBind.isChecked(gui, imbue_box))
-    imbue_save_after = 0.0
     stable = False  # Recovery control is hidden; use the current working PvP engine.
     set_checked_silent(legacy_box, stable)
     set_checked_silent(reclick_box, not stable and profile.get('reclick_enabled') is True)
@@ -1250,12 +1520,21 @@ def load_profile(owner, profile_override=None):
     set_checked_silent(hybrid_box,profile.get('hybrid_exchange_test') is True)
     if QtBind.isChecked(gui,hybrid_box):set_checked_silent(pvp_background_box,False)
     load_pvp_editor(profile)
-    if boss_enabled:
-        start_clicked(arm_only=True)  # Arm F1 only; no skill starts on profile load.
+    sync_pvp_trigger_boxes()
+    preset_name = str(profile.get('preset_name') or '')
+    QtBind.setText(gui, named_profile_name, preset_name)
+    if preset_name:
+        refresh_named_profiles(preset_name)
+    if profile:
+        message = ('Đã nạp bộ "%s" cho %s.' % (preset_name, owner[1]) if preset_name
+                   else 'Đã nạp cấu hình cho %s.' % owner[1])
+        QtBind.setText(gui, status_label, message)
+        log('[%s] %s' % (NAME, message))
+    if boss_enabled and _combat_tab == 'pvp':
+        start_clicked(arm_only=True)  # Arm F1 only while PvP owns the engine.
 
 
 def save_clicked():
-    global imbue_saved_selection
     owner = owner_of(get_character_data() or {})
     if owner is None or owner != profile_owner:
         report_error('Hãy chờ nhân vật vào game rồi lưu.')
@@ -1265,9 +1544,8 @@ def save_clicked():
         sync_pvp_editor()
         with pvp_lock:
             active_worker = hunt_stop
-            active_pages = pvp_allowed_pages if pvp_trigger_mode and direct_skills else ()
+            active_pages = pvp_allowed_pages if not auto_pk_running and pvp_trigger_mode and direct_skills else ()
             saved_groups = compile_skill_groups(active_pages, allow_empty=True) if active_pages else {}
-        profiles = read_profiles()
         profile = {name: QtBind.text(gui, field) for name, field in profile_fields.items()}
         profile.update({'use_' + page: QtBind.isChecked(gui, page_boxes[page]) for page in PAGES})
         profile['numeric_enabled'] = QtBind.isChecked(gui, numeric_box)
@@ -1284,11 +1562,9 @@ def save_clicked():
         profile['legacy_pvp'] = QtBind.isChecked(gui, legacy_box)
         for name, box in (('keys_enabled', ghost_box), ('boss_enabled', boss_box), ('pvp_enabled', pvp_box), ('hunt_enabled', hunt_box), ('pvp_background', pvp_background_box), ('direct_pvp', direct_box), ('boss_esc', boss_esc_box)):
             profile[name] = QtBind.isChecked(gui, box)
-        profiles[json.dumps(owner)] = profile
-        write_profiles(profiles)
-        imbue_saved_selection = (profile['imbue_choice'], profile['imbue_enabled'])
+        profile = update_character_profile(owner, profile)
         with pvp_lock:
-            if owner == profile_owner and pvp_trigger_mode:
+            if owner == profile_owner and pvp_trigger_mode and not auto_pk_running:
                 runtime_gear[PVP_STOP_PAGE] = {
                     'weapon': profile['weapon_F4'].strip(),
                     'shield': profile['shield_F4'].strip(),
@@ -1300,9 +1576,14 @@ def save_clicked():
     except (OSError, ValueError) as error:
         report_error('Lỗi lưu cấu hình: %s' % error)
         return
-    QtBind.setText(gui, status_label, 'Đã lưu cấu hình cho %s.%s' %
-                   (owner[1], ' Đã áp dụng các ô Tắt và Ngắt cho lượt kế tiếp.' if applied_rows else ''))
-    if QtBind.isChecked(gui, boss_mode_box) and not boss_running():
+    preset_name = profile.get('preset_name')
+    message = ('Đã lưu cấu hình cho %s · %s.' % (owner[1], preset_name) if preset_name
+               else 'Đã lưu cấu hình cho %s.' % owner[1])
+    if applied_rows:
+        message += ' Đã áp dụng các ô Tắt và Ngắt cho lượt kế tiếp.'
+    QtBind.setText(gui, status_label, message)
+    log('[%s] %s' % (NAME, message))
+    if _combat_tab == 'pvp' and QtBind.isChecked(gui, boss_mode_box) and not boss_running():
         disarm_boss()
         start_clicked(arm_only=True)
     return profile
@@ -1314,7 +1595,8 @@ widget('presets','createLabel','Tên bộ cần lưu',15,68)
 widget('presets','createLabel','Bộ đã lưu',15,113)
 widget('presets','createButton','save_named_profile','Lưu bộ',450,63)
 widget('presets','createButton','apply_named_profile','Nạp cho acc này',450,108)
-widget('presets','createButton','refresh_named_profiles','Làm mới',565,108)
+widget('presets','createButton','delete_named_profile','Xóa bộ',545,108)
+widget('presets','createButton','refresh_named_profiles','Làm mới',624,108)
 widget('presets','createButton','hide_game_clicked','Ẩn game',15,150)
 widget('presets','createButton','show_game_clicked','Hiện game',108,150)
 widget('presets', 'createLabel', 'Acc hỗ trợ ngắt Boss', 225, 154)
@@ -1323,7 +1605,7 @@ profile_fields['boss_exchange_player'] = boss_exchange_player_field
 pvp_stun_box = widget('presets', 'createCheckBox', 'stun_option_changed',
                       'Hiệu ứng ngoài lề · Nối sau choáng (PvP)', 15, 173)
 set_checked_silent(pvp_stun_box, True)
-widget('presets','createLabel','Bỏ trống = Solo Boss (client-7081 như PvP). Có tên = Exchange acc hỗ trợ.',15,195)
+widget('presets','createLabel','Bỏ trống tên acc hỗ trợ để Boss tự chọn Player ở gần.',15,195)
 widget('presets','createLabel','Nạp sẽ thay cấu hình acc hiện tại. Cùng tên: lưu cập nhật bộ cũ.',15,220)
 
 
@@ -1720,7 +2002,7 @@ def stop_invalid_native_pvp(character):
         reason = 'nhân vật đã chết'
     elif changed_owner:
         reason = 'đã đổi nhân vật hoặc mất dữ liệu nhân vật'
-    elif get_status():
+    elif (status_blocks_auto_pk() if auto_pk_running else status_blocks_ghost_manual()):
         reason = 'bot chính đã bật'
     else:
         client = get_client() or {}
@@ -2080,25 +2362,43 @@ def refresh_named_profiles(selected=None):
 
 
 def save_named_profile():
+    owner = owner_of(get_character_data() or {})
     name=QtBind.text(gui,named_profile_name).strip()
     if not name or len(name)>80:
         report('Nhập tên bộ cấu hình từ 1 đến 80 ký tự.');return
-    temporary=None
     try:
-        profiles=read_named_profiles()
-        profile=save_clicked()
-        if profile is None:return
-        profiles[name]=profile
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=str(named_profiles_path().parent),delete=False) as stream:
-            temporary=stream.name
-            json.dump(profiles,stream,ensure_ascii=False,indent=2)
-        os.replace(temporary,named_profiles_path())
+        profile = save_clicked()
+        if profile is None:
+            return
+        with profile_storage_lock:
+            profiles = read_named_profiles()
+            profiles[name] = {**profile, 'preset_name': name}
+            write_profiles(profiles, named_profiles_path())
+        if owner is not None and owner == profile_owner == owner_of(get_character_data() or {}):
+            update_character_profile(owner, {'preset_name': name})
         refresh_named_profiles(name)
-        report('Đã lưu bộ "%s". Lưu cùng tên sẽ cập nhật bộ đó.'%name)
-    except (OSError,ValueError) as error:report_error('Lỗi lưu bộ cấu hình: %s'%error)
-    finally:
-        if temporary and os.path.exists(temporary):os.unlink(temporary)
+        report('Đã lưu bộ "%s". Lưu cùng tên sẽ cập nhật bộ đó.' % name)
+    except (OSError, ValueError) as error:
+        report_error('Lỗi lưu bộ cấu hình: %s' % error)
+
+
+def delete_named_profile():
+    name = (QtBind.text(gui, named_profile_choice) or '').strip()
+    try:
+        with profile_storage_lock:
+            profiles = read_named_profiles()
+            if not name or name not in profiles:
+                raise ValueError('Chọn một bộ cấu hình trong danh sách Bộ đã lưu.')
+            del profiles[name]
+            write_profiles(profiles, named_profiles_path())
+        refresh_named_profiles()
+        message = 'Đã xóa bộ "%s" khỏi danh sách.' % name
+        QtBind.setText(gui, trace_status_label, message)
+        log('[%s] %s' % (NAME, message))
+    except (OSError, ValueError) as error:
+        message = 'Chưa xóa bộ cấu hình: %s' % error
+        QtBind.setText(gui, trace_status_label, message)
+        report_error(message)
 
 
 def apply_named_profile():
@@ -2110,14 +2410,10 @@ def apply_named_profile():
         profile = read_named_profiles().get(name)
         if not isinstance(profile, dict):
             raise ValueError('Chọn một bộ cấu hình trong danh sách Bộ đã lưu.')
-        profiles = read_profiles()
-        profiles[json.dumps(owner)] = profile
-        write_profiles(profiles)
+        profile = update_character_profile(owner, {**profile, 'preset_name': name})
         load_profile(owner, profile_override=profile)
-        QtBind.setText(gui, named_profile_name, name)
         message = 'Đã nạp bộ "%s" cho %s.' % (name, owner[1])
         QtBind.setText(gui, trace_status_label, message)
-        log('[%s] %s' % (NAME, message))
     except Exception as error:
         message = 'Lỗi nạp bộ cấu hình: %s' % error
         QtBind.setText(gui, trace_status_label, message)
@@ -2145,6 +2441,8 @@ def stop_clicked(keep_bridge=False):
     if 'phbot_bridge_process' in globals() and (not keep_bridge or phbot_bridge_pending is not None):close_phbot_bridge()
     global auto_pk_running,auto_pk_returning,auto_pk_runtime
     stop_auto_pk_patrol(auto_pk_runtime)
+    if auto_pk_running:
+        reset_auto_pk_switch()
     auto_pk_running=False
     auto_pk_returning=False
     auto_pk_runtime=None
@@ -2346,13 +2644,17 @@ def start_clicked(auto_pk_page=None):
                              {page for page in PVP_EDIT_PAGES if QtBind.isChecked(gui, pvp_page_boxes[page])})
             if not enabled_pages:
                 raise ValueError('Ghost PvP: bật ít nhất một nhóm F.')
-            sync_pvp_editor()
-            active_groups = compile_skill_groups(enabled_pages)
+            if auto_pk:
+                active_groups = compile_auto_pk_group(auto_pk_page)
+            else:
+                sync_pvp_editor()
+                active_groups = compile_skill_groups(enabled_pages)
             runtime_skill_groups = {page: active_groups.get(page) for page in PVP_EDIT_PAGES if page in enabled_pages}
             runtime_imbue_early = float(QtBind.text(gui, imbue_early_field) or '0.8')
             if not 0 <= runtime_imbue_early <= 10:
                 raise ValueError('Làm mới tay phép sớm cần từ 0 đến 10 giây.')
-            use_skill_group(next(iter(active_groups)))
+            if not auto_pk:
+                use_skill_group(next(iter(active_groups)))
         hybrid = not auto_pk and QtBind.isChecked(gui,hybrid_box) and run_section=='pvp' and QtBind.isChecked(gui,pvp_box)
         stable = not auto_pk and not hybrid and QtBind.isChecked(gui, legacy_box) and QtBind.isChecked(gui, pvp_box) and not QtBind.isChecked(gui,pvp_background_box)
         ghost_enabled = QtBind.isChecked(gui, ghost_box)
@@ -2367,19 +2669,20 @@ def start_clicked(auto_pk_page=None):
         pvp_enabled = auto_pk or ((stable or run_section == 'pvp') and QtBind.isChecked(gui, pvp_box))
         hunt_enabled = not stable and run_section == 'boss' and QtBind.isChecked(gui, hunt_box)
         direct_enabled = auto_pk or (not hybrid and not stable and pvp_enabled and (QtBind.isChecked(gui,direct_box) or QtBind.isChecked(gui,pvp_background_box)))
-        if pvp_enabled and get_status():
+        # Auto PK / PartyLeader ks+trace: NEVER block on get_status (tracing ≠ bot chính).
+        if pvp_enabled and (not auto_pk) and status_blocks_ghost_manual():
             raise ValueError('Dừng bot chính của phBot trước khi bật Ghost PvP.')
         if direct_enabled:
             if not pvp_enabled or hunt_enabled or boss_enabled:
                 raise ValueError('PvP trực tiếp: tích Ghost PvP và tắt Auto quái/Ghost Boss.')
-            if get_status():
+            if (not auto_pk) and status_blocks_ghost_manual():
                 raise ValueError('Dừng bot chính của phBot trước khi bật PvP khi chat.')
             ghost_enabled = False
         if pvp_enabled and not direct_enabled and not boss_enabled and not hunt_enabled:
             ghost_enabled = True
         selected_imbue = configured_imbue()
         try:
-            retry_wait_ms = int(QtBind.text(gui, reclick_wait_field).strip() or '650')
+            retry_wait_ms = int(QtBind.text(gui, pk_reclick_wait if auto_pk else reclick_wait_field).strip() or '650')
         except ValueError:
             raise ValueError('Chờ Reclick phải là số ms, ví dụ 650.') from None
         if not 200 <= retry_wait_ms <= 2000:
@@ -2455,7 +2758,9 @@ def start_clicked(auto_pk_page=None):
         return
 
     if pvp_enabled and not start_pvp(direct_enabled, next(iter(exchanges.values()), None),
-                                     hybrid=hybrid, auto_pk=auto_pk):
+                                     hybrid=hybrid, auto_pk=auto_pk,
+                                     compiled_group=next(iter(runtime_skill_groups.values()))
+                                     if direct_enabled and run_section == 'pvp' else None):
         return
     if ghost_enabled or boss_enabled or hunt_enabled:
         settings = (pages, boss_names, boss_keys, radius)
@@ -2468,7 +2773,7 @@ def start_clicked(auto_pk_page=None):
         pvp_page_exchanges = exchanges
         runtime_gear = gear
         imbue_id = selected_imbue
-        reclick_enabled = not stable and (not direct_enabled or direct_native_exchange) and QtBind.isChecked(gui, reclick_box)
+        reclick_enabled = not stable and (not direct_enabled or direct_native_exchange) and QtBind.isChecked(gui, pk_reclick_box if auto_pk else reclick_box)
         reclick_wait = retry_wait_ms / 1000.0
         boss_interrupt_key = interrupt_key
         boss_esc_enabled = esc_enabled
@@ -2645,7 +2950,6 @@ def event_loop():
     if owner is not None:
         if imbue_scan_pending:
             refresh_imbues()
-        remember_imbue(owner)
     show_skill_probe_result(owner)
     show_mouse_capture(owner)
     with pvp_lock:
@@ -2673,6 +2977,8 @@ def rotate_direct(character, gate_checked=False):
     global direct_index, direct_expected, pvp_cast_deadline, blocked_until, direct_retry_state
     global pvp_wait_push_until
     now = monotonic()
+    if auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight'):
+        return
     if pvp_trigger_mode and not gate_checked and not pvp_gate_tick(get_client() or {}, character):
         return
     if pvp_stun_blocks(character):
@@ -2687,74 +2993,127 @@ def rotate_direct(character, gate_checked=False):
             or direct_target == direct_blocked_target or pending is not None or direct_exchange_wait is not None
             or now < max(blocked_until, pvp_cast_deadline) or character.get('dead')
             or not character.get('player_id') or direct_target == character['player_id']
-            or get_status()):
+            or (get_status() and not auto_pk_running and status_blocks_ghost_manual())):
         return
     client = get_client() or {}
     if not client.get('running') or (not client.get('window') and not auto_pk_running):
         return
     monsters = get_monsters()
-    if monsters is None or direct_target in monsters or direct_target in (get_npcs() or {}):
+    if monsters is None or direct_target in (get_npcs() or {}):
+        return
+    if direct_target in monsters and not (auto_pk_running and
+                                           pvp_person_target(direct_target, character, monsters)):
         return
     if auto_pk_running:
         if auto_pk_returning:
             return
         inside, reason = auto_pk_radius_check(direct_target)
         if not inside:
-            if reason == AUTO_PK_OUTSIDE_SELF:
-                force_auto_pk_return(auto_pk_runtime, reason)
             return
+        runtime = auto_pk_runtime
+        if runtime and not is_party_sync_prefer_uid(direct_target, runtime):
+            position = get_position() or {}
+            own_distance = auto_pk_scan_distance(position, runtime['anchor']) if 'region' in position else None
+            if own_distance is None or own_distance > runtime['radius']:
+                return
     pk_runtime = auto_pk_runtime if auto_pk_running else None
-    probing_uid = pk_runtime is not None and pk_runtime.get('skill_probe_uid') == direct_target
+    party_prefer = is_party_sync_prefer_uid(direct_target, pk_runtime)
+    # Party prefer is a locked fight — never treat as disposable skill_probe.
+    if party_prefer and pk_runtime is not None:
+        pk_runtime['skill_probe_uid'] = 0
+    probing_uid = (pk_runtime is not None and pk_runtime.get('skill_probe_uid') == direct_target
+                   and not party_prefer)
     if pvp_wait_push_until:
         if now >= pvp_wait_push_until:
             pause_pvp('hết cửa sổ phục hồi, chưa thấy cú đẩy mới từ mục tiêu', cancel_action=False)
         return
     if direct_expected is not None and pvp_trigger_mode:
-        if probing_uid:
-            release_auto_pk_target(direct_target, 'thử skill theo UID nhưng không có B070')
+        if party_prefer and party_prefer_wait_timeout(pk_runtime, now):
             return
+        if pk_runtime is not None and not party_prefer:
+            reason = 'thử UID chưa có B070' if probing_uid else 'hết chờ B070'
+            auto_pk_locked_cast_failed(pk_runtime, direct_target, direct_expected[0], reason)
+            return
+    if direct_expected is not None and pvp_trigger_mode:
         next_group = runtime_skill_groups.get(current_page)
-        if current_page in runtime_skill_groups and (not next_group or direct_expected[0] not in next_group['delays']):
-            direct_expected = direct_retry_state = None
-            pvp_cast_deadline = 0.0
+        stale_id = (current_page in runtime_skill_groups
+                    and (not next_group or direct_expected[0] not in next_group.get('delays', {})))
+        if stale_id:
+            # [FIX stale B070 ID] ID không thuộc nhóm F — bỏ, không reclick/dừng.
+            stale = direct_expected[0]
+            report('ID=%d không có trong nhóm %s · bỏ ID cũ, lấy skill khác.'
+                   % (stale, current_page or '?'))
+            if auto_pk_running:
+                recover_auto_pk_cast(direct_target, stale,
+                                    'ID=%d không thuộc nhóm %s' % (stale, current_page or '?'))
+            else:
+                direct_expected = direct_retry_state = None
+                pvp_cast_deadline = 0.0
         elif direct_native_exchange and reclick_enabled and direct_retry_state is not None:
             if not retry_direct_native_skill(character):
                 return
         elif direct_native_exchange:
-            reason = 'chưa có B070 khớp ID=%d' % direct_expected[0]
-            if not recover_auto_pk_cast(direct_target, direct_expected[0], reason):
-                pause_pvp(reason + '; chờ lệnh bắt đầu mới', cancel_action=False)
+            # [FIX no B070 hard-stop] Không pause_pvp — chờ/thử lại mãi.
+            reason = 'đang chờ B070 ID=%d · thử lại' % direct_expected[0]
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, reason)
+            elif not recover_auto_pk_cast(direct_target, direct_expected[0], reason):
+                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
             return
         elif direct_chain_mode:
-            pause_pvp('ID THỬ: hết 6s chưa có B070 cho ID=%d; kết thúc đo, không gửi hủy tác vụ, không gửi lại'%direct_expected[0],cancel_action=False)
+            report_direct('ID THỬ: hết chờ B070 cho ID=%d · bỏ đo lẻ, cast tiếp.' % direct_expected[0])
+            direct_expected = direct_retry_state = None
+            pvp_cast_deadline = 0.0
             return
         else:
-            pause_pvp('server chưa xác nhận skill ID=%d; không tự bỏ sang skill kế tiếp'%direct_expected[0])
+            reason = 'đang chờ xác nhận skill ID=%d · thử lại' % direct_expected[0]
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, reason)
+            else:
+                soft_wait_b070_without_attempt(direct_expected[0], direct_target, reason)
             return
     if direct_expected is not None:
         report_direct('hết %.1fs chờ 0xB070 cho skill ID=%d.' % (DIRECT_CAST_WAIT, direct_expected[0]))
     if pvp_trigger_mode and not apply_skill_row_changes():
         return
-    if auto_pk_running and not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now):
+    if (auto_pk_running and not party_prefer
+            and not auto_pk_ready_to_cast(auto_pk_runtime, direct_target, now)):
         return
     skill_id = direct_skills[direct_index]
     skills = skill_table()
     skill_retry_at = pk_runtime.get('skill_retry_at', {}) if pk_runtime is not None else {}
+    locked_retries = pk_runtime.get('locked_skill_retry_at', {}) if pk_runtime is not None and not party_prefer else {}
+    skipped = []
     for _ in range(len(direct_skills)):
         skill_id = direct_skills[direct_index]
-        if (skill_retry_at.get(skill_id, 0) <= now and skill_id not in direct_missed_skills
-                and (skills.get(skill_id) or {}).get('can_cast') is not False):
+        if locked_retries.get(skill_id, 0.0) > now:
+            reason = 'chưa có B070 ở lượt này'
+        elif skill_retry_at.get(skill_id, 0) > now:
+            reason = 'đang chờ thử lại'
+        elif skill_id in direct_missed_skills:
+            reason = 'lượt trước chưa khớp'
+        elif (skills.get(skill_id) or {}).get('can_cast') is False:
+            reason = 'phBot báo chưa dùng được'
+        else:
             break
-        if skill_id not in direct_missed_skills:
-            report_direct('ID=%d chưa thể dùng theo dữ liệu phBot; xét skill kế tiếp.' % skill_id)
+        skipped.append('%d (%s)' % (skill_id, reason))
         direct_index = (direct_index + 1) % len(direct_skills)
-    else:
+    if skipped and party_prefer:
+        _auto_pk_debounced_log(pk_runtime, 'party_skip_skill_at',
+                               'Ghost %s bỏ qua skill: %s.' % (current_page, ', '.join(skipped)),
+                               interval=5.0)
+    if len(skipped) == len(direct_skills):
+        if pk_runtime is not None and not party_prefer:
+            auto_pk_wait_locked_skills(pk_runtime, direct_target, skipped, now)
         pvp_cast_deadline = now + 0.05
         return
+    if pk_runtime is not None:
+        pk_runtime.pop('locked_skills_wait_at', None)
     cast_target = direct_target
     direct_expected = (skill_id, cast_target)
-    if probing_uid:
-        pvp_cast_deadline = now + DIRECT_CAST_WAIT
+    if pk_runtime is not None:
+        pvp_cast_deadline = now + (PARTY_CAST_CONFIRM_TIMEOUT if party_prefer else
+                                   AUTO_PK_PROBE_CONFIRM_TIMEOUT if probing_uid else AUTO_PK_CAST_CONFIRM_TIMEOUT)
     else:
         pvp_cast_deadline = now + (reclick_wait if direct_native_exchange and reclick_enabled
                                    else DIRECT_TRIAL_WAIT if direct_chain_mode else DIRECT_CAST_WAIT)
@@ -2770,7 +3129,14 @@ def rotate_direct(character, gate_checked=False):
     push_trace_mark('skill đầu gửi', 'ID=%d' % skill_id)
     push_trace_note('Ghost gửi skill ID=%d UID=%d.' % (skill_id, direct_target), after_hit=True)
     cast_sent_at = monotonic()
+    attempt = direct_retry_state if party_prefer else None
     result=inject_joymax(0x7074, packet, False)
+    if result is not False and pk_runtime is not None and pk_runtime.pop('post_cut_check', None):
+        pk_runtime.pop('post_cut_block', None)
+        _auto_pk_debounced_log(pk_runtime, 'post_cut_cast_log_at',
+                               'Sau ngắt: đã gửi skill ID %d · UID %d.' % (skill_id, cast_target))
+    if attempt is not None:
+        attempt['api_result'] = result
     if first_pk_cast:
         locked = pk_runtime.get('target_locked_at', cast_sent_at)
         selected = pk_runtime.get('target_sent_at', locked)
@@ -2790,23 +3156,32 @@ def rotate_direct(character, gate_checked=False):
     if direct_chain_mode:
         report('ID THỬ: yêu cầu skill=%d, UID=%d, API=%r; chờ B070.'%(skill_id,direct_target,result))
     if result is False:
-        if probing_uid:
-            if (auto_pk_runtime is pk_runtime and pk_runtime.get('skill_probe_uid') == cast_target
-                    and direct_expected == (skill_id, cast_target)):
-                release_auto_pk_target(cast_target, 'phBot từ chối skill thử theo UID')
+        if party_prefer:
+            soft_wait_b070_without_attempt(
+                skill_id, cast_target, 'party prefer phBot từ chối skill · thử lại')
+            return
+        if pk_runtime is not None and direct_expected == (skill_id, cast_target):
+            auto_pk_locked_cast_failed(pk_runtime, cast_target, skill_id, 'phBot từ chối gửi')
             return
         if direct_native_exchange:
-            if auto_pk_running:
-                recover_auto_pk_cast(cast_target, skill_id, 'phBot từ chối gửi skill')
-            else:
-                pause_pvp('PvP ID/ô số: API từ chối gửi skill ID=%d; không tự gửi lại'%skill_id)
+            # Không hard-stop khi inject fail (thường do mất focus / đổi acc).
+            if direct_retry_state is not None:
+                soft_wait_b070_focus(direct_retry_state, 'phBot từ chối gửi skill ID=%d' % skill_id)
+            elif not (auto_pk_running and recover_auto_pk_cast(
+                    cast_target, skill_id, 'phBot từ chối gửi skill')):
+                soft_wait_b070_without_attempt(
+                    skill_id, cast_target, 'phBot từ chối gửi skill ID=%d · thử lại' % skill_id)
             return
         if direct_chain_mode:
-            pause_pvp('ID THỬ: API từ chối skill ID=%d; không gửi lặp'%skill_id)
+            report_direct('ID THỬ: API từ chối skill ID=%d · bỏ đo lẻ, cast tiếp.' % skill_id)
+            direct_expected = direct_retry_state = None
             return
-        report_direct('phBot từ chối gửi 0x7074.')
-        direct_expected = None
-        blocked_until = now + 0.5
+        report_direct('phBot từ chối gửi 0x7074 · thử lại, không dừng Ghost.')
+        if direct_expected is not None:
+            soft_wait_b070_without_attempt(
+                direct_expected[0], direct_expected[1], 'phBot từ chối 0x7074 · thử lại')
+        else:
+            blocked_until = now + 0.5
 
 
 def rotate(character):
@@ -2828,7 +3203,8 @@ def rotate(character):
         active_sequence = None
         return
 
-    if pvp_trigger_mode and get_status():
+    if pvp_trigger_mode and ((auto_pk_running and status_blocks_auto_pk())
+                             or ((not auto_pk_running) and status_blocks_ghost_manual())):
         return
     if not pvp_gate_tick(client, character):
         return
@@ -3189,8 +3565,14 @@ def update_hotbar_finder(skill_id,message):
         match=re.search(r'Ô ([0-9]):',message)
         QtBind.setText(gui,hotbar_slot_label,'Ô: '+(match.group(1) if match else '—'))
         QtBind.setText(gui,hotbar_id_field,str(skill_id))
-        QtBind.setText(gui,hotbar_name_field,str((skill_table().get(int(skill_id)) or {}).get('name','')))
-    QtBind.setText(gui,hotbar_status_label,('Đã đọc ID %s từ ô số; bấm Copy ID. Không tự thêm vào PvP.'%skill_id) if skill_id is not None else message)
+        name = finder_display_text(str((skill_table().get(int(skill_id)) or {}).get('name', '')))
+        QtBind.setText(gui, hotbar_name_field, name)
+        # Also fill the simple ID → tên box so user can Copy / Thêm ngay.
+        if 'finder_query_field' in globals():
+            QtBind.setText(gui, finder_query_field, str(skill_id))
+            if 'resolve_finder_id' in globals():
+                resolve_finder_id(force=True)
+    QtBind.setText(gui,hotbar_status_label,('Đã đọc ID %s · đã điền ô ID trên · Copy hoặc Thêm.'%skill_id) if skill_id is not None else message)
 
 
 def observe_hotbar_finder_request(opcode,data):
@@ -3231,13 +3613,15 @@ def auto_pk_settings_path():
 def view_auto_pk():
     global auto_pk_owner,auto_pk_anchor
     show_view('auto_pk')
+    refresh_auto_pk_nearby(force=True)
     owner=owner_of(get_character_data() or {})
     if owner==auto_pk_owner:return
     auto_pk_owner=owner
     auto_pk_anchor=None
     load_auto_pk_options({})
+    profile = {}
     QtBind.setText(gui,auto_pk_radius_field,str(AUTO_PK_MAX_RADIUS))
-    QtBind.setText(gui,auto_pk_page_field,'F2')
+    page = 'F2'
     QtBind.setText(gui,auto_pk_enemy_key_field,'')
     try:
         profiles=json.loads(auto_pk_settings_path().read_text(encoding='utf-8'))
@@ -3250,17 +3634,17 @@ def view_auto_pk():
             QtBind.setText(gui,auto_pk_enemy_key_field,str(profile.get('target_enemy_key') or ''))
             if math.isfinite(radius) and radius >= 1:
                 QtBind.setText(gui, auto_pk_radius_field, '%g' % min(radius, AUTO_PK_MAX_RADIUS))
-            if page in ('F1','F2'):QtBind.setText(gui,auto_pk_page_field,page)
             anchor=profile.get('anchor')
             if isinstance(anchor,dict) and all(k in anchor for k in ('x','y','region')):
                 values={k:float(anchor.get(k,0)) for k in ('x','y','z')}
                 if all(math.isfinite(value) for value in values.values()):
                     auto_pk_anchor=dict(values,region=int(anchor['region']))
     except (OSError,ValueError,TypeError):pass
+    load_auto_pk_editor(profile if isinstance(profile, dict) else {}, owner, page)
     show_auto_pk_anchor()
     for field in auto_pk_result_fields:QtBind.setText(gui,field,'')
     QtBind.setText(gui, auto_pk_scan_field, 'Tự quét nhận diện khi bật Auto PK.')
-    QtBind.setText(gui,auto_pk_status_label,'Bấm Bật Auto pk để lưu vị trí hiện tại và tự canh.')
+    QtBind.setText(gui,auto_pk_status_label,'Auto PK đã tắt.')
 
 
 def read_auto_pk_settings():
@@ -3275,8 +3659,8 @@ def read_auto_pk_settings():
     if radius > AUTO_PK_MAX_RADIUS:
         radius = AUTO_PK_MAX_RADIUS
         QtBind.setText(gui, auto_pk_radius_field, str(AUTO_PK_MAX_RADIUS))
-    page=QtBind.text(gui,auto_pk_page_field)
-    if page not in ('F1','F2'):raise ValueError('Chọn nhóm Auto pk F1 hoặc F2.')
+    page=selected_auto_pk_page()
+    if page not in PVP_EDIT_PAGES:raise ValueError('Chọn nhóm Auto PK F1, F2 hoặc F3.')
     return owner,radius,page
 
 
@@ -3295,22 +3679,128 @@ def current_auto_pk_anchor():
     return {'x': x, 'y': y, 'z': z, 'region': int(position['region'])}
 
 
+def capture_auto_pk_center(kind, title):
+    try:
+        position = current_auto_pk_anchor()
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError, OverflowError):
+        QtBind.setText(gui, auto_pk_options_status, 'Chưa lấy được tọa độ nhân vật.')
+        return
+    for axis, field in zip(('x', 'y'), auto_pk_center_fields[kind]):
+        QtBind.setText(gui, field, '%.3f' % position[axis])
+    QtBind.setText(gui, auto_pk_options_status, '%s: đã lấy X/Y. Bấm Lưu Auto PK để lưu.' % title)
+
+
+def refresh_auto_pk_nearby(force=False):
+    global auto_pk_nearby_next
+    now = monotonic()
+    if not force and now < auto_pk_nearby_next:
+        return
+    auto_pk_nearby_next = now + 0.5
+    rows = []
+    try:
+        position = current_auto_pk_anchor()
+    except (KeyError, TypeError, ValueError, OSError, RuntimeError, OverflowError):
+        position = None
+    if position is not None:
+        character = get_character_data() or {}
+        own_uid = str(character.get('player_id') or '')
+        own_name = str(character.get('name') or '').casefold()
+        players = auto_pk_players() or {}
+        party = phbot_api.get_party() or {}
+        seen = set()
+        party_members = party.values() if isinstance(party, dict) else ()
+        nearby_party = ((str(member['player_id']), member) for member in party_members
+                        if isinstance(member, dict) and member.get('player_id') not in (None, 0, '0'))
+        from itertools import chain
+        for uid, player in chain(players.items(), nearby_party):
+            uid = str(uid)
+            if uid == own_uid or uid in seen or not isinstance(player, dict):
+                continue
+            name = str(player.get('name') or player.get('job_name') or '')
+            if not name or name.casefold() == own_name:
+                continue
+            distance = auto_pk_scan_distance(player, position)
+            if distance is not None:
+                seen.add(uid)
+                rows.append((distance, name))
+    rows.sort()
+    for index, field in enumerate(auto_pk_nearby_labels):
+        text = '%s = %.1f m' % (rows[index][1], rows[index][0]) if index < len(rows) else ''
+        if not rows and index == 0:
+            text = 'Chưa có tọa độ nhân vật gần.' if position is not None else 'Chưa đọc được vị trí hiện tại.'
+        if QtBind.text(gui, field) != text:
+            QtBind.setText(gui, field, text)
+
+
+def view_auto_pk_advanced():
+    view_auto_pk()
+    show_view('auto_pk_advanced')
+
+
+def view_auto_ks():
+    show_view('auto_ks')
+
+
 def view_auto_pk_options():
     view_auto_pk()
     show_view('auto_pk_options')
 
 
 def view_auto_pk_buffs():
+    # ghep-2.6: buff list is on the main Auto PK tab (fully visible).
     view_auto_pk()
-    show_view('auto_pk_buffs')
+
+
+def refresh_auto_pk_buff_names(force=False):
+    """Numeric ID entry → show skill name; keep one copy-line of looked-up IDs."""
+    global _auto_pk_buff_name_cache
+    if not force and _ui_current_view != 'auto_pk':
+        return
+    texts = []
+    copy_ids = []
+    known = None
+    for index, field in enumerate(auto_pk_buff_fields):
+        text = QtBind.text(gui, field).strip()
+        texts.append(text)
+        name = '—'
+        if text.isdigit():
+            try:
+                uid = int(text)
+            except ValueError:
+                uid = 0
+            if 0 < uid <= 0xffffffff:
+                if known is None:
+                    known = skill_table()
+                skill = known.get(uid)
+                if skill:
+                    name = str(skill.get('name') or skill.get('servername') or ('ID %d' % uid))
+                else:
+                    name = '(chưa có trên acc)'
+                copy_ids.append(str(uid))
+            else:
+                name = 'ID không hợp lệ'
+        elif text:
+            name = 'chỉ nhập số'
+        QtBind.setText(gui, auto_pk_buff_name_labels[index], name[:48])
+    copy_line = '; '.join(copy_ids)
+    cache_key = '|'.join(texts) + '#' + copy_line
+    if not force and cache_key == _auto_pk_buff_name_cache:
+        return
+    _auto_pk_buff_name_cache = cache_key
+    if QtBind.text(gui, auto_pk_buff_ids_copy) != copy_line:
+        QtBind.setText(gui, auto_pk_buff_ids_copy, copy_line)
 
 
 def load_auto_pk_options(profile):
     QtBind.setText(gui, auto_pk_scan_radius_field, str(profile.get('scan_radius', AUTO_PK_REPORT_RADIUS)))
     QtBind.setText(gui, auto_pk_patrol_radius_field, str(profile.get('patrol_radius', 10)))
     for box, name in ((auto_pk_fast_box,'fast_scan'),(auto_pk_patrol_box,'patrol_enabled'),
-                      (auto_pk_buffs_box,'buffs_enabled')):
+                      (auto_pk_mob_farm_box,'mob_farm'),(auto_pk_buffs_box,'buffs_enabled')):
         set_checked_silent(box, profile.get(name) is True)
+    # Ally filters: Party + Guild only (no Liên minh). Default ON if key missing.
+    for box, name in ((auto_pk_skip_party_box, 'skip_party'),
+                      (auto_pk_skip_guild_box, 'skip_guild')):
+        set_checked_silent(box, profile.get(name) is not False)
     centers = profile.get('centers') or {}
     if not isinstance(centers, dict):
         centers = {}
@@ -3320,8 +3810,22 @@ def load_auto_pk_options(profile):
             text = str(values[i]) if isinstance(values,(list,tuple)) and len(values)==2 else ''
             QtBind.setText(gui, field, text)
     buffs = profile.get('buff_ids') or []
+    weapons = profile.get('buff_weapons') or {}
+    legacy_page = profile.get('buff_page') or ''
+    if legacy_page in ('(Không đổi)', 'Không đổi'):
+        legacy_page = ''
+    if not isinstance(weapons, dict):
+        weapons = {}
     for i, field in enumerate(auto_pk_buff_fields):
-        QtBind.setText(gui, field, str(buffs[i]) if isinstance(buffs,list) and i<len(buffs) else '')
+        uid = buffs[i] if isinstance(buffs, list) and i < len(buffs) else ''
+        QtBind.setText(gui, field, str(uid) if uid else '')
+        page = ''
+        if uid:
+            page = weapons.get(str(uid), weapons.get(uid, legacy_page if legacy_page in ('F1', 'F2', 'F3') else ''))
+        if page not in ('F1', 'F2', 'F3'):
+            page = '(Không đổi)'
+        QtBind.setText(gui, auto_pk_buff_weapon_fields[i], page)
+    refresh_auto_pk_buff_names(force=True)
 
 
 def auto_pk_option_radius(field, name, limit):
@@ -3347,34 +3851,60 @@ def read_auto_pk_centers():
 
 
 def read_auto_pk_buff_ids():
-    buffs = []
-    for row, field in enumerate(auto_pk_buff_fields, 1):
+    """Legacy helper — prefer read_auto_pk_buff_rows()."""
+    return [row['id'] for row in read_auto_pk_buff_rows()]
+
+
+def _normalize_buff_weapon_page(text, row):
+    page = (text or '').strip()
+    if page in ('', '(Không đổi)', 'Không đổi'):
+        return ''
+    if page not in ('F1', 'F2', 'F3'):
+        raise ValueError('Buff %d: vũ khí phải là (Không đổi), F1, F2 hoặc F3.' % row)
+    return page
+
+
+def read_auto_pk_buff_rows():
+    """Return [{id, page}, ...] — page is F1/F2/F3 or '' (no weapon switch)."""
+    rows = []
+    seen = set()
+    for index, field in enumerate(auto_pk_buff_fields):
+        row = index + 1
         text = QtBind.text(gui, field).strip()
+        page = _normalize_buff_weapon_page(QtBind.text(gui, auto_pk_buff_weapon_fields[index]), row)
         if not text:
             continue
         try:
             uid = int(text)
         except ValueError:
             raise ValueError('Buff %d: nhập ID bằng số.' % row) from None
-        if not 0 <= uid <= 0xffffffff:
+        if not 0 < uid <= 0xffffffff:
             raise ValueError('Buff %d: ID phải là số dương hợp lệ.' % row)
-        if uid and uid not in buffs:
-            buffs.append(uid)
-    return buffs
+        if uid in seen:
+            continue
+        seen.add(uid)
+        rows.append({'id': uid, 'page': page})
+    return rows
 
 
 def read_auto_pk_options():
     try:
-        buffs, buff_error = read_auto_pk_buff_ids(), None
+        buff_rows, buff_error = read_auto_pk_buff_rows(), None
     except ValueError as error:
-        buffs, buff_error = [], str(error)
+        buff_rows, buff_error = [], str(error)
+    buffs = [row['id'] for row in buff_rows]
+    weapons = {str(row['id']): row['page'] for row in buff_rows if row.get('page')}
     return {
         'scan_radius':auto_pk_option_radius(auto_pk_scan_radius_field,'Vùng quét',AUTO_PK_MAX_SCAN_RADIUS),
         'patrol_radius':auto_pk_option_radius(auto_pk_patrol_radius_field,'Bán kính chạy vòng',AUTO_PK_MAX_RADIUS),
         'patrol_enabled':QtBind.isChecked(gui,auto_pk_patrol_box),
         'fast_scan':QtBind.isChecked(gui,auto_pk_fast_box),
+        'mob_farm':QtBind.isChecked(gui,auto_pk_mob_farm_box),
         'buffs_enabled':QtBind.isChecked(gui,auto_pk_buffs_box),
-        'buff_ids':buffs, 'buff_error':buff_error, 'centers':read_auto_pk_centers(),
+        'skip_party':QtBind.isChecked(gui,auto_pk_skip_party_box),
+        'skip_guild':QtBind.isChecked(gui,auto_pk_skip_guild_box),
+        'buff_ids':buffs, 'buff_weapons':weapons, 'buff_page':'',
+        'buff_error':buff_error, 'centers':read_auto_pk_centers(),
     }
 
 
@@ -3419,7 +3949,14 @@ def save_auto_pk_settings(require_valid_buffs=False):
             if not isinstance(previous, dict):
                 previous = {}
             options['buff_ids'] = previous.get('buff_ids', [])
+            options['buff_weapons'] = previous.get('buff_weapons', {})
+            options['buff_page'] = previous.get('buff_page', '')
             options['buffs_enabled'] = options['buffs_enabled'] and previous.get('buffs_enabled') is True
+        sync_skill_rows(pk_skill_editor)
+        options.update(skill_rows=pk_skill_editor[0],
+                       ghost_pages=[page],
+                       ghost_reclick=QtBind.isChecked(gui, pk_reclick_box),
+                       ghost_reclick_wait=QtBind.text(gui, pk_reclick_wait))
         profiles[owner_key] = dict(options, radius=radius, attack_radius=radius, page=page,
                                    target_enemy_key=key_name, anchor=auto_pk_anchor, enabled=False)
         import tempfile
@@ -3434,7 +3971,7 @@ def save_auto_pk_settings(require_valid_buffs=False):
             auto_pk_option_status('Đã lưu Auto PK · giữ bảng buff đã lưu trước đó.')
             QtBind.setText(gui, auto_pk_buffs_status, 'Chưa lưu buff: ' + buff_error)
         else:
-            auto_pk_option_status('Đã lưu Auto PK và bảng buff · cấu hình áp dụng khi bật lại.')
+            auto_pk_option_status('Đã lưu skill và buff Auto PK · áp dụng khi bật lại.')
     except (OSError,ValueError,TypeError) as error:
         auto_pk_option_status('Chưa lưu: '+str(error))
 
@@ -3459,42 +3996,59 @@ def scan_auto_pk_evidence(runtime=None):
             scan_radius = runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS)
         players = auto_pk_players()
         character = get_character_data() or {}
-        monsters = get_monsters() if callable(get_monsters) else None
         player_id = character.get('player_id')
+        monsters = get_monsters() if callable(get_monsters) else None
         now = monotonic()
         rows = []
         for uid, player in (players or {}).items():
             if not isinstance(player, dict) or str(uid) == str(player_id):
                 continue
             scan_distance = auto_pk_scan_distance(player, center)
-            if scan_distance is None or scan_distance > scan_radius:
+            if scan_distance is None or scan_distance > scan_radius + AUTO_PK_SCAN_PREVIEW_MARGIN:
                 continue
             attack_distance = auto_pk_target_distance(player, anchor, runtime)
             unavailable = (auto_pk_target_unavailable(runtime, int(uid), player, now)
                            if runtime is not None and str(uid).isdigit() else None)
-            try:
-                uid_key = int(uid) if str(uid).isdigit() else uid
-            except (TypeError, ValueError):
-                uid_key = uid
-            hostility, is_opponent = auto_pk_hostility_label(
-                player, character, uid=uid_key, monsters=monsters)
+            uid_i = int(uid) if str(uid).isdigit() else 0
+            label, hostile = auto_pk_hostility_label(player, character, uid=uid_i or None,
+                                                    monsters=monsters)
+            # Preview ally filters (Party + Guild only).
+            preview = {
+                'skip_party': QtBind.isChecked(gui, auto_pk_skip_party_box),
+                'skip_guild': QtBind.isChecked(gui, auto_pk_skip_guild_box),
+            }
+            ally_reason = auto_pk_ally_skip_reason(preview, uid_i, player, character)
+            if ally_reason:
+                hostile = False
+                label = 'bỏ qua (%s)' % (
+                    'Party' if ally_reason == 'party' else 'Guild')
             rows.append(dict(uid=str(uid), name=player.get('name','?'), distance_m=scan_distance,
-                             dead=player.get('dead'), unavailable=unavailable,
-                             in_attack_range=attack_distance is not None and attack_distance <= radius,
-                             hostility=hostility,
-                             opponent=is_opponent))
-        rows.sort(key=lambda row: (not row['opponent'], row['distance_m']))
+                             dead=player.get('dead'), unavailable=unavailable, hostile=hostile,
+                             hostility=label,
+                             in_attack_range=attack_distance is not None and attack_distance <= radius))
+        rows.sort(key=lambda row: (not row['hostile'], row['distance_m']))
         for i, field in enumerate(auto_pk_result_fields):
             row = rows[i] if i<len(rows) else None
-            text = ('%s | UID=%s | %.1f m từ tâm quét | %s | %s' %
+            text = ('%s | UID=%s | %.1f m | %s | %s' %
                     (row['name'], row['uid'], row['distance_m'], row['hostility'],
                      'đã chết' if row['dead'] else row['unavailable'] or
-                     ('trong vùng đánh' if row['in_attack_range'] else 'chỉ báo'))) if row else ''
+                     ('trong vùng đánh' if row['in_attack_range'] else
+                      'cảnh báo xa' if row['distance_m'] > scan_radius else 'vùng quét'))) if row else ''
             QtBind.setText(gui, field, text)
-        message = ('Quét %g m · %d người · %d ngoài vùng đánh.' %
-                   (scan_radius,len(rows),sum(not row['in_attack_range'] for row in rows)))
+        hostiles = [row for row in rows if row['hostile'] and not row['dead']]
+        outside = sum(not row['in_attack_range'] for row in hostiles)
+        message = ('Quét %g m · cảnh báo tới %g m · đánh %g m · %d địch / %d thấy.' %
+                   (scan_radius, scan_radius + AUTO_PK_SCAN_PREVIEW_MARGIN, radius, len(hostiles), len(rows)))
         if not players:
-            message += ' Chưa có UID từ phBot.'
+            message += ' Chưa có UID từ phBot (giới hạn client/get_players).'
+        elif hostiles:
+            nearest = hostiles[0]
+            if nearest.get('in_attack_range'):
+                message += ' Sẵn sàng Target/Ghost.'
+            else:
+                message += ' Địch trong vùng quét · sẵn sàng Target khi vào vùng đánh.'
+        elif rows:
+            message += ' Không có đỏ/tím/job địch trong tầm.'
         QtBind.setText(gui, auto_pk_scan_field, message)
         return {'players': rows}
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as error:
@@ -3586,18 +4140,9 @@ def auto_pk_self_in_radius(runtime, position=None):
 
 
 def auto_pk_allow_unlisted_target(runtime, uid):
-    """Accept a select when get_players omits opposing-faction enemies."""
     if not pvp_person_target(uid):
         return False, 'mục tiêu không hợp lệ'
-    ok, reason = auto_pk_radius_check(uid)
-    if ok:
-        return True, reason
-    if reason != 'tạm thiếu dữ liệu Player':
-        return False, reason
-    self_ok, self_reason = auto_pk_self_in_radius(runtime)
-    if not self_ok:
-        return False, self_reason
-    return True, 'thiếu Player list · giữ chọn server/Target Enemy'
+    return auto_pk_radius_check(uid)
 
 
 def auto_pk_outgoing_selection(data):
@@ -3608,6 +4153,21 @@ def auto_pk_outgoing_selection(data):
     uid = struct.unpack('<I', data)[0]
     if uid and uid == runtime['requested']:
         return True
+    # [FIX party sync hook] PartyLeader inject 7045 must not be blocked.
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    if uid and party_uid and uid == party_uid:
+        now = monotonic()
+        runtime.pop('select_in_event', None)
+        runtime.update(requested=uid, select_until=now + AUTO_PK_SELECT_TIMEOUT, native_uid=uid,
+                       target_seen_at=now, target_sent_at=now, native_probe_until=0.0,
+                       native_source='PartyLeader sync', party_hold_fight=False)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'PartyLeader sync UID %d · chờ B045.' % uid)
+        pvp_selection_request = direct_select_request = uid
+        return True
+    # HARD: party_lock → không nhận target khác UID chủ.
+    if runtime.get('party_lock') and party_uid and uid != party_uid:
+        return False
     if runtime['requested'] or pvp_target or not uid:
         return False
     now = monotonic()
@@ -3639,8 +4199,7 @@ def auto_pk_players():
     return players if isinstance(players, dict) else None
 
 
-# Hostile name colors after war-scarf and/or Alt hostile mode (purple→red).
-# Red = primary opponent mark; purple = hostile/alt mode (also treat as enemy).
+# --- [FIX hostile filter đỏ/tím+job] (1.8.45 style; NO *AE_Sro must-attack, NO ALT) ---
 _HOSTILE_COLOR_KEYS = (
     'color', 'name_color', 'namecolor', 'colour', 'player_color', 'NameColor',
     'nameColor', 'Name_Color', 'text_color', 'font_color',
@@ -3650,12 +4209,27 @@ _HOSTILE_COLOR_WORDS = {
     'purple', 'tím', 'tim', 'violet', 'magenta', 'fuchsia',
     'hostile', 'enemy', 'pk', 'war',
 }
-# Small enums seen on some private builds (0=normal …).
 _HOSTILE_COLOR_ENUMS = {3, 4, 5, 6, 7, 8, 9}
+_JOB_FIELD_KEYS = (
+    'job_type', 'jobtype', 'JobType', 'job', 'job_id', 'jobId', 'job_mode',
+    'jobMode', 'job_flag', 'jobflag', 'profession', 'role', 'title', 'job_name',
+    'jobName', 'job_title', 'jobTitle',
+)
+_JOB_THIEF_WORDS = {
+    'thief', 'bandit', 'robber', 'đạo tặc', 'dao tac', 'đạotặc', 'daotac', 'tặc',
+    'cướp', 'cuop', 'cướp chuyên nghiệp', 'cuop chuyen nghiep', 'cướpchuyênnghiệp',
+}
+_JOB_ESCORT_WORDS = {
+    'trader', 'hunter', 'trade', 'merchant', 'caravan',
+    'bảo tiêu', 'bao tieu', 'bảotiêu', 'baotieu',
+    'thương nhân', 'thuong nhan', 'thợ săn', 'tho san',
+    'tiêu thương', 'tieu thuong',
+}
+_JOB_THIEF_ENUMS = {2, 4}
+_JOB_ESCORT_ENUMS = {1, 3}
 
 
 def _auto_pk_color_rgb(value):
-    """Normalize a color field to (r, g, b) when possible."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, float) and value.is_integer():
@@ -3715,11 +4289,7 @@ def auto_pk_player_color_value(player):
 
 
 def auto_pk_hostile_name_color(player):
-    """True when name color marks a hostile opponent (red primary, purple also).
-
-    Returns None when no usable color field is present (caller may fall back to
-    Target Enemy / Insert, war-scarf, or server-confirmed select).
-    """
+    """True=đỏ/tím địch, False=không thù, None=không có field màu (ẩn)."""
     value = auto_pk_player_color_value(player)
     if value is None:
         return None
@@ -3729,7 +4299,6 @@ def auto_pk_hostile_name_color(player):
         number = int(value)
         if number in _HOSTILE_COLOR_ENUMS:
             return True
-        # Common non-hostile enums / white-ish packed colors.
         if number in (0, 1, 2):
             return False
     if isinstance(value, str):
@@ -3738,7 +4307,6 @@ def auto_pk_hostile_name_color(player):
             return None
         if text in _HOSTILE_COLOR_WORDS or any(word in text for word in _HOSTILE_COLOR_WORDS):
             return True
-        # Explicit non-hostile labels.
         if text in ('white', 'blue', 'green', 'yellow', 'gray', 'grey', 'black',
                     'ally', 'party', 'guild', 'neutral', 'trắng', 'xanh', 'vàng'):
             return False
@@ -3746,46 +4314,15 @@ def auto_pk_hostile_name_color(player):
     if rgb is None:
         return None
     red, green, blue = rgb
-    # Near-white / gray names are not opponents.
     if red >= 200 and green >= 200 and blue >= 200:
         return False
     if abs(red - green) <= 25 and abs(green - blue) <= 25 and abs(red - blue) <= 25:
         return False
-    # Yellow / green / blue names are NOT ALT-hostile.
-    if green >= 140 and green >= blue + 30 and red >= 100 and abs(red - green) <= 55:
-        return False
-    if green >= 150 and green >= red + 40 and green >= blue + 40:
-        return False
-    if blue >= 150 and blue >= red + 40 and blue >= green + 40:
-        return False
-    # Red hostile (after Alt hostile mode / war scarf): R dominates.
     if red >= 150 and red >= green + 40 and red >= blue + 40:
         return True
-    # Purple / violet hostile mode tint: R and B high, G lower.
     if red >= 110 and blue >= 110 and green <= min(red, blue) - 25:
         return True
     return False
-
-
-# Job-flag (mặc cờ nghề): đạo tặc vs bảo tiêu (trader/hunter) are always enemies.
-_JOB_FIELD_KEYS = (
-    'job_type', 'jobtype', 'JobType', 'job', 'job_id', 'jobId', 'job_mode',
-    'jobMode', 'job_flag', 'jobflag', 'profession', 'role', 'title', 'job_name',
-    'jobName', 'job_title', 'jobTitle', 'nickname', 'desc', 'description',
-)
-_JOB_THIEF_WORDS = {
-    'thief', 'bandit', 'robber', 'đạo tặc', 'dao tac', 'đạotặc', 'daotac', 'tặc',
-    'cướp', 'cuop', 'cướp chuyên nghiệp', 'cuop chuyen nghiep', 'cướpchuyênnghiệp',
-}
-_JOB_ESCORT_WORDS = {
-    'trader', 'hunter', 'trade', 'merchant', 'caravan',
-    'bảo tiêu', 'bao tieu', 'bảotiêu', 'baotieu',
-    'thương nhân', 'thuong nhan', 'thợ săn', 'tho san',
-    'tiêu thương', 'tieu thuong',
-}
-# VSRO / common private enums: 0 none; trader/hunter/thief vary by build.
-_JOB_THIEF_ENUMS = {2, 4}          # 2=Thief on many builds; 4=Bandit on some
-_JOB_ESCORT_ENUMS = {1, 3}         # 1/3 = Hunter or Trader depending on build
 
 
 def auto_pk_job_raw(entity):
@@ -3801,7 +4338,9 @@ def _auto_pk_job_side_from_text(text):
     text = (text or '').strip().casefold()
     if not text or text in ('0', 'none', 'no', 'off', 'false', '-'):
         return None
-    # Prefer thief markers before escort (e.g. "Cướp Chuyên Nghiệp").
+    # Never treat *AE_Sro / bare display tags as a job side.
+    if 'ae_sro' in text.replace('*', '').replace('[', '').replace(']', ''):
+        return None
     if text in _JOB_THIEF_WORDS or any(word in text for word in _JOB_THIEF_WORDS):
         return 'thief'
     if text in _JOB_ESCORT_WORDS or any(word in text for word in _JOB_ESCORT_WORDS):
@@ -3810,7 +4349,7 @@ def _auto_pk_job_side_from_text(text):
 
 
 def auto_pk_job_side(entity):
-    """Return 'thief', 'escort' (trader/hunter), or None if no job flag."""
+    """Return 'thief', 'escort' (trader/hunter), or None."""
     value = auto_pk_job_raw(entity)
     if value is None or value is False:
         value = None
@@ -3831,15 +4370,14 @@ def auto_pk_job_side(entity):
         side = _auto_pk_job_side_from_text(text)
         if side:
             return side
-    # phBot Stable often omits job_type but still exposes job title text
-    # ("Cướp Chuyên Nghiệp", …) in miscellaneous string fields.
+    # Only known job title fields — do not scan every string (avoids AE_Sro FPs).
     if isinstance(entity, dict):
-        for key, entry in entity.items():
-            if key in ('name', 'guild', 'servername') or not isinstance(entry, str):
-                continue
-            side = _auto_pk_job_side_from_text(entry)
-            if side:
-                return side
+        for key in ('title', 'job_name', 'jobName', 'job_title', 'jobTitle', 'desc', 'description'):
+            entry = entity.get(key)
+            if isinstance(entry, str):
+                side = _auto_pk_job_side_from_text(entry)
+                if side:
+                    return side
     return None
 
 
@@ -3853,7 +4391,7 @@ def auto_pk_job_flag_hostile(self_entity, other_entity):
 
 
 def auto_pk_dual_listed(uid, monsters=None):
-    """Opposing-faction / scarf hostiles are often dual-listed in get_monsters()."""
+    """Scarf / opposing-faction players are often also in get_monsters()."""
     if monsters is None:
         monsters = get_monsters()
     if not isinstance(monsters, dict):
@@ -3883,7 +4421,7 @@ def auto_pk_monster_entry(uid, monsters=None):
 
 
 def auto_pk_player_view(player, uid=None, monsters=None):
-    """Merge dual-listed monster fields under player so job/color cues survive."""
+    """Merge dual-listed monster job/color cues under the player entry."""
     if not isinstance(player, dict):
         return {}
     entry = auto_pk_monster_entry(uid, monsters) if uid is not None else None
@@ -3894,25 +4432,143 @@ def auto_pk_player_view(player, uid=None, monsters=None):
     return merged
 
 
+def _phbot_dict_api(name):
+    fn = getattr(phbot_api, name, None)
+    if not callable(fn):
+        return None
+    try:
+        data = fn()
+    except (RuntimeError, OSError, TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ally_norm_name(text):
+    """Normalize player/party names for ally match (*AG_BangChu == AG_BangChu)."""
+    text = str(text or '').strip()
+    while text.startswith('*'):
+        text = text[1:].strip()
+    return text.casefold()
+
+
+def _ally_member_ids_names(member):
+    """Strict tokens from one party/guild member — ids + character/job names only."""
+    ids, names = set(), set()
+    if not isinstance(member, dict):
+        return ids, names
+    for key in ('player_id', 'unique_id', 'uid', 'id'):
+        try:
+            pid = int(member.get(key) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0:
+            ids.add(pid)
+    for key in ('name', 'charname', 'char_name', 'character_name', 'CharName',
+                'job_name', 'jobName', 'job'):
+        norm = _ally_norm_name(member.get(key) or '')
+        if norm:
+            names.add(norm)
+    return ids, names
+
+
+def auto_pk_ally_sets(character=None):
+    """Snapshot Party + Guild allies only. No Liên minh / union. Unknown = empty."""
+    character = character or get_character_data() or {}
+    try:
+        self_id = int(character.get('player_id') or 0)
+    except (TypeError, ValueError):
+        self_id = 0
+    self_guild = str(character.get('guild') or character.get('guild_name')
+                     or character.get('guildName') or '').strip().casefold()
+    party_ids, party_names = set(), set()
+    guild_ids = set()
+    # Self is never a valid Auto PK target (handled elsewhere); only real
+    # get_party / get_guild members populate skip sets — empty API ⇒ skip nobody.
+    party = _phbot_dict_api('get_party')
+    if isinstance(party, dict) and party:
+        for member in party.values():
+            ids, names = _ally_member_ids_names(member)
+            party_ids |= ids
+            party_names |= names
+        if self_id:
+            party_ids.add(self_id)
+
+    guild = _phbot_dict_api('get_guild')
+    if isinstance(guild, dict) and guild:
+        for member in guild.values():
+            ids, _names = _ally_member_ids_names(member)
+            guild_ids |= ids
+        if self_id:
+            guild_ids.add(self_id)
+
+    return {
+        'party_ids': party_ids,
+        'party_names': party_names,
+        'guild_ids': guild_ids,
+        'self_guild': self_guild,
+        'has_party': bool(isinstance(party, dict) and party),
+        'has_guild': bool(isinstance(guild, dict) and guild) or bool(self_guild),
+    }
+
+
+def auto_pk_ally_skip_reason(runtime, uid, player, character=None, allies=None):
+    """Skip ONLY same party or same guild. Never alliance/color/job/unknown."""
+    player = player if isinstance(player, dict) else {}
+    runtime = runtime or {}
+    try:
+        uid_i = int(uid or 0)
+    except (TypeError, ValueError):
+        uid_i = 0
+    allies = allies or auto_pk_ally_sets(character)
+
+    name_tokens = set()
+    for key in ('name', 'charname', 'char_name', 'character_name', 'CharName',
+                'job_name', 'jobName', 'job'):
+        norm = _ally_norm_name(player.get(key) or '')
+        if norm:
+            name_tokens.add(norm)
+    player_guild = ''
+    for key in ('guild', 'guild_name', 'guildName'):
+        player_guild = str(player.get(key) or '').strip().casefold()
+        if player_guild:
+            break
+
+    # HARD: same party only when get_party actually listed members.
+    if allies.get('has_party'):
+        if uid_i and uid_i in allies['party_ids']:
+            return 'party'
+        if name_tokens and (name_tokens & allies['party_names']):
+            return 'party'
+
+    # Guild: UID in get_guild roster OR both have same non-empty guild string.
+    skip_guild = True if 'skip_guild' not in runtime else bool(runtime.get('skip_guild'))
+    if skip_guild:
+        if allies.get('has_guild') and uid_i and uid_i in allies['guild_ids']:
+            return 'guild'
+        self_guild = allies.get('self_guild') or ''
+        if self_guild and player_guild and self_guild == player_guild:
+            return 'guild'
+    # No Liên minh. Missing party/guild data ⇒ do not skip (attack strangers).
+    return ''
+
+
+
 def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid=None,
                                 monsters=None):
-    """Opponent for Auto PK list select.
+    """List-select hostile: đỏ/tím OR job đạo tặc↔bảo tiêu; optional dual-list if màu ẩn.
 
-    Hostile = red/purple name color (purple→red hostile state) only for list-select.
-    War-scarf dual-list in get_monsters remains the khăn path when color is
-    hidden. Job thief↔trader is NEVER enough alone and must not invent a
-    job-flag enemy class for màu tên ẩn. Yellow/green/white stay skipped.
-    Insert / server B045 paths remain separate.
+    Does NOT auto-attack on *AE_Sro / job-display-name alone. No ALT.
     """
+    self_entity = get_character_data() or {} if character is None else character
     view = auto_pk_player_view(player, uid, monsters)
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return True
     verdict = auto_pk_hostile_name_color(view)
     if verdict is True:
-        # Already địch by name color — no separate job-flag enemy class.
         return True
     if verdict is False:
         return False
-    # Color missing ("màu tên ẩn"): only war-scarf dual-list may mark địch.
-    # Never treat hidden as hostile from own/other job flag alone.
+    # Color hidden: dual-list (khăn/phe địch) only — not display-name tags.
     if uid is not None and auto_pk_dual_listed(uid, monsters):
         return True
     if require_color:
@@ -3920,33 +4576,19 @@ def auto_pk_is_hostile_opponent(player, character=None, require_color=False, uid
     return False
 
 
-def auto_pk_color_hidden(player, uid=None, monsters=None):
-    """True when name color is missing (màu tên ẩn), not explicit white/ally."""
-    view = auto_pk_player_view(player, uid, monsters)
-    return auto_pk_hostile_name_color(view) is None
-
-
 def auto_pk_hostility_label(player, character=None, uid=None, monsters=None):
-    """Short VN label for Auto PK scan rows."""
     view = auto_pk_player_view(player, uid, monsters)
+    self_entity = character or get_character_data() or {}
+    if auto_pk_job_flag_hostile(self_entity, view):
+        return 'địch cờ nghề', True
     color = auto_pk_hostile_name_color(view)
     if color is True:
         return 'chữ đỏ/tím', True
     if color is False:
         return 'không thù địch', False
-    dual = uid is not None and auto_pk_dual_listed(uid, monsters)
-    if dual:
+    if uid is not None and auto_pk_dual_listed(uid, monsters):
         return 'địch (dual-list/khăn)', True
-    # Job / hidden are informational only — never auto-hostile without red/purple.
-    theirs = auto_pk_job_side(view)
-    mine = auto_pk_job_side(character or {})
-    if theirs and mine and theirs != mine and {mine, theirs} == {'thief', 'escort'}:
-        return 'màu tên ẩn · cờ nghề (chưa chữ đỏ/tím)', False
-    if theirs == 'thief':
-        return 'màu tên ẩn · cướp (chưa chữ đỏ/tím)', False
-    if theirs == 'escort':
-        return 'màu tên ẩn · bảo tiêu (chưa chữ đỏ/tím)', False
-    return 'màu tên ẩn', False
+    return 'bỏ qua', False
 
 
 def auto_pk_distance(target, anchor):
@@ -3960,35 +4602,66 @@ def auto_pk_distance(target, anchor):
 
 
 def auto_pk_target_distance(target, center, runtime):
-    if runtime is not None and runtime.get('fast_scan'):
-        return auto_pk_scan_distance(target, center)
-    return auto_pk_distance(target, center)
+    # [FIX widen scan 60m] Always allow adjacent world-sector neighbours for
+    # Auto PK player distance (was gated behind fast_scan → missed ~40–60m).
+    return auto_pk_scan_distance(target, center)
+
+
+def auto_pk_player_attack_range(uid, runtime=None):
+    """True when PLAYER uid is still inside attack radius (vùng đánh) from camp anchor.
+
+    [FIX never abort PvP in attack range] Self can be outside while target stays inside —
+    that must NOT count as leave-range.
+    """
+    runtime = runtime if runtime is not None else auto_pk_runtime
+    if not runtime or not uid:
+        return False, 'chưa bật Auto PK / thiếu UID'
+    anchor = runtime['anchor']
+    players = auto_pk_players() or {}
+    target = players.get(uid) or players.get(str(uid))
+    if auto_pk_ally_skip_reason(runtime, uid, target):
+        return False, 'mục tiêu là đồng đội'
+    if not isinstance(target, dict):
+        return False, 'tạm thiếu dữ liệu Player'
+    unavailable = auto_pk_target_unavailable(runtime, uid, target, monotonic())
+    if unavailable:
+        return False, unavailable
+    # A leader-commanded fight is not tied to the stationary camp anchor.
+    if is_party_sync_prefer_uid(uid, runtime):
+        return True, 'mục tiêu do leader chỉ định'
+    distance = auto_pk_target_distance(target, anchor, runtime)
+    if distance is None:
+        return False, 'tạm thiếu dữ liệu Player'
+    if distance > runtime['radius']:
+        return False, AUTO_PK_OUTSIDE_TARGET
+    return True, 'mục tiêu trong vùng đánh %.1f m' % distance
 
 
 def auto_pk_radius_check(uid):
     runtime = auto_pk_runtime
     if not runtime:
         return False, 'chưa bật Auto PK'
+    # [FIX never abort PvP in attack range] Target still in vùng đánh wins over self-outside.
+    in_attack, attack_detail = auto_pk_player_attack_range(uid, runtime)
+    if in_attack:
+        return True, attack_detail
+    if attack_detail == AUTO_PK_OUTSIDE_TARGET:
+        return False, AUTO_PK_OUTSIDE_TARGET
+    if attack_detail in ('mục tiêu đã chết', AUTO_PK_PROTECTED, 'mục tiêu là đồng đội'):
+        return False, attack_detail
     anchor = runtime['anchor']
     position = get_position() or {}
-    own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
+    own_distance = auto_pk_scan_distance(position, anchor) if 'region' in position else None
     if own_distance is None:
-        return False, 'thiếu tọa độ hoặc đã đổi vùng'
+        return False, attack_detail if attack_detail == 'tạm thiếu dữ liệu Player' else 'thiếu tọa độ hoặc đã đổi vùng'
     if own_distance > runtime['radius']:
+        # Engaged chase: self outside alone is not a hard fail when Player list is thin.
+        if attack_detail == 'tạm thiếu dữ liệu Player' and (pvp_target == uid or direct_target == uid):
+            return False, 'tạm thiếu dữ liệu Player'
         return False, AUTO_PK_OUTSIDE_SELF
-    players = auto_pk_players() or {}
-    target = players.get(uid) or players.get(str(uid))
-    if not isinstance(target, dict):
+    if attack_detail == 'tạm thiếu dữ liệu Player':
         return False, 'tạm thiếu dữ liệu Player'
-    unavailable = auto_pk_target_unavailable(runtime, uid, target, monotonic())
-    if unavailable:
-        return False, unavailable
-    distance = auto_pk_target_distance(target, anchor, runtime)
-    if distance is None:
-        return False, 'tạm thiếu dữ liệu Player'
-    if distance > runtime['radius']:
-        return False, AUTO_PK_OUTSIDE_TARGET
-    return True, 'mục tiêu cách điểm chờ %.1f m' % distance
+    return False, attack_detail
 
 
 def auto_pk_target_unavailable(runtime, uid, target, now):
@@ -4003,53 +4676,76 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
     return None
 
 
+def auto_pk_approach_range(runtime=None):
+    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 15 m)."""
+    if runtime is None and auto_pk_running:
+        runtime = auto_pk_runtime
+    page = runtime.get('page') if isinstance(runtime, dict) else None
+    page = page or current_page
+    if page not in AUTO_PK_APPROACH_BY_PAGE and auto_pk_running:
+        page = selected_auto_pk_page()
+    return AUTO_PK_APPROACH_BY_PAGE.get(page, AUTO_PK_APPROACH_RANGE)
+
+
 def auto_pk_ready_to_cast(runtime, uid, now):
+    """While fighting a locked UID: keep casting — never force camp-radius return."""
+    # Party prefer: cast immediately — no approach / move_to gate.
+    if is_party_sync_prefer_uid(uid, runtime):
+        runtime.pop('approach', None)
+        return True
     anchor = runtime['anchor']
     position = get_position() or {}
     players = auto_pk_players() or {}
     target = players.get(uid) or players.get(str(uid))
-    own_radius = auto_pk_distance(position, anchor) if 'region' in position else None
+    own_radius = auto_pk_scan_distance(position, anchor) if 'region' in position else None
     if own_radius is None:
-        return False
-    if own_radius > runtime['radius']:
-        force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
         return False
     # Opposing-faction enemies may be absent from get_players; skill packets still
     # use the server-confirmed UID, so allow cast without approach coords.
     if not isinstance(target, dict):
         runtime.pop('approach', None)
         return True
-    target_radius = auto_pk_target_distance(target, anchor, runtime)
-    if target_radius is None:
+    x, y = float(position['x']), float(position['y'])
+    try:
+        dx, dy = float(target['x']) - x, float(target['y']) - y
+    except (KeyError, TypeError, ValueError):
         runtime.pop('approach', None)
         return True
-    if target_radius > runtime['radius']:
-        return False
-    x, y = float(position['x']), float(position['y'])
-    dx, dy = float(target['x']) - x, float(target['y']) - y
     distance = math.hypot(dx, dy)
-    if distance <= AUTO_PK_APPROACH_RANGE:
+    approach_range = auto_pk_approach_range(runtime)
+    if distance <= approach_range:
         runtime.pop('approach', None)
         return True
 
     approach = runtime.get('approach')
     if approach is None or approach['uid'] != uid:
-        approach = runtime['approach'] = dict(uid=uid, best=distance, since=now, move_at=now)
-    elif distance <= approach['best'] - AUTO_PK_RETURN_MIN_PROGRESS:
-        approach.update(best=distance, since=now)
-    elif now - approach['since'] >= AUTO_PK_RETURN_STALL_TIMEOUT:
-        runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
-        force_auto_pk_return(runtime, 'không áp sát được mục tiêu')
+        approach = runtime['approach'] = dict(uid=uid, x=x, y=y, since=now, move_at=now)
+    elif math.hypot(x - approach['x'], y - approach['y']) >= AUTO_PK_RETURN_MIN_PROGRESS:
+        approach.update(x=x, y=y, since=now)
+    elif now - approach['since'] >= AUTO_PK_APPROACH_STALL_TIMEOUT:
+        reason = 'không di chuyển được khi áp sát'
+        if release_auto_pk_target(uid, reason):
+            force_auto_pk_return(runtime, reason)
         return False
     if now >= approach['move_at']:
-        approach['move_at'] = now + 2.0
-        fraction = (distance - 4.0) / distance
+        approach['move_at'] = now + AUTO_PK_APPROACH_MOVE_INTERVAL
+        # Stop at page approach range (F2 15 m) — never pull bow into ~4 m melee.
+        stop_at = max(1.0, approach_range - 0.5)
+        fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
         z = float(position.get('z', anchor['z']))
-        if phbot_api.move_to(x + dx * fraction, y + dy * fraction, z) is False:
-            runtime['retired'][uid] = now + AUTO_PK_TARGET_RETRY_DELAY
-            force_auto_pk_return(runtime, 'phBot từ chối áp sát')
-        else:
-            QtBind.setText(gui, auto_pk_status_label, 'Đang áp sát UID %d · cách %.1f m.' % (uid, distance))
+        try:
+            moved = phbot_api.move_to(x + dx * fraction, y + dy * fraction, z)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            moved = False
+            report_error('Auto PK áp sát: lỗi move_to: %s.' % error)
+        if moved is False:
+            reason = 'phBot từ chối lệnh áp sát'
+            if release_auto_pk_target(uid, reason):
+                force_auto_pk_return(runtime, reason)
+            return False
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đang áp sát UID %d · cách %.1f m · mục tiêu %.0f m (%s).'
+                       % (uid, distance, approach_range, runtime.get('page') or '?'))
     return False
 
 
@@ -4057,6 +4753,29 @@ def auto_pk_fast_changed(checked):
     with pvp_lock:
         if not ui_sync and auto_pk_runtime is not None:
             auto_pk_runtime['fast_scan'] = bool(checked)
+
+
+def auto_pk_mob_farm_changed(checked):
+    with pvp_lock:
+        if ui_sync or auto_pk_runtime is None:
+            return
+        auto_pk_runtime['mob_farm'] = bool(checked)
+        if not checked:
+            auto_pk_drop_mob(auto_pk_runtime, 'tắt Đánh quái')
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đánh quái: bật.' if checked else 'Đánh quái: tắt · API/Target chỉ cho địch.')
+
+
+def auto_pk_skip_party_changed(checked):
+    with pvp_lock:
+        if not ui_sync and auto_pk_runtime is not None:
+            auto_pk_runtime['skip_party'] = bool(checked)
+
+
+def auto_pk_skip_guild_changed(checked):
+    with pvp_lock:
+        if not ui_sync and auto_pk_runtime is not None:
+            auto_pk_runtime['skip_guild'] = bool(checked)
 
 
 def auto_pk_buffs_changed(checked):
@@ -4087,14 +4806,11 @@ def auto_pk_patrol_changed(checked):
 
 
 def stop_auto_pk_patrol(runtime):
-    if not runtime or not runtime.pop('patrol_destination', None) or get_status():
+    # [FIX camp stand-still] Clear patrol state only — do NOT move_to (was nudging camp).
+    if not runtime:
         return
-    try:
-        position = current_auto_pk_anchor()
-        if position['region'] == runtime['anchor']['region']:
-            phbot_api.move_to(position['x'], position['y'], position['z'])
-    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-        report('Auto PK không hủy được bước chạy vòng: %s' % error)
+    runtime.pop('patrol_destination', None)
+    runtime.pop('patrol_attempts', None)
 
 
 def tick_auto_pk_patrol(runtime, position, now):
@@ -4125,31 +4841,302 @@ def tick_auto_pk_patrol(runtime, position, now):
     return True
 
 
+def auto_pk_buff_gear_ready(page):
+    """True when configured buff-page weapon/shield already matches inventory."""
+    wanted = runtime_gear.get(page) or {}
+    if not any(wanted.values()):
+        return False
+    fn = getattr(phbot_api, 'get_inventory', None)
+    items = ((fn() or {}).get('items') or []) if fn else []
+    if len(items) < 8:
+        return False
+    for destination, key in ((6, 'weapon'), (7, 'shield')):
+        identity = wanted.get(key, '')
+        if not identity:
+            continue
+        if identity == '0':
+            if destination == 7 and is_shield_item(items[7]):
+                return False
+            continue
+        if not matches_gear(items[destination], identity):
+            return False
+    return True
+
+
+def auto_pk_is_farm_monster(uid, monster, players):
+    """True for real mobs only — living dual-listed players are opponents, not farm."""
+    if not isinstance(monster, dict) or monster.get('hp', 0) <= 0:
+        return False
+    if isinstance(players, dict):
+        player = players.get(uid) or players.get(str(uid))
+        if isinstance(player, dict) and not player.get('dead'):
+            return False
+    return True
+
+
+def auto_pk_drop_mob(runtime, reason=''):
+    """Stop mob fight so Ghost PvP can take the target cleanly."""
+    global selected_monster_uid, hunt_request
+    if runtime is None:
+        return False
+    uid = int(runtime.pop('mob_uid', 0) or 0)
+    runtime.pop('mob_requested', None)
+    runtime.pop('mob_select_until', None)
+    runtime.pop('mob_cast_at', None)
+    runtime.pop('mob_skill_index', None)
+    if not uid:
+        return False
+    inject_joymax(0x7046, b'', False)
+    if selected_monster_uid == uid:
+        selected_monster_uid = 0
+    if hunt_request == uid:
+        hunt_request = None
+    if reason:
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Bỏ quái UID %d · %s · chuyển Auto Ghost.' % (uid, reason))
+    return True
+
+
+def auto_pk_mob_cast(runtime, character, uid, now):
+    """Cast Ghost skill IDs at a farm monster (rotate_direct refuses monsters)."""
+    global blocked_until
+    if now < max(blocked_until, runtime.get('mob_cast_at', 0), runtime.get('buff_cast_until', 0)):
+        return True
+    if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
+        return True
+    if pvp_activation is not None or pvp_target:
+        return False
+    skills = list(direct_skills or ())
+    if not skills:
+        group = (runtime_skill_groups or {}).get(runtime.get('page')) or {}
+        skills = list(group.get('order') or group.get('delays') or ())
+        if isinstance(skills, dict):
+            skills = list(skills.keys())
+    if not skills:
+        return False
+    table = skill_table()
+    index = int(runtime.get('mob_skill_index', 0) or 0) % len(skills)
+    for _ in range(len(skills)):
+        skill_id = skills[index]
+        index = (index + 1) % len(skills)
+        data = table.get(skill_id) if isinstance(skill_id, int) else None
+        if not isinstance(skill_id, int):
+            continue
+        if data is not None and data.get('can_cast') is False:
+            continue
+        if inject_joymax(0x7074, struct.pack('<BBIBI', 1, 4, skill_id, 1, uid), False) is False:
+            continue
+        runtime['mob_skill_index'] = index
+        runtime['mob_cast_at'] = now + AUTO_PK_MOB_CAST_GAP
+        cast_time = imbue_seconds(data, 'cast_time') if data else 0.0
+        blocked_until = now + max(0.15, cast_time + 0.05)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Đánh quái UID %d · skill %d · vẫn quét địch.' % (uid, skill_id))
+        return True
+    runtime['mob_skill_index'] = index
+    runtime['mob_cast_at'] = now + AUTO_PK_MOB_CAST_GAP
+    return True
+
+
+def tick_auto_pk_idle_mob(runtime, character, now):
+    """Farm nearest monster while Auto PK keeps scanning for opponents."""
+    if (pvp_target or runtime.get('requested') or auto_pk_returning
+            or pvp_stunned_character is not None or now < blocked_until):
+        return False
+    if runtime.get('buff_phase') in ('equip', 'restore'):
+        return False
+    if now < runtime.get('buff_cast_until', 0):
+        return False
+    players = auto_pk_players()
+    monsters = get_monsters() if callable(get_monsters) else None
+    if not isinstance(monsters, dict):
+        return False
+    position = get_position() or {}
+    if 'region' not in position:
+        return False
+    anchor = runtime['anchor']
+    own = auto_pk_distance(position, anchor)
+    # Waiting on mob select confirm.
+    mob_req = int(runtime.get('mob_requested') or 0)
+    if mob_req and now < runtime.get('mob_select_until', 0):
+        return True
+    if mob_req and now >= runtime.get('mob_select_until', 0):
+        runtime.pop('mob_requested', None)
+        runtime.pop('mob_select_until', None)
+    mob_uid = int(runtime.get('mob_uid') or 0)
+    if mob_uid:
+        mon = monsters.get(mob_uid) or monsters.get(str(mob_uid))
+        # Active farm lock: keep casting even past camp radius (no quay về pause).
+        if isinstance(mon, dict) and auto_pk_is_farm_monster(mob_uid, mon, players):
+            return auto_pk_mob_cast(runtime, character, mob_uid, now)
+        auto_pk_drop_mob(runtime, 'quái chết/ra vùng')
+    # New farm pick only while still inside camp.
+    if own is None or own > runtime['radius']:
+        return False
+    origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
+    best = None
+    self_id = character.get('player_id')
+    for raw_uid, monster in monsters.items():
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        if not 0 < uid <= 0xffffffff or uid == self_id:
+            continue
+        if not auto_pk_is_farm_monster(uid, monster, players):
+            continue
+        if monster.get('region') is not None and int(monster['region']) != anchor['region']:
+            continue
+        anchor_distance = auto_pk_target_distance(monster, anchor, runtime)
+        if anchor_distance is None or anchor_distance > runtime['radius']:
+            continue
+        dist = auto_pk_target_distance(monster, origin, runtime)
+        if dist is None:
+            continue
+        candidate = (dist, uid)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return False
+    stop_auto_pk_patrol(runtime)
+    distance, uid = best
+    runtime['mob_requested'] = uid
+    runtime['mob_select_until'] = now + AUTO_PK_MOB_SELECT_TIMEOUT
+    if inject_joymax(0x7045, struct.pack('<I', uid), False) is False:
+        runtime.pop('mob_requested', None)
+        runtime.pop('mob_select_until', None)
+        return False
+    QtBind.setText(gui, auto_pk_status_label,
+                   'Chọn quái UID %d · %.1f m · vẫn canh địch.' % (uid, distance))
+    return True
+
+
+def auto_pk_buff_weapon_for(runtime, uid):
+    """F-page for one buff skill, or '' for no switch. Migrates legacy buff_page."""
+    weapons = runtime.get('buff_weapons') or {}
+    if isinstance(weapons, dict):
+        page = weapons.get(str(uid), weapons.get(uid, ''))
+        if page in ('F1', 'F2', 'F3'):
+            return page
+    legacy = runtime.get('buff_page') or ''
+    return legacy if legacy in ('F1', 'F2', 'F3') else ''
+
+
 def tick_auto_pk_idle_buff(runtime, now):
+    """Existing idle auto-buff: cast when idle, rebuff when expired, never while fighting.
+
+    Only addition: optional per-skill F-page weapon switch around that cast, then restore.
+    """
     global blocked_until
     ids = runtime.get('buff_ids') if runtime.get('buffs_enabled') else None
     if not ids or auto_pk_returning or pvp_target or pvp_stunned_character is not None or now < blocked_until:
+        if pvp_target:
+            runtime.pop('buff_phase', None)
+            runtime.pop('buff_restore_page', None)
+            runtime.pop('buff_cast_uid', None)
+        return False
+    if any(runtime.get(key) for key in ('mob_uid', 'mob_requested', 'requested', 'patrol_destination')):
         return False
     if pending is not None or direct_expected is not None or direct_exchange_wait is not None:
         return False
+    # Let the equipment move finish before starting another one.
+    if pvp_activation is not None and pvp_activation.get('gear_only'):
+        prepare_pvp_page(get_client() or {})
+        return True
     if now < runtime.get('buff_check_at', 0):
         return False
     runtime['buff_check_at'] = now + 0.3
-    retry_at = runtime.setdefault('buff_retry_at', {})
+    combat_page = runtime.get('page')
+    phase = runtime.get('buff_phase')
     try:
+        if phase == 'restore':
+            restore = runtime.get('buff_restore_page') or combat_page
+            if restore and any((runtime_gear.get(restore) or {}).values()):
+                if auto_pk_buff_gear_ready(restore):
+                    runtime.pop('buff_phase', None)
+                    runtime.pop('buff_restore_page', None)
+                    runtime.pop('buff_cast_uid', None)
+                    QtBind.setText(gui, auto_pk_status_label, 'Buff xong · đã trả vũ khí %s.' % restore)
+                    return False
+                if request_gear_only(restore):
+                    QtBind.setText(gui, auto_pk_status_label, 'Buff xong · trả vũ khí nhóm %s.' % restore)
+                    return True
+            runtime.pop('buff_phase', None)
+            runtime.pop('buff_restore_page', None)
+            runtime.pop('buff_cast_uid', None)
+            return False
+
+        retry_at = runtime.setdefault('buff_retry_at', {})
         skills = skill_table()
-        for uid in ids:
+        cast_any = False
+        # Same skill walk as before; if mid-equip, stay on that skill only.
+        walk = ids
+        equip_uid = runtime.get('buff_cast_uid')
+        if phase == 'equip' and equip_uid in ids:
+            walk = [equip_uid]
+        for uid in walk:
             data = skills.get(uid)
-            if (not data or data.get('can_cast') is False or now < retry_at.get(uid, 0)
+            if (not data or now < retry_at.get(uid, 0)
                     or imbue_is_active(phbot_api, uid, data)):
                 continue
+            # --- only addition vs classic buff: weapon for this skill ID ---
+            buff_page = auto_pk_buff_weapon_for(runtime, uid)
+            if buff_page and not any((runtime_gear.get(buff_page) or {}).values()):
+                # UI may have models before runtime_gear refresh — read fields.
+                ui_w = (QtBind.text(gui, weapon_fields.get(buff_page)) or '').strip() if buff_page in weapon_fields else ''
+                ui_s = (QtBind.text(gui, shield_fields.get(buff_page)) or '').strip() if buff_page in shield_fields else ''
+                if ui_w or (ui_s and ui_s != ''):
+                    runtime_gear[buff_page] = {'weapon': ui_w, 'shield': ui_s or '0'}
+                if not any((runtime_gear.get(buff_page) or {}).values()):
+                    retry_at[uid] = now + 15.0
+                    message = (
+                        'Buff ID %d cần đồ nhóm %s — tab Đồ: mặc VK/khiên %s → bấm Lấy đồ %s → Lưu. '
+                        '(Thiếu weapon/shield model cho F này.)' % (uid, buff_page, buff_page, buff_page))
+                    report_error(message)
+                    QtBind.setText(gui, auto_pk_status_label, message)
+                    continue
+            if buff_page:
+                if not auto_pk_buff_gear_ready(buff_page):
+                    stop_auto_pk_patrol(runtime)
+                    runtime['buff_phase'] = 'equip'
+                    runtime['buff_cast_uid'] = uid
+                    runtime['buff_restore_page'] = combat_page
+                    if request_gear_only(buff_page):
+                        QtBind.setText(gui, auto_pk_status_label,
+                                       'Đổi vũ khí %s để cast buff %d · rồi trả %s.' %
+                                       (buff_page, uid, combat_page or '?'))
+                        return True
+                    return False
+                if phase == 'equip':
+                    runtime['buff_phase'] = 'cast'
+                runtime['buff_restore_page'] = combat_page
+                runtime['buff_cast_uid'] = uid
+            # Recheck after equipping: the skill can be unavailable with the combat weapon.
+            if data.get('can_cast') is False:
+                if runtime.get('buff_restore_page'):
+                    runtime['buff_phase'] = 'restore'
+                    retry_at[uid] = now + 2.0
+                    return True
+                continue
+            # --- classic cast / rebuff ---
             stop_auto_pk_patrol(runtime)
             retry_at[uid] = now + max(2.0, imbue_seconds(data, 'cooldown'), imbue_seconds(data, 'duration'))
             if inject_joymax(0x7074, struct.pack('<BBIB', 1, 4, uid, 0), False) is False:
                 continue
             blocked_until = now + max(0.2, imbue_seconds(data, 'cast_time') + 0.1)
             runtime['buff_cast_until'] = blocked_until
+            cast_any = True
+            runtime.pop('buff_cast_uid', None)
+            if runtime.get('buff_restore_page'):
+                runtime['buff_phase'] = 'restore'
+            else:
+                runtime.pop('buff_phase', None)
             QtBind.setText(gui, auto_pk_status_label, 'Đã gửi buff ID %d · tiếp tục canh sau khi thi triển.' % uid)
+            return True
+        if cast_any:
+            return True
+        if runtime.get('buff_restore_page') and runtime.get('buff_phase') in ('cast', 'equip'):
+            runtime['buff_phase'] = 'restore'
             return True
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         report('Auto PK buff: %s' % error)
@@ -4157,21 +5144,13 @@ def tick_auto_pk_idle_buff(runtime, now):
 
 
 def auto_pk_try_native_enemy_key(runtime, client, now, reason):
-    """Fire configured Target Enemy when the player list cannot supply a UID.
-
-    Never presses ALT / enters đồ sát — Target Enemy key only.
-    """
+    """Fire configured Target Enemy when the player list cannot supply a UID."""
     key = runtime.get('native_key', 0)
     if key not in AUTO_PK_NATIVE_KEYS.values():
         return False
-    window = client.get('window')
     runtime['native_probe_until'] = now + AUTO_PK_NATIVE_TIMEOUT
     runtime['select_until'] = runtime['native_probe_until']
-    sent = post_game_key(key, window)
-    if not sent and window and user32 and user32.GetForegroundWindow() == window:
-        # Foreground fallback when PostMessage did not stick.
-        sent = press_key(key, window)
-    if sent:
+    if post_game_key(key, client.get('window')):
         QtBind.setText(gui, auto_pk_status_label,
                        'Đã gửi Target Enemy (%s) · chờ game phát 7045.' % reason)
         return True
@@ -4180,16 +5159,41 @@ def auto_pk_try_native_enemy_key(runtime, client, now, reason):
     return False
 
 
-def auto_pk_select(character, runtime, now, from_event=False):
+def auto_pk_select(character, runtime, now, from_event=False, on_return=False):
+    global auto_pk_returning
     global pvp_selection_request, direct_select_request
     if (now < max(runtime['select_until'], runtime.get('native_probe_until', 0),
                   runtime.get('buff_cast_until', 0))
             or (runtime.get('select_in_event') and not from_event)):
         return
+    # HARD Phụ: party hold / chỉ UID chủ — không tự dò địch khác.
+    if runtime.get('party_hold_fight'):
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Party hold · chờ chủ chọn/đánh lại.')
+        return
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    if runtime.get('party_lock') and party_uid:
+        runtime.pop('native_probe_until', None)
+        runtime.pop('select_in_event', None)
+        runtime['party_follow_mode'] = True
+        if pvp_target and pvp_target != party_uid:
+            release_auto_pk_target(pvp_target, 'khác UID chủ · bỏ')
+        # Already preferred/locked → ensure Ghost armed+cast (no re-log storm).
+        if pvp_target == party_uid or direct_target == party_uid:
+            if not pvp_armed or pvp_paused:
+                party_sync_select_uid(
+                    party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+            elif direct_expected is None and direct_skills:
+                try:
+                    rotate_direct(get_character_data() or {}, gate_checked=True)
+                except Exception:
+                    pass
+            return
+        # Bind prefer + Ghost cast immediately (no 7045 loop).
+        party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+        return
+    # Expire Target probe quietly (no Log spam); keep flag for skill-probe fallback.
     native_expired = bool(runtime.pop('native_probe_until', 0))
-    if native_expired and now >= runtime.get('native_notice_at', 0):
-        runtime['native_notice_at'] = now + 5.0
-        log('[%s] Auto PK v%s: game chưa phát 7045 sau phím Target Enemy.' % (NAME, VERSION))
     runtime.pop('select_in_event', None)
     if runtime['requested']:
         runtime['retired'][runtime['requested']] = now + AUTO_PK_TARGET_RETRY_DELAY
@@ -4199,26 +5203,44 @@ def auto_pk_select(character, runtime, now, from_event=False):
         direct_select_request = 0
     runtime.update(requested=0, native_uid=0)
     players = auto_pk_players()
-    monsters = get_monsters() if callable(get_monsters) else None
     anchor = runtime['anchor']
     position = get_position() or {}
-    own_distance = auto_pk_distance(position, anchor) if 'region' in position else None
-    if own_distance is None or own_distance > runtime['radius']:
-        return
+    own_distance = auto_pk_scan_distance(position, anchor) if 'region' in position else None
     client = get_client() or {}
     if not client.get('running'):
         return
+    farming = bool(runtime.get('mob_farm')) and not on_return
+    if own_distance is None or own_distance > runtime['radius']:
+        return
+    # Idle Skill buff first (on arm / rebuff) before farm or Target.
+    if not on_return and tick_auto_pk_idle_buff(runtime, now):
+        return
     if players is None:
-        # get_players often omits opposing-faction enemies on Stable; still try Target Enemy.
+        if on_return:
+            return
+        # Farm never shares Target/API with PK. Target Enemy is opponent-only.
+        if farming and tick_auto_pk_idle_mob(runtime, character, now):
+            return
         if auto_pk_try_native_enemy_key(runtime, client, now, 'thiếu Player list'):
             return
-        if not tick_auto_pk_patrol(runtime, position, now):
-            QtBind.setText(gui, auto_pk_status_label,
-                           'phBot chưa trả danh sách Player · gán Target Enemy (Home/End/Insert) để chọn phe địch.')
+        if tick_auto_pk_patrol(runtime, position, now):
+            return
+        # [FIX camp stand-still]
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX camp stand-still] Đứng canh im · thiếu Player list · gán Target Enemy'
+                       + (' · Đánh quái đang bật.' if farming else '.'))
         return
     runtime['retired'] = {uid: until for uid, until in runtime['retired'].items() if until > now}
-    best = None
+    # [FIX widen scan 60m] Detect in Vùng quét; Ghost-lock only in Vùng đánh.
+    attack_radius = float(runtime['radius'])
+    scan_radius = float(runtime.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
+    if scan_radius < attack_radius:
+        scan_radius = attack_radius
+    best_attack = None
+    best_scan = None
+    monsters = get_monsters() if callable(get_monsters) else None
     origin = {'x': float(position['x']), 'y': float(position['y']), 'region': anchor['region']}
+    allies = auto_pk_ally_sets(character)
     for raw_uid, target in players.items():
         try:
             uid = int(raw_uid)
@@ -4231,71 +5253,124 @@ def auto_pk_select(character, runtime, now, from_event=False):
             continue
         if auto_pk_target_unavailable(runtime, uid, target, now):
             continue
-        # List-select: red/purple (ALT) or war-scarf dual-list only.
-        # Never mark màu tên ẩn as địch from job flag alone.
-        if not auto_pk_is_hostile_opponent(target, character, require_color=True,
-                                           uid=uid, monsters=monsters):
+        if auto_pk_ally_skip_reason(runtime, uid, target, character, allies):
             continue
-        anchor_distance = auto_pk_target_distance(target, anchor, runtime)
-        if anchor_distance is None or anchor_distance > runtime['radius']:
+        anchor_distance = auto_pk_scan_distance(target, anchor)
+        if anchor_distance is None or anchor_distance > scan_radius:
             continue
-        candidate = (auto_pk_target_distance(target, origin, runtime), uid)
-        if best is None or candidate < best:
-            best = candidate
-    if best is None:
-        if native_expired:
-            runtime['native_misses'] = runtime.get('native_misses', 0) + 1
-        misses = runtime.get('native_misses', 0)
-        can_native = misses < AUTO_PK_NATIVE_MISS_LIMIT
-        if can_native and auto_pk_try_native_enemy_key(
-                runtime, client, now, 'chưa thấy chữ đỏ/tím hoặc dual-list/khăn'):
+        self_distance = auto_pk_scan_distance(target, origin)
+        if self_distance is None:
+            self_distance = anchor_distance
+        candidate = (self_distance, uid, anchor_distance)
+        if anchor_distance <= attack_radius:
+            if best_attack is None or candidate < best_attack:
+                best_attack = candidate
+        elif best_scan is None or candidate < best_scan:
+            best_scan = candidate
+    if on_return:
+        if best_attack is not None and start_auto_pk_skill_probe(runtime, best_attack[1]):
+            auto_pk_returning = False
+            runtime.pop('return_progress', None)
+            runtime.pop('withdraw', None)
+            runtime['move_at'] = 0.0
+        return
+    if best_attack is None and best_scan is not None:
+        distance, uid, anchor_distance = best_scan
+        if farming:
+            tick_auto_pk_idle_mob(runtime, character, now)
+        else:
+            stop_auto_pk_patrol(runtime)
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Người chơi UID %d cách điểm chờ %.1f m · sẵn sàng Ghost %s khi vào vùng đánh %.0f m.'
+                       % (uid, anchor_distance, runtime['page'], attack_radius))
+        return
+    if best_attack is None:
+        # Independent Đánh quái: mob inject only — do not fire Target Enemy here.
+        if farming and tick_auto_pk_idle_mob(runtime, character, now):
             return
-        if not tick_auto_pk_idle_buff(runtime, now) and not tick_auto_pk_patrol(runtime, position, now):
-            QtBind.setText(gui, auto_pk_status_label,
-                           'Đang canh %.0f m · chờ chữ đỏ/tím hoặc khăn dual-list · không đánh màu tên ẩn.' %
-                           runtime['radius'])
+        # No list hostile: Target Enemy still for màu ẩn; then stand still unless Chạy vòng.
+        if (not native_expired or runtime.get('native_misses', 0) < 2) and auto_pk_try_native_enemy_key(
+                runtime, client, now, 'chưa thấy người chơi trong vùng'):
+            if native_expired:
+                runtime['native_misses'] = runtime.get('native_misses', 0) + 1
+            return
+        if tick_auto_pk_patrol(runtime, position, now):
+            return
+        # [FIX camp stand-still] Idle camp — no move_to.
+        QtBind.setText(gui, auto_pk_status_label,
+                       '[FIX camp stand-still] Đứng canh im · đánh %.0f m · quét %.0f m · chờ người chơi.'
+                       % (attack_radius, scan_radius))
         return
     runtime['native_misses'] = 0
+    # Opponent in attack radius → drop mob (if any) and Ghost via Target (no player 7045).
+    auto_pk_drop_mob(runtime, 'có địch trong vùng')
     stop_auto_pk_patrol(runtime)
-    distance, uid = best
-    # Select known hostile UID via 7045; wait B045 before attacking.
+    distance, uid, anchor_distance = best_attack
+    failed_pid, until = runtime.get('fast_select_fallback', (None, 0))
+    prefer_direct = (runtime.get('fast_scan') and auto_pk_in_background(client)
+                     and failed_pid == client.get('pid') and now < until)
+    if (native_expired or prefer_direct) and start_auto_pk_skill_probe(runtime, uid):
+        return
+    # [FIX no player 7045] Prefer configured Target Enemy; never inject player select.
     sent_at = monotonic()
-    runtime.update(requested=uid, select_until=sent_at + AUTO_PK_SELECT_TIMEOUT,
-                   target_seen_at=now, target_sent_at=sent_at)
-    pvp_selection_request = direct_select_request = uid
-    accepted = inject_joymax(0x7045, struct.pack('<I', uid), False)
-    if auto_pk_runtime is not runtime or runtime['requested'] != uid:
-        return  # A synchronous reply already handled this request.
-    if accepted is not False:
+    runtime.update(target_seen_at=now, target_sent_at=sent_at)
+    if auto_pk_try_native_enemy_key(runtime, client, now, 'địch trong vùng đánh'):
         QtBind.setText(gui, auto_pk_status_label,
-                       'Thử chọn UID %d · inject 7045 · cách %.1f m · chờ B045 · v%s.' %
-                       (uid, distance, VERSION))
+                       '[FIX no player 7045] Target Enemy · UID gần nhất %d · cách %.1f m.'
+                       % (uid, distance))
         return
-    runtime.update(requested=0, select_until=0.0)
-    pvp_selection_request = direct_select_request = 0
-    if not from_event:
-        runtime['select_in_event'] = True
-        QtBind.setText(gui, auto_pk_status_label, 'Đợi callback phBot gửi lại UID %d.' % uid)
+    if auto_pk_in_background(client) and start_auto_pk_skill_probe(runtime, uid):
+        if runtime.get('fast_scan') and client.get('pid'):
+            runtime['fast_select_fallback'] = (client['pid'], sent_at + 5.0)
         return
-
-    # Do not skill-probe before B045 — that attacked neutrals in v1.8.42.
-    if auto_pk_try_native_enemy_key(runtime, client, monotonic(), 'API từ chối 7045'):
+    if start_auto_pk_skill_probe(runtime, uid):
         return
     runtime['retired'][uid] = sent_at + AUTO_PK_TARGET_RETRY_DELAY
     key = runtime.get('native_key', 0)
-    message = ('phBot từ chối 7045 · chưa gửi được phím Target Enemy.'
-               if key else 'phBot từ chối 7045 · thử gán Target Enemy bằng Home, End hoặc Insert.')
+    message = ('[FIX no player 7045] Chưa gửi được Target Enemy · gán Home/End/Insert.'
+               if not key else
+               '[FIX no player 7045] Target Enemy từ chối · thử lại UID %d.' % uid)
     QtBind.setText(gui, auto_pk_status_label, message)
     if sent_at >= runtime.get('select_error_at', 0):
         runtime['select_error_at'] = sent_at + 5.0
-        log('[%s] Auto PK UID %d: API trả False cho 7045 trong event_loop. %s' % (NAME, uid, message))
+        log('[%s] Auto PK: %s' % (NAME, message))
+
+
+def auto_pk_wait_locked_skills(runtime, uid, skipped, now):
+    runtime['locked_skills_wait_at'] = now
+    runtime['post_cut_block'] = ', '.join(skipped)
+    _auto_pk_debounced_log(runtime, 'locked_skills_wait_log_at',
+                           'UID %d · giữ khóa, chờ skill dùng lại được.' % uid, interval=3.0)
+
+
+def auto_pk_locked_cast_failed(runtime, uid, skill, reason):
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    if runtime is not auto_pk_runtime or uid != pvp_target or direct_expected != (skill, uid):
+        return
+    runtime.setdefault('locked_skill_retry_at', {})[skill] = monotonic() + AUTO_PK_LOCKED_SKILL_RETRY
+    detail = '%s skill ID %d · UID %d' % (reason, skill, uid)
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
+    # The skill index has already advanced, so the next tick tries the next ID.
+    _auto_pk_debounced_log(runtime, 'locked_cast_miss_at', detail + ' · chuyển skill kế.')
 
 
 def start_auto_pk_skill_probe(runtime, uid):
-    """Legacy helper — Auto PK must not attack before B045; kept for non-PK callers."""
     global pvp_target, direct_target
     if not direct_native_exchange or not auto_pk_allow_unlisted_target(runtime, uid)[0]:
         return False
+    # HARD: never skill-probe own party / filtered allies.
+    players = auto_pk_players() or {}
+    player = players.get(uid) or players.get(str(uid)) or {}
+    ally = auto_pk_ally_skip_reason(runtime, uid, player if isinstance(player, dict) else {},
+                                    get_character_data() or {})
+    if ally:
+        runtime['retired'][int(uid)] = monotonic() + AUTO_PK_TARGET_RETRY_DELAY
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Bỏ UID %d · cùng %s (không PK).' % (
+                           int(uid), 'Party' if ally == 'party' else 'Guild'))
+        return False
+    auto_pk_drop_mob(runtime, 'có địch')
     pvp_target = direct_target = uid
     runtime.pop('approach', None)
     runtime.pop('missing_since', None)
@@ -4312,74 +5387,59 @@ def auto_pk_select_reply(data):
     now = monotonic()
     if not data:
         return
-    requested = runtime['requested']
-    # Target Enemy often selects in-client without an outgoing 7045 the plugin sees.
-    # Accept B045 during native probe / select wait even when requested is still 0.
-    probe_open = now < max(runtime.get('native_probe_until', 0), runtime.get('select_until', 0))
+    # Mob-farm select confirm (keep scanning for opponents).
+    mob_req = int(runtime.get('mob_requested') or 0)
+    if mob_req and data[0] == 1 and len(data) >= 5:
+        confirmed = struct.unpack_from('<I', data, 1)[0]
+        if confirmed == mob_req:
+            runtime['mob_uid'] = confirmed
+            runtime.pop('mob_requested', None)
+            runtime.pop('mob_select_until', None)
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Đã chọn quái UID %d · đánh mob · vẫn canh địch.' % confirmed)
+            return
+    if runtime.get('party_hold_fight') or party_sync_has_target(runtime.get('party_sync_uid') or 0):
+        return
+    uid = runtime['requested']
+    if not uid or now >= runtime['select_until']:
+        return
     if data[0] != 1:
-        if not requested:
-            return
-        if now >= runtime['select_until']:
-            return
         runtime['requested'] = runtime['native_uid'] = pvp_selection_request = direct_select_request = 0
         runtime.update(select_until=0.0, scan_at=0.0)
-        runtime.pop('soft_hidden_pending', None)
-        runtime['retired'][requested] = now + AUTO_PK_PROTECTION_DELAY
+        runtime['retired'][uid] = now + AUTO_PK_PROTECTION_DELAY
         QtBind.setText(gui, auto_pk_status_label, 'Server từ chối UID %d · B045 %s.' %
-                       (requested, bytes(data[:8]).hex(' ').upper()))
+                       (uid, bytes(data[:8]).hex(' ').upper()))
         return
-    if len(data) < 5:
+    if len(data) < 5 or struct.unpack_from('<I', data, 1)[0] != uid:
         return
-    confirmed = struct.unpack_from('<I', data, 1)[0]
-    if requested and confirmed != requested:
-        return
-    if not requested:
-        if not probe_open or not confirmed:
-            return
-        allowed, reason = auto_pk_allow_unlisted_target(runtime, confirmed)
-        if not allowed:
-            return
-        uid = confirmed
-        runtime['native_uid'] = confirmed
-        runtime['native_source'] = runtime.get('native_source') or 'Target Enemy'
-    else:
-        if now >= runtime['select_until']:
-            return
-        uid = requested
-        allowed, reason = auto_pk_allow_unlisted_target(runtime, uid)
-        if not allowed:
-            runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
-            runtime['scan_at'] = 0.0
-            runtime.pop('soft_hidden_pending', None)
-            QtBind.setText(gui, auto_pk_status_label,
-                           'B045 UID %d nhưng chưa khóa: %s.' % (uid, reason))
-            return
     runtime['requested'] = pvp_selection_request = direct_select_request = 0
     runtime['select_until'] = 0.0
-    runtime.pop('native_probe_until', None)
-    runtime.pop('soft_hidden_pending', None)
-    # Target/B045 only switches select state. Friend/foe from red/purple (or
-    # war-scarf dual-list) — never attack màu tên ẩn / neutrals. No ALT key.
-    players = auto_pk_players() or {}
-    row = players.get(uid) or players.get(str(uid)) or {}
-    monsters = get_monsters() if callable(get_monsters) else None
-    character = get_character_data() or {}
-    if not auto_pk_is_hostile_opponent(row, character, require_color=True,
-                                       uid=uid, monsters=monsters):
+    # Server confirmation is authoritative. Do not drop opposing-faction locks
+    # just because get_players is empty/partial or the UID is dual-listed as a mob.
+    allowed, reason = auto_pk_allow_unlisted_target(runtime, uid)
+    if not allowed:
         runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
         runtime['scan_at'] = 0.0
-        runtime['native_uid'] = 0
-        inject_joymax(0x7046, b'', False)
-        label = auto_pk_hostility_label(row, character, uid=uid, monsters=monsters)[0]
-        message = 'B045 UID %d · %s · không đánh (chỉ chữ đỏ/tím hoặc khăn).' % (uid, label)
-        QtBind.setText(gui, auto_pk_status_label, message)
-        log('[%s] Auto PK v%s: %s' % (NAME, VERSION, message))
+        QtBind.setText(gui, auto_pk_status_label,
+                       'B045 UID %d nhưng chưa khóa: %s.' % (uid, reason))
         return
+    players = auto_pk_players() or {}
+    player = players.get(uid) or players.get(str(uid)) or {}
+    ally = auto_pk_ally_skip_reason(runtime, uid, player if isinstance(player, dict) else {},
+                                    get_character_data() or {})
+    if ally:
+        runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + AUTO_PK_TARGET_RETRY_DELAY)
+        runtime['scan_at'] = 0.0
+        QtBind.setText(gui, auto_pk_status_label,
+                       'B045 UID %d · bỏ vì cùng %s (không PK).' % (
+                           uid, 'Party' if ally == 'party' else 'Guild'))
+        return
+    auto_pk_drop_mob(runtime, 'có địch')
     stop_auto_pk_patrol(runtime)
     pvp_target = direct_target = uid
     runtime.pop('missing_since', None)
     runtime.pop('approach', None)
-    runtime.update(first_cast_sent=False, target_locked_at=now, skill_probe_uid=0, native_misses=0)
+    runtime.update(first_cast_sent=False, target_locked_at=now, skill_probe_uid=0)
     request_pvp_page(runtime['page'])
     if auto_pk_runtime is not runtime:
         return
@@ -4389,22 +5449,245 @@ def auto_pk_select_reply(data):
         QtBind.setText(gui, auto_pk_status_label, message)
         return
     source = ' qua ' + runtime['native_source'] if uid == runtime['native_uid'] else ''
-    message = 'Đã khóa UID %d%s · chữ đỏ/tím/khăn · đánh nhóm %s · v%s.' % (
-        uid, source, runtime['page'], VERSION)
+    message = 'Đã khóa UID %d%s · chuẩn bị đánh nhóm %s.' % (uid, source, runtime['page'])
     QtBind.setText(gui, auto_pk_status_label, message)
     log('[%s] Auto PK: %s' % (NAME, message))
 
 
 
+def party_sync_apply_page(page):
+    """Áp nhóm F đã chọn trên phụ (compile + use_skill_group)."""
+    global runtime_skill_groups, current_page, direct_expected, direct_retry_state, pvp_cast_deadline
+    global direct_missed_skills, pvp_allowed_pages
+    page = str(page or '').strip().upper()
+    if page not in PVP_EDIT_PAGES:
+        raise ValueError('Nhóm F phải là F1–F3 (nhận %r).' % page)
+    group = compile_auto_pk_group(page)[page]
+    select_auto_pk_page(page)
+    runtime_skill_groups = {page: group}
+    pvp_allowed_pages = (page,)
+    use_skill_group(page, runtime=True, index=0)
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
+    direct_missed_skills.clear()
+    if auto_pk_runtime is not None:
+        auto_pk_runtime['page'] = page
+        auto_pk_runtime.pop('skill_retry_at', None)
+    current_page = page
+    ids = ','.join(str(uid) for uid in group['order'][:8])
+    log('[%s] party_sync: dùng nhóm %s · ID=[%s%s]'
+        % (NAME, page, ids, '…' if len(group['order']) > 8 else ''))
+    return page
+
+
+def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
+    """Hook công khai: PartyLeader bật Auto PK theo nhóm F (F1–F3)."""
+    if _combat_tab != 'pk':
+        return False
+    global auto_pk_owner
+    try:
+        # ks/trace được phép — không stop_bot, không chặn get_status tracing.
+        page = str(page or '').strip().upper()
+        if page and page not in PVP_EDIT_PAGES:
+            page = selected_auto_pk_page() or 'F2'
+        owner = owner_of(get_character_data() or {})
+        if owner and owner != auto_pk_owner:
+            view_auto_pk()
+        if auto_pk_running:
+            if page in PVP_EDIT_PAGES and page != (auto_pk_runtime or {}).get('page'):
+                try:
+                    party_sync_apply_page(page)
+                except ValueError as error:
+                    log('[%s] party_sync đổi F: %s' % (NAME, error))
+            with pvp_lock:
+                if auto_pk_runtime is not None:
+                    auto_pk_runtime['party_sync_source'] = source
+                    auto_pk_runtime['party_lock'] = True
+            log('[%s] party_sync: Auto PK đã chạy · page=%s · prefer_uid=%s · src=%s'
+                % (NAME, selected_auto_pk_page(), prefer_uid, source))
+            if prefer_uid:
+                party_sync_select_uid(prefer_uid, source=source)
+            return True
+        if page in PVP_EDIT_PAGES:
+            select_auto_pk_page(page)
+        request_auto_pk_arm()
+        if not auto_pk_running:
+            reset_auto_pk_switch()
+            return False
+        if page in PVP_EDIT_PAGES:
+            try:
+                party_sync_apply_page(page)
+            except ValueError as error:
+                log('[%s] party_sync F sau arm: %s' % (NAME, error))
+        with pvp_lock:
+            if auto_pk_runtime is not None:
+                auto_pk_runtime['party_sync_source'] = source
+                auto_pk_runtime['party_lock'] = True
+        log('[%s] party_sync: đã bật Auto PK · nhóm %s · src=%s'
+            % (NAME, selected_auto_pk_page(), source))
+        if prefer_uid:
+            party_sync_select_uid(prefer_uid, source=source)
+        return True
+    except Exception as error:
+        log('[%s] party_sync_arm lỗi: %s' % (NAME, error))
+        return False
+
+
+def party_sync_stop_auto_pk(reason=None, source='PartyLeader'):
+    """Hook công khai: PartyLeader tắt Auto PK (ks off / dung)."""
+    try:
+        if not auto_pk_running:
+            return True
+        stop_auto_pk(reason=reason or ('dừng bởi %s' % source))
+        return True
+    except Exception as error:
+        log('[%s] party_sync_stop lỗi: %s' % (NAME, error))
+        return False
+
+
+def party_sync_has_target(uid):
+    with pvp_lock:
+        runtime = auto_pk_runtime
+        return bool(auto_pk_running and runtime and not runtime.get('party_hold_fight')
+                    and not auto_pk_returning and not pvp_paused
+                    and runtime.get('party_sync_uid') == uid
+                    and pvp_target == direct_target == uid
+                    and (pvp_armed or (pvp_activation and pvp_activation.get('target') == uid)))
+
+
+def party_sync_select_uid(uid, source='PartyLeader'):
+    """Party prefer: lock UID + immediately cast Ghost F skills. NO 7045.
+
+    Never skill_probe / never retire this UID. B070 miss → soft-wait + retry.
+    If Auto PK was F4-stopped, re-arm first then prefer (no UI click needed).
+    After B074: ignore Prefer same UID for ≥PARTY_PREFER_B074_BACKOFF if armed.
+    """
+    global pvp_selection_request, direct_select_request, pvp_target, direct_target, pvp_paused
+    global direct_expected, direct_retry_state, pvp_cast_deadline, auto_pk_returning
+    global pvp_armed, pvp_activation, current_page, direct_index, direct_blocked_target
+    global active_sequence, sequence_index
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        return False
+    if uid <= 0:
+        return False
+    # F4 / stop left Auto PK off — re-arm then prefer (PartyLeader inject path).
+    if not auto_pk_running or auto_pk_runtime is None:
+        page = selected_auto_pk_page() or 'F2'
+        return bool(party_sync_arm_auto_pk(page=page, prefer_uid=uid, source=source))
+    now = monotonic()
+    page = None
+    with pvp_lock:
+        runtime = auto_pk_runtime if auto_pk_running else None
+        if runtime is None:
+            return False
+        players = auto_pk_players() or {}
+        if auto_pk_ally_skip_reason(runtime, uid, players.get(uid) or players.get(str(uid))):
+            return False
+        if runtime['retired'].get(uid, 0) > now:
+            return False
+        if party_sync_has_target(uid):
+            return True
+        target = players.get(uid) or players.get(str(uid))
+        if isinstance(target, dict) and auto_pk_target_unavailable(runtime, uid, target, now):
+            return False
+        runtime['party_sync_uid'] = uid
+        runtime['party_sync_source'] = source
+        runtime['party_lock'] = True
+        runtime['party_follow_mode'] = True
+        runtime['party_hold_fight'] = False
+        runtime['party_sync_select_at'] = now
+        runtime['party_sync_select_uid_last'] = uid
+        runtime['requested'] = 0
+        runtime['native_uid'] = uid
+        runtime['native_source'] = 'PartyLeader prefer'
+        runtime['target_seen_at'] = now
+        runtime['target_sent_at'] = now
+        runtime['target_locked_at'] = now
+        runtime['select_until'] = 0.0
+        runtime['native_probe_until'] = 0.0
+        # Locked prefer fight — NOT disposable skill_probe (probe releases on B070 miss).
+        runtime['skill_probe_uid'] = 0
+        runtime['first_cast_sent'] = False
+        runtime.pop('missing_since', None)
+        runtime.pop('approach', None)
+        runtime.pop('target_outside', None)
+        auto_pk_returning = False
+        runtime.pop('withdraw', None)
+        runtime.pop('return_progress', None)
+        pvp_selection_request = direct_select_request = 0
+        pvp_target = direct_target = uid
+        pvp_paused = False
+        page = runtime.get('page') or selected_auto_pk_page() or 'F2'
+        request_pvp_page(page)
+        if pvp_activation is not None:
+            prepare_pvp_page(get_client() or {})
+        if pvp_target != uid or (not pvp_armed and pvp_activation is None):
+            report_error('Đã nhận UID %d nhưng chưa kích hoạt được Ghost %s; xem trạng thái nhóm/vũ khí.' %
+                         (uid, page))
+            return False
+        if pvp_armed:
+            rotate_direct(get_character_data() or {}, gate_checked=True)
+        log('[%s] Party UID %d · Ghost %s · %s.' %
+            (NAME, uid, page, 'đã kích hoạt' if pvp_armed else 'đang chuẩn bị nhóm/vũ khí'))
+        return True
+
+
+def party_sync_clear_target(reason=None, source='PartyLeader', cancel_action=True):
+    """Clear the local target and optionally cancel the active action."""
+    global pvp_target, pvp_selection_request, direct_target, direct_select_request
+    global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
+    global pvp_armed, active_sequence, sequence_index, auto_pk_returning
+    reason = reason or ('clear bởi %s' % source)
+    with pvp_lock:
+        had_target = bool(pvp_target or direct_target)
+        runtime = auto_pk_runtime if auto_pk_running else None
+        if runtime is not None:
+            runtime['party_sync_uid'] = 0
+            runtime['party_hold_fight'] = True
+            runtime.update(requested=0, native_uid=0, select_until=0.0,
+                           native_probe_until=0.0, skill_probe_uid=0)
+            runtime.pop('select_in_event', None)
+            runtime.pop('withdraw', None)
+            runtime.pop('return_progress', None)
+            auto_pk_returning = False
+        clear_pending()
+        reset_pvp_activation()
+        pvp_armed = False
+        active_sequence = None
+        sequence_index = 0
+        pvp_target = pvp_selection_request = 0
+        direct_target = direct_select_request = 0
+        direct_expected = direct_retry_state = None
+        pvp_cast_deadline = 0.0
+        pvp_paused = True
+        if had_target and cancel_action:
+            if inject_joymax(0x7074, b'\x02', False) is False:
+                report_error('phBot từ chối hủy tác vụ đang chạy.')
+    msg = 'Party sync bỏ khóa · %s' % reason
+    QtBind.setText(gui, auto_pk_status_label, msg)
+    log('[%s] %s' % (NAME, msg))
+    return True
+
+
+def party_sync_hold_fight(reason=None, source='PartyLeader'):
+    """Soft-stop Ghost/Auto PK cast (giữ armed). No inject / no stop_bot."""
+    return party_sync_clear_target(reason=reason or ('hold bởi %s' % source), source=source)
+
+
+
 def request_auto_pk_arm():
+    if _combat_tab != 'pk':
+        report_error('Tích ô cạnh tab Auto PK để chạy.')
+        return
     global auto_pk_running,auto_pk_returning,auto_pk_runtime,auto_pk_anchor,run_section
     try:
         owner,radius,page=read_auto_pk_settings()
         options = read_auto_pk_options()
         key_name = auto_pk_enemy_key_name()
         if not callable(getattr(phbot_api,'move_to',None)):raise ValueError('phBot chưa cung cấp move_to để quay về.')
-        sync_pvp_editor()
-        if page not in compile_skill_groups({page}, allow_empty=True):raise ValueError('Nhóm %s chưa có skill.'%page)
+        compile_auto_pk_group(page, report_skipped=True)
         anchor = auto_pk_center(current_auto_pk_anchor(), options['centers'], 'attack')
         options['scan_center'] = auto_pk_center(anchor, options['centers'], 'scan')
         options['patrol_center'] = auto_pk_center(anchor, options['centers'], 'patrol')
@@ -4420,15 +5703,16 @@ def request_auto_pk_arm():
                 except (OSError, RuntimeError, TypeError, ValueError):
                     buff_error = 'chưa đọc được danh sách skill buff.'
                 else:
-                    if any(uid not in known_skills for uid in options['buff_ids']):
-                        buff_error = 'có ID buff chưa học hoặc không đúng nhân vật.'
+                    missing_ids = [uid for uid in options['buff_ids'] if uid not in known_skills]
+                    if missing_ids:
+                        report_error('Buff: chưa thấy ID %s trong danh sách skill lúc bật.' %
+                                     ', '.join(map(str, missing_ids)))
         disable_buffs = bool(buff_error and options['buffs_enabled'])
         if disable_buffs:
             options.update(buffs_enabled=False, buff_ids=[])
         run_section='pvp'
         set_checked_silent(boss_mode_box, False)
         set_checked_silent(numeric_box, False)
-        set_checked_silent(pvp_box,True)
         with pvp_lock:
             if not start_clicked(auto_pk_page=page):
                 raise ValueError('Chưa bật được bộ skill PvP; xem Log.')
@@ -4436,12 +5720,25 @@ def request_auto_pk_arm():
             auto_pk_runtime = {'owner': owner, 'radius': radius, 'page': page, 'anchor': anchor,
                                'move_at': 0.0, 'scan_at': 0.0, 'requested': 0, 'select_until': 0.0,
                                'native_uid': 0, 'native_key': AUTO_PK_NATIVE_KEYS.get(key_name, 0),
-                               'retired': {}, 'dead_uids': set()}
+                               'retired': {}, 'dead_uids': set(),
+                               'buff_check_at': 0.0, 'armed_at': monotonic()}
             auto_pk_runtime.update(options)
             auto_pk_running = True
             auto_pk_returning = False
+            set_checked_silent(_pk_tab_switch, True)
+            set_checked_silent(_pk_inner_switch, True)
         show_auto_pk_anchor()
-        message = 'Đã bật Auto PK v%s · canh %.0f m · nhóm %s.' % (VERSION, radius, page)
+        farm_on = bool(options.get('mob_farm'))
+        scan_m = float(options.get('scan_radius', AUTO_PK_REPORT_RADIUS) or AUTO_PK_REPORT_RADIUS)
+        skips = []
+        if options.get('skip_party', True): skips.append('Party')
+        if options.get('skip_guild', True): skips.append('Guild')
+        skip_txt = (' · không đánh ' + '/'.join(skips)) if skips else ''
+        message = ('[FIX ally Party+Guild] Đã bật đánh %.0f m · quét %.0f m · nhóm %s · '
+                   'đứng canh im%s.' % (radius, scan_m, page, skip_txt))
+        message += ' Đánh quái: bật.' if farm_on else ' Đánh quái: tắt.'
+        if options.get('buffs_enabled') and options.get('buff_ids'):
+            message += ' Đang gửi Skill buff…'
         if buff_error:
             QtBind.setText(gui, auto_pk_buffs_status, 'Bảng buff: ' + buff_error)
         if disable_buffs:
@@ -4449,16 +5746,33 @@ def request_auto_pk_arm():
             message += ' Buff đã tắt vì ID lỗi.'
             log('[%s] Auto PK vẫn chạy · bỏ qua bảng buff: %s' % (NAME, buff_error))
         QtBind.setText(gui, auto_pk_status_label, message)
-        log('[%s] %s' % (NAME, message))
-        log('[%s] Auto PK v%s: Target chỉ chọn mục tiêu; đánh khi chữ đỏ/tím hoặc khăn · không ALT · không đánh theo cờ ẩn.' %
-            (NAME, VERSION))
-    except (ValueError,TypeError,KeyError,OSError) as error:
-        QtBind.setText(gui,auto_pk_status_label,'Chưa bật: '+str(error))
+        log('[%s] Auto PK v%s: buff-on-arm · fast scan · Đánh quái=%s · API/Target≠farm.' %
+            (NAME, VERSION, 'on' if farm_on else 'off'))
+        # Kick idle buff immediately on arm (before Target/farm).
+        if options.get('buffs_enabled') and options.get('buff_ids') and not disable_buffs:
+            with pvp_lock:
+                if auto_pk_runtime is not None:
+                    tick_auto_pk_idle_buff(auto_pk_runtime, monotonic())
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+        message = 'Auto PK chưa bật được: ' + str(error)
+        QtBind.setText(gui, auto_pk_status_label, message)
+        report_error(message)
+
+
+def reset_auto_pk_switch():
+    global _combat_tab
+    if _combat_tab == 'pk':
+        _combat_tab = None
+    set_checked_silent(_pk_tab_switch, False)
+    set_checked_silent(_pk_inner_switch, False)
 
 
 def stop_auto_pk(reason=None):
+    if auto_pk_runtime is not None:
+        auto_pk_drop_mob(auto_pk_runtime)
     if auto_pk_running:
         stop_clicked()
+    reset_auto_pk_switch()
     message = 'AUTO PK ĐÃ TẮT.'
     if reason:
         message += ' Dừng cưỡng chế: ' + reason + '.'
@@ -4470,7 +5784,24 @@ def stop_auto_pk(reason=None):
 def hold_auto_pk(reason, retry_after=0.0):
     global auto_pk_returning
     runtime = auto_pk_runtime
+    if runtime is None:
+        return
     if runtime.get('hold_reason') == reason:
+        return
+    engaged = int(pvp_target or 0) or int(direct_target or 0)
+    party_follow = bool(runtime.get('party_lock') or runtime.get('party_follow_mode')
+                        or int(runtime.get('party_sync_uid') or 0))
+    # [FIX never abort PvP in attack range] Coord flicker / wait must not quay về mid-fight.
+    if engaged and ('tọa độ' in reason or 'client hoặc dữ liệu' in reason):
+        report('[FIX never abort PvP in attack range] bỏ hold mid-fight · UID %d · %s'
+               % (engaged, reason))
+        runtime.update(hold_reason=reason, hold_until=monotonic() + max(retry_after, 0.15))
+        return
+    # Follower party sync: soft hold only — keep prefer/direct_target, no camp return.
+    if party_follow:
+        runtime.update(hold_reason=reason, hold_until=monotonic() + max(retry_after, 0.5))
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Party sync chờ: %s · giữ prefer UID.' % reason)
         return
     auto_pk_returning = True
     pause_pvp('Auto PK chờ: ' + reason, clear_target=True, cancel_action=False, notify=False)
@@ -4478,20 +5809,168 @@ def hold_auto_pk(reason, retry_after=0.0):
     runtime.pop('return_progress', None)
     runtime.pop('patrol_destination', None)
     runtime.update(hold_reason=reason, hold_until=monotonic() + retry_after, move_at=0.0)
-    message = 'Auto PK đang chờ: ' + reason + ' · sẽ tự canh lại.'
+    message = '[FIX never abort PvP in attack range] Auto PK đang chờ: ' + reason + ' · sẽ tự canh lại.'
     QtBind.setText(gui, auto_pk_status_label, message)
     report_error(message)
 
 
-def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
+def _auto_pk_debounced_log(runtime, key, message, interval=None, error=False):
+    """Status always updates; Log/report at most once per interval (default 2s)."""
+    interval = AUTO_PK_LOG_DEBOUNCE if interval is None else float(interval)
+    now = monotonic()
+    last = float((runtime or {}).get(key) or 0) if isinstance(runtime, dict) else 0.0
+    QtBind.setText(gui, auto_pk_status_label, message)
+    if (now - last) < interval:
+        return False
+    if isinstance(runtime, dict):
+        runtime[key] = now
+    if error:
+        report_error(message)
+    else:
+        log('[%s] %s' % (NAME, message))
+    return True
+
+
+def _party_prefer_unreachable_reason(reason):
+    """True only for truly gone targets — NEVER B074 skill refuse."""
+    text = str(reason or '').casefold()
+    if reason == AUTO_PK_OUTSIDE_TARGET:
+        return True
+    # Explicitly ignore B074 / từ chối đánh — those are skill fails, keep prefer.
+    if 'b074' in text or 'từ chối đánh' in text:
+        return False
+    return any(token in text for token in (
+        'ra vùng', 'vượt bán kính',
+        'biến mất', 'không còn hợp lệ', 'đã chết',
+        AUTO_PK_PROTECTED.casefold(),
+    ))
+
+
+def party_prefer_wait_timeout(runtime, now):
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    skill_id, uid = direct_expected
+    attempt = direct_retry_state
+    if attempt is not None and not attempt.get('party_confirm_grace'):
+        attempt['party_confirm_grace'] = True
+        pvp_cast_deadline = now + PARTY_CAST_RETRY_GAP
+        return True
+    direct_expected = direct_retry_state = None
+    attempt = attempt or {}
+    _auto_pk_debounced_log(
+        runtime, 'party_wait_b070_at',
+        'Party UID %d · skill %d hết chờ B070 (%d ms) · API=%r · B070 của acc=%s · B074=%s · thử skill kế.'
+        % (uid, skill_id, round((now - attempt.get('sent_at', now)) * 1000),
+           attempt.get('api_result'), attempt.get('party_seen_b070', 'chưa thấy'),
+           attempt.get('first_reply', b'').hex(' ').upper() or 'chưa thấy'),
+        interval=5.0)
+    return False
+
+
+def party_prefer_handle_b074_refuse(attempt=None, reason='server từ chối đánh (B074)'):
+    """B074 on party prefer = skill fail → cooldown skill, rotate next, KEEP prefer."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    runtime = auto_pk_runtime
+    if not isinstance(runtime, dict):
+        return False
+    now = monotonic()
+    try:
+        skill_id = int((attempt or {}).get('skill') or 0)
+    except (TypeError, ValueError):
+        skill_id = 0
+    try:
+        uid = int((attempt or {}).get('target') or pvp_target or runtime.get('party_sync_uid') or 0)
+    except (TypeError, ValueError):
+        uid = int(runtime.get('party_sync_uid') or 0)
+    failed_uid, failed_count = runtime.get('party_refusal_count', (0, 0))
+    failed_count = failed_count + 1 if failed_uid == uid else 1
+    if uid and failed_count >= max(1, len(set(direct_skills))):
+        runtime.pop('party_refusal_count', None)
+        runtime['retired'][uid] = now + AUTO_PK_PROTECTION_DELAY
+        log('[%s] UID %d chưa xác nhận %d lượt · %s · bỏ qua 5 giây.' %
+            (NAME, uid, failed_count, reason))
+        return soft_clear_party_prefer(runtime, uid, 'hết lượt thử nhóm skill')
+    runtime['party_refusal_count'] = (uid, failed_count)
+    # Keep prefer locked; block Prefer re-arm spam from PartyLeader.
+    runtime['party_b074_backoff_until'] = now + PARTY_PREFER_B074_BACKOFF
+    runtime['party_b074_uid'] = uid
+    runtime['party_hold_fight'] = False
+    runtime['party_lock'] = True
+    runtime['party_follow_mode'] = True
+    if uid:
+        runtime['party_sync_uid'] = uid
+    if skill_id:
+        retries = runtime.setdefault('skill_retry_at', {})
+        retries[skill_id] = now + 0.75
+    # Clear expect so rotate_direct can fire next Ghost skill.
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = now + 0.35
+    _auto_pk_debounced_log(
+        runtime, 'party_b074_log_at',
+        'Party UID %d · skill %s: %s · xét skill kế tiếp' % (uid, skill_id or '?', reason),
+        interval=2.0)
+    return True
+
+
+def soft_clear_party_prefer(runtime, uid, reason):
+    """Clear prefer only for real leave/F4/>10m/new clear — not B074."""
     global direct_target, direct_select_request, active_sequence, sequence_index
+    global direct_expected, direct_retry_state, pvp_cast_deadline, pvp_paused
+    if not isinstance(runtime, dict):
+        return False
+    if 'b074' in str(reason or '').casefold() or 'từ chối đánh' in str(reason or '').casefold():
+        return party_prefer_handle_b074_refuse(
+            {'skill': (direct_expected or (0, 0))[0], 'target': uid}, reason)
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    return party_sync_clear_target(reason, cancel_action=False)
+
+
+def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY,
+                           allow_party_clear=False):
+    global direct_target, direct_select_request, active_sequence, sequence_index
+    global direct_expected, direct_retry_state, pvp_cast_deadline
     runtime = auto_pk_runtime
     if not auto_pk_running or auto_pk_returning or runtime is None:
         return False
+    try:
+        uid = int(uid or 0)
+    except (TypeError, ValueError):
+        return False
+    if is_party_sync_prefer_uid(uid, runtime):
+        # B074 / skill refuse → keep prefer, retry next skill (never soft-clear).
+        text = str(reason or '').casefold()
+        if 'b074' in text or 'từ chối đánh' in text:
+            skill = (direct_expected or (0, uid))[0]
+            return party_prefer_handle_b074_refuse(
+                {'skill': skill, 'target': uid}, reason)
+        # Real leave / dead / allow_party_clear (F4, >10m) → soft-clear.
+        if allow_party_clear or _party_prefer_unreachable_reason(reason):
+            return soft_clear_party_prefer(runtime, uid, reason)
+        # Transient B070 miss — soft-wait, keep prefer.
+        now = monotonic()
+        runtime['party_hold_fight'] = False
+        runtime.pop('missing_since', None)
+        runtime.pop('approach', None)
+        runtime.pop('target_outside', None)
+        if direct_expected and direct_expected[1] == uid:
+            soft_wait_b070_without_attempt(
+                direct_expected[0], uid, reason or 'chờ B070 party prefer')
+        else:
+            direct_expected = direct_retry_state = None
+            pvp_cast_deadline = now + 0.25
+        _auto_pk_debounced_log(
+            runtime, 'party_prefer_soft_log_at',
+            'Party prefer UID %d · giữ cast Ghost (%s)' % (uid, reason),
+            interval=3.0)
+        return False
     now = monotonic()
-    # Retire the UID briefly in case the next inventory of nearby players
-    # still contains the entity that just disappeared.
     runtime['retired'][uid] = max(runtime['retired'].get(uid, 0), now + retry_delay)
+    runtime.pop('post_cut_check', None)
+    runtime.pop('post_cut_block', None)
+    runtime.pop('locked_skill_retry_at', None)
+    runtime.pop('locked_skills_wait_at', None)
     runtime.pop('missing_since', None)
     runtime.pop('approach', None)
     runtime.pop('select_in_event', None)
@@ -4501,11 +5980,13 @@ def release_auto_pk_target(uid, reason, retry_delay=AUTO_PK_TARGET_RETRY_DELAY):
     clear_pending()
     reset_pvp_activation()
     direct_target = direct_select_request = 0
+    direct_expected = direct_retry_state = None
+    pvp_cast_deadline = 0.0
     active_sequence = None
     sequence_index = 0
-    message = 'UID %d: %s · dò ngay mục tiêu khác.' % (uid, reason)
-    log('[%s] Auto PK: %s' % (NAME, message))
-    QtBind.setText(gui, auto_pk_status_label, message)
+    _auto_pk_debounced_log(
+        runtime, 'release_target_log_at',
+        'UID %d: %s · dò ngay mục tiêu khác.' % (uid, reason))
     return True
 
 
@@ -4524,70 +6005,138 @@ def tick_auto_pk(from_event=False):
     if runtime.get('trade_open'):
         return False
     if not owner or not (get_client() or {}).get('running'):
+        if runtime.get('party_lock') or runtime.get('party_follow_mode'):
+            # False flicker during ks/trace — keep prefer, soft wait.
+            hold_auto_pk('đang chờ client (party sync)', retry_after=1.0)
+            return bool(int(runtime.get('party_sync_uid') or 0) or pvp_target or direct_target)
         hold_auto_pk('đang chờ client hoặc dữ liệu nhân vật')
         return False
-    if character.get('dead') or get_status():
-        hold_auto_pk('nhân vật đã chết' if character.get('dead') else 'bot chính đang chạy')
+    if character.get('dead'):
+        hold_auto_pk('nhân vật đã chết')
+        return False
+    # Trace (ks) ≠ bot chính — không hold / không stop_bot.
+    if status_blocks_auto_pk():
+        hold_auto_pk('bot chính (train) đang chạy')
+        return False
+    if runtime.get('party_hold_fight') and not int(runtime.get('party_sync_uid') or 0):
+        return False
+    # HARD: đang đánh UID khác chủ → bỏ ngay.
+    party_uid = int(runtime.get('party_sync_uid') or 0)
+    if runtime.get('party_lock') and party_uid and pvp_target and pvp_target != party_uid:
+        release_auto_pk_target(pvp_target, 'khác UID chủ')
         return False
     now = monotonic()
     if now < runtime.get('hold_until', 0):
         return False
+    party_follow = bool(runtime.get('party_lock') or runtime.get('party_follow_mode'))
     if not auto_pk_returning:
         if now < runtime['scan_at'] and not (from_event and runtime.get('select_in_event')):
             return bool(pvp_target and 'missing_since' not in runtime and 'target_outside' not in runtime)
-        interval = AUTO_PK_FAST_SCAN_INTERVAL if not pvp_target and runtime.get('fast_scan') else AUTO_PK_SCAN_INTERVAL
+        # Near camp without a lock: always poll players fast so Target/API engage sooner.
+        if not pvp_target:
+            interval = AUTO_PK_FAST_SCAN_INTERVAL
+            if runtime.get('fast_scan'):
+                interval = min(interval, 0.010)
+        else:
+            interval = AUTO_PK_SCAN_INTERVAL
         runtime['scan_at'] = now + interval
     position = get_position() or {}
-    distance = auto_pk_distance(position, runtime['anchor']) if 'region' in position else None
+    distance = auto_pk_scan_distance(position, runtime['anchor']) if 'region' in position else None
+    engaged_uid = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
     if distance is None:
+        # [FIX never abort PvP in attack range] Keep engaged cast if coords flicker.
+        if engaged_uid and (pvp_armed or pvp_activation is not None):
+            return True
+        if party_follow:
+            # Follower: ignore camp coords — keep prefer/cast.
+            return bool(engaged_uid)
         hold_auto_pk('chưa có tọa độ hợp lệ trong vùng điểm chờ')
         return False
     if runtime.pop('hold_reason', None):
         runtime.update(hold_until=0.0, scan_at=0.0, move_at=0.0)
     if not auto_pk_returning:
-        if distance > runtime['radius']:
+        if not party_follow and distance > runtime['radius']:
+            if engaged_uid:
+                release_auto_pk_target(engaged_uid, AUTO_PK_OUTSIDE_SELF, retry_delay=0.0)
             force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_SELF)
             return False
         if not pvp_target:
+            # Buff on idle/arm before opponent Target or Đánh quái.
+            if tick_auto_pk_idle_buff(runtime, now):
+                return False
             auto_pk_select(character, runtime, now, from_event=from_event)
             return False
         eligible, reason = auto_pk_radius_check(pvp_target)
+        in_attack, attack_detail = auto_pk_player_attack_range(pvp_target, runtime)
+        active = pvp_armed or pvp_activation is not None
+        # [FIX never abort PvP in attack range] Target still in vùng đánh → keep casting.
+        if in_attack:
+            runtime.pop('target_outside', None)
+            runtime.pop('missing_since', None)
+            if not party_follow:
+                if not active or pvp_paused:
+                    reason = 'UID còn khóa nhưng chuỗi đánh không còn hoạt động'
+                    if release_auto_pk_target(pvp_target, reason):
+                        force_auto_pk_return(runtime, reason)
+                    return False
+                if auto_pk_recover_post_cut(runtime, pvp_target, character, now):
+                    return False
+            return party_follow or distance <= runtime['radius']
         if reason == AUTO_PK_OUTSIDE_SELF:
-            force_auto_pk_return(runtime, reason)
-            return False
+            # Self left camp while chasing a target still in vùng đánh — keep engage.
+            runtime.pop('target_outside', None)
+            runtime.pop('missing_since', None)
+            _auto_pk_debounced_log(
+                runtime, 'self_outside_log_at',
+                'Self ngoài bán kính · giữ UID %d · %s' % (pvp_target, attack_detail))
+            return True
         if reason == AUTO_PK_OUTSIDE_TARGET:
-            uid, since = runtime.get('target_outside', (0, now))
-            if uid != pvp_target:
-                runtime['target_outside'] = (pvp_target, now)
-                runtime.pop('missing_since', None)
-            elif now - since >= AUTO_PK_TARGET_OUTSIDE_CONFIRM:
-                force_auto_pk_return(runtime, reason)
+            left_uid = pvp_target
+            if party_follow or is_party_sync_prefer_uid(left_uid, runtime):
+                uid, since = runtime.get('target_outside', (0, now))
+                if uid != left_uid:
+                    runtime['target_outside'] = (left_uid, now)
+                    return False
+                if now - since < AUTO_PK_TARGET_OUTSIDE_CONFIRM:
+                    return False
+                soft_clear_party_prefer(runtime, left_uid, AUTO_PK_OUTSIDE_TARGET)
+            else:
+                release_auto_pk_target(left_uid, AUTO_PK_OUTSIDE_TARGET, retry_delay=0.0)
+                force_auto_pk_return(runtime, AUTO_PK_OUTSIDE_TARGET)
             return False
         runtime.pop('target_outside', None)
         if reason in ('mục tiêu đã chết', AUTO_PK_PROTECTED):
-            release_auto_pk_target(pvp_target, reason)
+            left_uid = pvp_target
+            if is_party_sync_prefer_uid(left_uid, runtime):
+                # Dead/unreachable prefer — soft-clear (do not cast forever).
+                soft_clear_party_prefer(runtime, left_uid, reason)
+                return False
+            release_auto_pk_target(left_uid, reason)
+            if not party_follow:
+                force_auto_pk_return(runtime, reason)
             return False
-        active = pvp_armed or pvp_activation is not None
         if eligible and active:
             runtime.pop('missing_since', None)
             return True
         if active and reason == 'tạm thiếu dữ liệu Player':
-            # Opposing-faction enemies are frequently omitted from get_players on
-            # Stable. Keep the server-confirmed lock; 0x3015/0x3016 still release
-            # vanished UIDs. Do not force-return after one second.
-            runtime.pop('missing_since', None)
-            if now >= runtime.get('missing_notice_at', 0):
-                runtime['missing_notice_at'] = now + 5.0
-                QtBind.setText(gui, auto_pk_status_label,
-                               'Giữ UID %d · Player list thiếu (thường gặp phe địch).' % pvp_target)
-            return True
+            if party_follow:
+                return True
+            if now - runtime.setdefault('missing_since', now) < AUTO_PK_TARGET_COORD_GRACE:
+                return False
+            reason = 'mất tọa độ mục tiêu khi đang đuổi'
         runtime.pop('missing_since', None)
         if eligible:
             reason = 'chuỗi đánh đã dừng, xem lý do ngay trước dòng này'
-        report_error('Auto PK bỏ khóa UID %d: %s.' % (pvp_target, reason))
-        pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
-        auto_pk_returning = True
-        QtBind.setText(gui, auto_pk_status_label, 'Dừng đánh · đang quay về điểm bật.')
+        left_uid = pvp_target
+        _auto_pk_debounced_log(
+            runtime, 'drop_lock_log_at',
+            'Bỏ khóa UID %d: %s · quay về điểm chờ' % (left_uid, reason),
+            error=True)
+        release_auto_pk_target(left_uid, reason, allow_party_clear=True)
+        if not party_follow:
+            force_auto_pk_return(runtime, reason)
+        else:
+            pause_pvp('Auto PK: ' + reason, clear_target=True, notify=False)
     if auto_pk_returning:
         withdraw = runtime.get('withdraw')
         if withdraw and not auxiliary_exchange_ready(withdraw):
@@ -4607,21 +6156,64 @@ def tick_auto_pk(from_event=False):
                     return False
             else:
                 return False
-        move_auto_pk_to_anchor(runtime)
+        if not party_follow and distance <= runtime['radius'] and now >= runtime['scan_at']:
+            runtime['scan_at'] = now + (0.010 if runtime.get('fast_scan') else AUTO_PK_FAST_SCAN_INTERVAL)
+            auto_pk_select(character, runtime, now, from_event=from_event, on_return=True)
+        if auto_pk_returning:
+            move_auto_pk_to_anchor(runtime)
     return False
 
 
+def auto_pk_recover_post_cut(runtime, uid, character, now):
+    check = runtime.get('post_cut_check')
+    approach = runtime.get('approach') or {}
+    approaching = approach.get('uid') == uid and now < approach.get('move_at', 0.0) + AUTO_PK_APPROACH_MOVE_INTERVAL
+    waiting_for_skills = now - runtime.get('locked_skills_wait_at', float('-inf')) < 0.25
+    if (not check or check[0] != uid or now < check[1] or approaching or waiting_for_skills
+            or pvp_stun_blocks(character) or direct_expected is not None
+            or pending is not None or direct_exchange_wait is not None):
+        return False
+    detail = runtime.pop('post_cut_block', '')
+    reason = 'sau ngắt chưa gửi được skill kế' + (' · ' + detail if detail else '')
+    if not release_auto_pk_target(uid, reason):
+        return False
+    force_auto_pk_return(runtime, reason)
+    return True
+
+
 def force_auto_pk_return(runtime, reason):
+    """Camp return. Refuse only while locked UID is STILL inside vùng đánh."""
     global auto_pk_returning
     if auto_pk_returning:
         return
+    if not isinstance(runtime, dict):
+        return
+    # Party follower: movement is Trace — never camp-return mid party sync.
+    if runtime.get('party_lock') or runtime.get('party_follow_mode'):
+        if int(runtime.get('party_sync_uid') or 0):
+            return
+    engaged = int(pvp_target or 0) or int(direct_target or 0) or int(runtime.get('requested') or 0)
+    if engaged:
+        in_attack, detail = auto_pk_player_attack_range(engaged, runtime)
+        if in_attack:
+            # Target still in camp attack radius — keep fighting, no quay về.
+            _auto_pk_debounced_log(
+                runtime, 'refuse_return_log_at',
+                'Giữ đánh UID %d · từ chối quay về (%s)' % (engaged, detail),
+                error=True)
+            return
+        # Target left vùng đánh / missing — clear engage then return.
+        release_auto_pk_target(engaged, reason or AUTO_PK_OUTSIDE_TARGET,
+                               allow_party_clear=True)
     auto_pk_returning = True
     runtime.pop('withdraw', None)
     runtime.pop('patrol_destination', None)
     runtime['move_at'] = 0.0
-    pause_pvp('Auto PK: ' + reason, clear_target=True, cancel_action=False, notify=False)
-    report_error('Auto PK: %s (%.1f m) · quay về điểm bật.' % (reason, runtime['radius']))
-    QtBind.setText(gui, auto_pk_status_label, 'Quay về điểm chờ · ' + reason + '.')
+    pause_pvp('Auto PK: ' + str(reason), clear_target=True, cancel_action=False, notify=False)
+    _auto_pk_debounced_log(
+        runtime, 'camp_return_log_at',
+        'Quay về điểm chờ · %s (bán kính %.1f m)' % (reason, float(runtime.get('radius') or 0)),
+        error=True)
     move_auto_pk_to_anchor(runtime)
 
 
@@ -4633,11 +6225,10 @@ def move_auto_pk_to_anchor(runtime):
         region = int(position['region'])
     except (KeyError, TypeError, ValueError, OverflowError):
         return
-    if region != anchor['region']:
-        hold_auto_pk('nhân vật đang ở khác vùng điểm chờ')
-        return
-    distance = auto_pk_distance(position, anchor)
+    distance = auto_pk_scan_distance(position, anchor)
     if distance is None:
+        if region != anchor['region']:
+            hold_auto_pk('nhân vật đang ở khác vùng điểm chờ')
         return
 
     now = monotonic()
@@ -4656,7 +6247,7 @@ def move_auto_pk_to_anchor(runtime):
 
     if progress is None:
         progress = runtime['return_progress'] = {
-            'distance': distance, 'since': now, 'move_pending': False,
+            'distance': distance, 'since': now, 'cancel_sent': False, 'move_sent': False,
             'short_steps': False, 'step_index': 0,
         }
     elif distance <= progress['distance'] - AUTO_PK_RETURN_MIN_PROGRESS:
@@ -4667,14 +6258,15 @@ def move_auto_pk_to_anchor(runtime):
 
     if now < runtime['move_at']:
         return
-    if not progress['move_pending']:
-        # Clear the current action even when Ghost has already dropped its UID.
+    if not progress['cancel_sent']:
+        # Cancel once per retreat. A repeated cancel can stop the current move.
         inject_joymax(0x7074, b'\x02', False)
-        progress['move_pending'] = True
+        progress['cancel_sent'] = True
         runtime['move_at'] = now + AUTO_PK_RETURN_CANCEL_GAP
         return
+    if progress['move_sent'] and now - progress['since'] < AUTO_PK_RETURN_MOVE_INTERVAL:
+        return
 
-    progress['move_pending'] = False
     runtime['move_at'] = now + AUTO_PK_RETURN_MOVE_INTERVAL
     x, y, z = anchor['x'], anchor['y'], anchor['z']
     if progress['short_steps']:
@@ -4690,6 +6282,7 @@ def move_auto_pk_to_anchor(runtime):
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         result = False
         report('Auto PK quay về: lỗi move_to: %s.' % error)
+    progress['move_sent'] = result is not False
     if result is False:
         progress['short_steps'] = True
         message = 'phBot từ chối di chuyển · sẽ thử lại, đang khóa đánh.'
@@ -4708,67 +6301,215 @@ def normalize_finder_text(text):
                    if not unicodedata.combining(char))
 
 
+def finder_display_text(value):
+    """Fix common SRO/phBot mojibake so Vietnamese skill names stay readable."""
+    text = str(value or '')
+    if not text:
+        return text
+    if any(0x1ea0 <= ord(c) <= 0x1ef9 for c in text):
+        return text
+    for src_enc, dst_enc in (
+            ('latin1', 'utf-8'),
+            ('cp1252', 'utf-8'),
+            ('latin1', 'cp1258'),
+            ('cp1252', 'cp1258')):
+        try:
+            fixed = text.encode(src_enc).decode(dst_enc)
+        except (LookupError, UnicodeDecodeError, UnicodeEncodeError):
+            continue
+        if not fixed or fixed == text or '\ufffd' in fixed:
+            continue
+        if any(0x1ea0 <= ord(c) <= 0x1ef9 for c in fixed):
+            return fixed
+        if any(mark in text for mark in ('¾', 'ð', 'ø', '¹', 'µ')) and not any(
+                mark in fixed for mark in ('¾', 'ð', 'ø')):
+            return fixed
+    return text
+
+
+def _finder_sync_dest_default():
+    """Prefer current Auto PK page when opening Tools."""
+    if 'finder_dest_field' not in globals():
+        return
+    page = None
+    try:
+        page = selected_auto_pk_page()
+    except Exception:
+        page = None
+    if page in ('F1', 'F2', 'F3'):
+        QtBind.setText(gui, finder_dest_field, 'Auto PK · %s' % page)
+
+
+def _finder_clear_result_row():
+    """Empty the single result row (default / clear / invalid ID)."""
+    QtBind.setText(gui, finder_result_id, '')
+    QtBind.setText(gui, finder_pick_name, '')
+    QtBind.setText(gui, finder_level_field, '')
+    finder_visible_ids[:] = []
+
+
+def resolve_finder_id(force=False):
+    """Live: digits in ID box → fill ONLY the one result row (never dump list)."""
+    global _finder_live_query
+    raw = QtBind.text(gui, finder_query_field).strip()
+    if not force and raw == _finder_live_query:
+        return
+    _finder_live_query = raw
+    if not raw:
+        _finder_clear_result_row()
+        QtBind.setText(gui, finder_id_preview,
+                       'Bảng trống · gõ ID → hiện đúng 1 skill. Không dump cả list.')
+        QtBind.setText(gui, finder_status_label, 'Chưa có ID · hàng kết quả đang trống.')
+        return
+    if not raw.isdigit():
+        _finder_clear_result_row()
+        QtBind.setText(gui, finder_id_preview, 'Chỉ nhập số ID skill.')
+        QtBind.setText(gui, finder_status_label, 'ID phải là số · hàng vẫn trống.')
+        return
+    try:
+        uid = int(raw)
+    except ValueError:
+        _finder_clear_result_row()
+        QtBind.setText(gui, finder_id_preview, 'ID không hợp lệ.')
+        return
+    if not (0 < uid <= 0xffffffff):
+        _finder_clear_result_row()
+        QtBind.setText(gui, finder_id_preview, 'ID ngoài phạm vi.')
+        return
+    QtBind.setText(gui, finder_result_id, str(uid))
+    finder_visible_ids[:] = [uid]
+    skill = skill_table().get(uid)
+    if not skill:
+        QtBind.setText(gui, finder_pick_name, '(chưa có trên acc)')
+        QtBind.setText(gui, finder_level_field, '')
+        QtBind.setText(gui, finder_id_preview,
+                       'ID %d · 1 hàng · chưa có trên acc — vẫn Copy / Thêm.' % uid)
+        QtBind.setText(gui, finder_status_label, '1 skill (chưa có trên acc).')
+        return
+    name = finder_display_text(str(skill.get('name') or skill.get('servername') or ('ID %d' % uid)))
+    level = str(skill.get('level') or '')
+    QtBind.setText(gui, finder_pick_name, name)
+    QtBind.setText(gui, finder_level_field, level)
+    QtBind.setText(gui, finder_id_preview, '1 skill · ID %d → %s' % (uid, name[:40]))
+    QtBind.setText(gui, finder_status_label, 'Sẵn sàng Copy hoặc Thêm.')
+
+
+def tick_skill_finder_live():
+    if _ui_current_view != 'tools':
+        return
+    resolve_finder_id()
+
+
 def refresh_skill_finder():
-    global finder_owner,finder_skills
-    finder_owner=owner_of(get_character_data() or {})
-    finder_skills=[]
-    if finder_owner is not None:
-        for uid,skill in (get_skills() or {}).items():
-            try:uid=int(uid)
-            except (ValueError,TypeError):continue
-            if uid<=0 or not isinstance(skill,dict):continue
-            name=str(skill.get('name') or skill.get('servername') or '(chưa có tên)')
-            finder_skills.append({'id':uid,'name':name,'level':str(skill.get('level','')),
-                                  'search':normalize_finder_text('%s %s %s'%(uid,name,skill.get('servername','')))})
-        finder_skills.sort(key=lambda row:(normalize_finder_text(row['name']),row['id']))
-    search_skill_finder()
+    """Compatibility: resolve current ID box (no skill dump)."""
+    resolve_finder_id(force=True)
 
 
 def search_skill_finder():
-    global finder_matches,finder_offset
-    if finder_owner!=owner_of(get_character_data() or {}):
-        refresh_skill_finder()
-        return
-    query=normalize_finder_text(QtBind.text(gui,finder_query_field)).strip()
-    terms=query.split()
-    finder_matches=[row for row in finder_skills if all(term in row['search'] for term in terms)]
-    if query.isdigit():finder_matches.sort(key=lambda row:(str(row['id'])!=query,normalize_finder_text(row['name']),row['id']))
-    finder_offset=0
-    show_skill_finder()
-    message=('%d skill khớp / %d skill của acc. Bấm Copy ID hoặc copy trực tiếp trong ô ID.'%(len(finder_matches),len(finder_skills))
-             if finder_owner else 'Chưa có nhân vật vào game; đăng nhập rồi bấm Quét lại.')
-    QtBind.setText(gui,finder_status_label,message)
+    resolve_finder_id(force=True)
 
 
 def show_skill_finder():
-    global finder_visible_ids
-    rows=finder_matches[finder_offset:finder_offset+len(finder_row_fields)]
-    finder_visible_ids=[row['id'] for row in rows]
-    for index,fields in enumerate(finder_row_fields):
-        row=rows[index] if index<len(rows) else {'id':'','name':'','level':''}
-        for field,key in zip(fields,('id','name','level')):QtBind.setText(gui,field,str(row[key]))
-    count=len(finder_matches)
-    first=finder_offset+1 if count else 0
-    QtBind.setText(gui,finder_page_label,'%d–%d / %d kết quả'%(first,min(finder_offset+len(finder_row_fields),count),count))
+    resolve_finder_id(force=True)
 
 
 def clear_skill_finder():
-    QtBind.setText(gui,finder_query_field,'')
-    search_skill_finder()
+    QtBind.setText(gui, finder_query_field, '')
+    _finder_clear_result_row()
+    resolve_finder_id(force=True)
+    QtBind.setText(gui, finder_status_label, 'Đã xóa · bảng trống lại.')
 
 
 def finder_previous():
-    global finder_offset
-    if finder_owner!=owner_of(get_character_data() or {}):refresh_skill_finder();return
-    finder_offset=max(0,finder_offset-len(finder_row_fields))
-    show_skill_finder()
+    pass
 
 
 def finder_next():
-    global finder_offset
-    if finder_owner!=owner_of(get_character_data() or {}):refresh_skill_finder();return
-    if finder_offset+len(finder_row_fields)<len(finder_matches):finder_offset+=len(finder_row_fields)
-    show_skill_finder()
+    pass
+
+
+def copy_finder_pick_id():
+    resolve_finder_id(force=True)
+    uid = QtBind.text(gui, finder_query_field).strip()
+    if not uid.isdigit():
+        QtBind.setText(gui, finder_status_label, 'Nhập ID số trước khi Copy.')
+        return
+    if put_finder_clipboard(uid):
+        QtBind.setText(gui, finder_status_label, 'Đã copy ID ' + uid + '.')
+    else:
+        QtBind.setText(gui, finder_status_label,
+                       'Chưa copy được. ID ' + uid + ': chọn ô ID, Ctrl+A rồi Ctrl+C.')
+
+
+def copy_finder_line():
+    """Copy `ID · name` for pasting into notes / configs."""
+    resolve_finder_id(force=True)
+    uid = QtBind.text(gui, finder_query_field).strip()
+    name = QtBind.text(gui, finder_pick_name).strip()
+    if not uid.isdigit():
+        QtBind.setText(gui, finder_status_label, 'Nhập ID số trước khi Copy dòng.')
+        return
+    line = uid if not name else '%s · %s' % (uid, name)
+    if put_finder_clipboard(line):
+        QtBind.setText(gui, finder_status_label, 'Đã copy: ' + line[:60])
+    else:
+        QtBind.setText(gui, finder_status_label, 'Chưa copy được dòng · Ctrl+A/C trong ô ID/Tên.')
+
+
+def _finder_parse_dest():
+    text = (QtBind.text(gui, finder_dest_field) or '').strip()
+    if '·' in text:
+        side, page = [part.strip() for part in text.split('·', 1)]
+    elif ' ' in text:
+        side, page = text.rsplit(' ', 1)
+        side, page = side.strip(), page.strip()
+    else:
+        return None, None
+    page = page.upper()
+    if page not in ('F1', 'F2', 'F3'):
+        return None, None
+    use_pk = 'auto pk' in side.casefold() or side.casefold().startswith('pk')
+    return use_pk, page
+
+
+def add_finder_skill():
+    """Append the typed ID into Auto PK or PvP skill rows for the chosen F page."""
+    resolve_finder_id(force=True)
+    uid = QtBind.text(gui, finder_query_field).strip()
+    if not uid.isdigit():
+        QtBind.setText(gui, finder_status_label, 'Nhập ID số trước khi Thêm.')
+        return
+    use_pk, page = _finder_parse_dest()
+    if page is None:
+        QtBind.setText(gui, finder_status_label, 'Chọn đích Thêm vào (Auto PK/PvP · F1–F3).')
+        return
+    editor = pk_skill_editor if use_pk else None
+    if editor is not None:
+        sync_skill_rows(editor)
+    else:
+        sync_skill_rows()
+    rows = page_skill_rows(page, editor)
+    if any(str(row.get('id') or '').strip() == uid for row in rows):
+        QtBind.setText(gui, finder_status_label,
+                       'ID %s đã có trong %s %s.' % (uid, 'Auto PK' if use_pk else 'PvP', page))
+        show_skill_rows(editor)
+        return
+    rows.append({
+        'stt': str(len(rows) + 1),
+        'id': uid,
+        'page': page,
+        'ms': '',
+        'cut': True,
+        'disabled': False,
+    })
+    replace_page_skill_rows(page, rows, editor)
+    show_skill_rows(editor)
+    label = 'Auto PK' if use_pk else 'PvP'
+    name = QtBind.text(gui, finder_pick_name).strip() or uid
+    QtBind.setText(gui, finder_status_label,
+                   'Đã Thêm ID %s (%s) vào %s · %s. Lưu cấu hình nếu cần giữ.'
+                   % (uid, name[:28], label, page))
+    report('Tìm Skill: thêm ID %s vào %s %s.' % (uid, label, page))
 
 
 def put_finder_clipboard(text):
@@ -4894,7 +6635,7 @@ def parse_direct_order(raw, known_skills, delays):
     return tuple(order), {**delays, **inline}
 
 
-def start_pvp(direct=False, exchange_override=None, hybrid=False, auto_pk=False):
+def start_pvp(direct=False, exchange_override=None, hybrid=False, auto_pk=False, compiled_group=None):
     global pvp_delays, exchange_key, pvp_background, pvp_background_error, direct_skills, hybrid_exchange_mode, direct_chain_mode, direct_baseline_mode, direct_native_exchange
     if not user32 or not owner_of(get_character_data() or {}):
         report_error('Ghost PvP cần nhân vật đã vào game trên Windows.')
@@ -4905,34 +6646,40 @@ def start_pvp(direct=False, exchange_override=None, hybrid=False, auto_pk=False)
         background_exchange = native
         if (not direct or native) and not hybrid and not background_exchange and (len(key) != 1 or key not in '0123456789'):
             raise ValueError('Nhập phím 0–9 đặt biểu tượng Exchange trên thanh đang dùng.')
-        known_skills = get_skills() or {}
-        delays = {}
-        for entry in QtBind.text(gui, skills_field).partition('/')[0].split(';'):
-            if not entry.strip():
-                continue
-            if '=' not in entry:
-                raise ValueError('Mốc ngắt PvP dùng ID=ms hoặc tên=ms; mục lỗi: %s' % entry.strip())
-            name, raw_delay = (part.strip() for part in entry.rsplit('=', 1))
-            if not name or not re.fullmatch(r'[0-9]+', raw_delay):
-                raise ValueError('Mốc ngắt PvP không hợp lệ: %s. Dùng ID=550, không kèm chữ trong số ms.' % entry.strip())
-            delay = int(raw_delay)
-            if not 0 <= delay <= 5000:
-                raise ValueError('Delay phải nằm trong khoảng 0–5000 ms.')
-            ids = [int(skill_id) for skill_id, skill in known_skills.items()
-                   if str(skill_id) == name or skill.get('name', '').casefold() == name.casefold()]
-            if len(ids) != 1:
-                raise ValueError('Không xác định được skill %s. Hãy dùng ID trong Log.' % name)
-            if ids[0] in delays:
-                raise ValueError('Skill bị nhập trùng: %s' % name)
-            delays[ids[0]] = delay / 1000
-        order = ()
-        if direct:
-            from_delays = not auto_pk and QtBind.isChecked(gui, pvp_background_box)
-            raw_order = '' if from_delays else QtBind.text(gui, direct_field).strip()
-            order, delays = parse_direct_order(raw_order or ';'.join(str(skill_id) for skill_id in delays),
-                                               {int(skill_id) for skill_id in known_skills}, delays)
-        elif not delays:
-            raise ValueError('Nhập ít nhất một cặp skill=delay.')
+        if compiled_group is not None:
+            order, delays = tuple(compiled_group['order']), dict(compiled_group['delays'])
+        elif auto_pk:
+            group = next(iter(runtime_skill_groups.values()))
+            order, delays = tuple(group['order']), dict(group['delays'])
+        else:
+            known_skills = get_skills() or {}
+            delays = {}
+            for entry in QtBind.text(gui, skills_field).partition('/')[0].split(';'):
+                if not entry.strip():
+                    continue
+                if '=' not in entry:
+                    raise ValueError('Mốc ngắt PvP dùng ID=ms hoặc tên=ms; mục lỗi: %s' % entry.strip())
+                name, raw_delay = (part.strip() for part in entry.rsplit('=', 1))
+                if not name or not re.fullmatch(r'[0-9]+', raw_delay):
+                    raise ValueError('Mốc ngắt PvP không hợp lệ: %s. Dùng ID=550, không kèm chữ trong số ms.' % entry.strip())
+                delay = int(raw_delay)
+                if not 0 <= delay <= 5000:
+                    raise ValueError('Delay phải nằm trong khoảng 0–5000 ms.')
+                ids = [int(skill_id) for skill_id, skill in known_skills.items()
+                       if str(skill_id) == name or skill.get('name', '').casefold() == name.casefold()]
+                if len(ids) != 1:
+                    raise ValueError('Không xác định được skill %s. Hãy dùng ID trong Log.' % name)
+                if ids[0] in delays:
+                    raise ValueError('Skill bị nhập trùng: %s' % name)
+                delays[ids[0]] = delay / 1000
+            order = ()
+            if direct:
+                from_delays = not auto_pk and QtBind.isChecked(gui, pvp_background_box)
+                raw_order = '' if from_delays else QtBind.text(gui, direct_field).strip()
+                order, delays = parse_direct_order(raw_order or ';'.join(str(skill_id) for skill_id in delays),
+                                                   {int(skill_id) for skill_id in known_skills}, delays)
+            elif not delays:
+                raise ValueError('Nhập ít nhất một cặp skill=delay.')
     except ValueError as error:
         message = 'Chưa bật Auto Ghost: %s' % error
         QtBind.setText(gui, status_label, message)
@@ -5384,9 +7131,49 @@ def trace_manual_packet(outgoing, opcode, data):
             finish_trace()
 
 
+def _is_client_basic_attack_7074(data):
+    raw = bytes(data or b'')
+    return len(raw) == 7 and raw[:3] == b'\x01\x01\x01'
+
+
+def _should_block_auto_pk_basic_attack(opcode, data):
+    """Drop client đánh thường while Auto PK Ghost is fighting.
+
+    Prior gate required runtime_natural_skills + exact pvp_target UID match.
+    F2 bow clients often fire 01 01 01 during retarget / before arm settles /
+    between no-cut skills — those packets slipped through. Block whenever Auto
+    PK is armed (or mid natural cast / already locked on a fight target).
+    """
+    if opcode != 0x7074 or not auto_pk_running:
+        return False
+    if not _is_client_basic_attack_7074(data):
+        return False
+    # natural_cast is assigned later in this module; resolve at call time.
+    if globals().get('natural_cast') is not None:
+        return True
+    if pvp_armed and not pvp_paused:
+        return True
+    if pvp_target or direct_target:
+        return True
+    return False
+
+
 def handle_silkroad(opcode, data):
-    if auto_pk_running and opcode in (0x7045, 0x7046, 0x7074) and get_status():
-        return True  # Auto PK yields combat and targeting to phBot's main bot.
+    # All globals first — never use a name above its global (SyntaxError on load).
+    global pvp_target, pvp_resume_page
+    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
+    # Chỉ nhường bot train thật. Tracing (ks) phải để 7045/7074 Ghost + PartyLeader chạy.
+    if (auto_pk_running and opcode in (0x7045, 0x7046, 0x7074)
+            and status_blocks_auto_pk()):
+        return True
+    if (auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight')
+            and opcode == 0x7074 and data and data[0] == 1):
+        return False
+    # Auto PK skill chain (F1/F2/F3): drop client đánh thường so it cannot
+    # wedge before/between Ghost skills. Do not require natural-set or UID match —
+    # bow clients often race retarget / fire 01 01 01 while no-cut or cut skills run.
+    if _should_block_auto_pk_basic_attack(opcode, data):
+        return False
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
             return auto_pk_outgoing_selection(data)
@@ -5399,8 +7186,6 @@ def handle_silkroad(opcode, data):
         if opcode==0x7045 or (opcode==0x7074 and raw and raw[0]==1):
             return False  # No new target/attack can restart pursuit during withdrawal.
     observe_numeric_request(opcode, data)
-    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
-    global pvp_target, pvp_resume_page
     trace_manual_packet(True, opcode, data)
     observe_hotbar_finder_request(opcode,data)
     if (opcode==0x7074 and pvp_trigger_mode=='manual' and not pvp_armed
@@ -5443,6 +7228,7 @@ def handle_silkroad(opcode, data):
             if direct_skills:
                 clear_pending()
                 direct_target = direct_index = direct_select_request = 0
+        notify_party_leader_clear_target('7046 bỏ target')
         return True
     if opcode == 0x7045 and len(data) == 4:
         cancel_exchange_probe()
@@ -5452,6 +7238,7 @@ def handle_silkroad(opcode, data):
                 selected_monster_uid = 0
                 hunt_request = None
                 pause_pvp('đã bỏ target', clear_target=True, notify=False)
+                notify_party_leader_clear_target('7045 UID=0')
                 return True
             if reclick_enabled and key_attempt is not None and uid != selected_monster_uid:
                 clear_pending()
@@ -5501,7 +7288,10 @@ def handle_joymax(opcode, data):
                         pending[1].cancel()
                         pending = None
                 context = direct_exchange_wait
-                if raw == b'\x02\x01' and context and context.get('auto_background'):
+                if (raw == b'\x02\x01' and context
+                        and (context.get('auto_background')
+                             or (context.get('transport') == 'client_7081'
+                                 and is_party_sync_prefer_uid(context['target'])))):
                     context['natural_end'] = True
                     check_direct_exchange()
                 emergency = (pvp_activation or {}).get('emergency')
@@ -5636,6 +7426,11 @@ def handle_joymax(opcode, data):
     with pvp_lock:
         skill_id, source = struct.unpack_from('<II', data, 3)
         target = struct.unpack_from('<I', data, 15)[0]
+        attempt = direct_retry_state
+        if (attempt is not None and direct_expected == (attempt['skill'], attempt['target'])
+                and is_party_sync_prefer_uid(attempt['target'])
+                and source == (get_character_data() or {}).get('player_id')):
+            attempt['party_seen_b070'] = 'ID=%d UID=%d loại=%d' % (skill_id, target, data[0])
         if skill_probe is not None:
             probe = skill_probe
             character = get_character_data() or {}
@@ -5653,7 +7448,8 @@ def handle_joymax(opcode, data):
             return True
         if pvp_pause_controls and pvp_paused:
             return True
-        if not (pvp_delays or boss_interrupt_delays) or get_status():
+        busy = status_blocks_auto_pk() if auto_pk_running else get_status()
+        if not (pvp_delays or boss_interrupt_delays) or busy:
             return True
         character = get_character_data() or {}
         owner = owner_of(character)
@@ -5664,7 +7460,8 @@ def handle_joymax(opcode, data):
         if monsters is None:
             return True
         now = monotonic()
-        is_boss = target in monsters
+        is_boss = target in monsters and not (auto_pk_running and target == pvp_target
+                                                and pvp_person_target(target, character, monsters))
         if is_boss:
             if (skill_id not in boss_interrupt_delays or settings is None
                     or not target_matches_boss(target, monsters, (settings[1], settings[3]))):
@@ -5690,6 +7487,13 @@ def handle_joymax(opcode, data):
             direct_action_ended = False
             confirm_direct_native_skill(skill_id)
             runtime = auto_pk_runtime if auto_pk_running else None
+            if runtime is not None:
+                runtime.pop('party_refusal_count', None)
+                runtime.pop('locked_skills_wait_at', None)
+            if runtime is not None and is_party_sync_prefer_uid(target, runtime):
+                if runtime.get('party_b070_logged_lock') != runtime.get('target_locked_at'):
+                    runtime['party_b070_logged_lock'] = runtime.get('target_locked_at')
+                    log('[%s] B070 xác nhận skill %d của acc này trên UID %d.' % (NAME, skill_id, target))
             if runtime is not None and runtime.get('skill_probe_uid') == target:
                 runtime.update(skill_probe_uid=0, target_locked_at=now)
                 message = 'Đã khóa UID %d qua B070 · server đã nhận skill %d.' % (target, skill_id)
@@ -5707,8 +7511,11 @@ def handle_joymax(opcode, data):
             begin_natural_cast(skill_id, target, owner)
             return True
         if background_pk and not auto_pk_can_cut_in_background(client, target):
-            begin_natural_cast(skill_id, target, owner)
-            return True
+            # Party prefer: NEVER fall into silent natural-attack lock — still
+            # schedule Ghost interrupt path (7081/B074) like foreground AutoGhost.
+            if not is_party_sync_prefer_uid(target):
+                begin_natural_cast(skill_id, target, owner)
+                return True
 
         signature = (skill_id, target)
         if not direct_skills and last_trigger and last_trigger[0] == signature and now - last_trigger[1] < 0.25:
@@ -6049,7 +7856,12 @@ def observe_push_packet(outgoing, opcode, data):
                     and attempt['target'] == pvp_target and now < pvp_cast_deadline
                     and attempt.get('first_reply') == raw and not attempt.get('reply_ambiguous')
                     and not attempt.get('push_rejected')):
-                release_auto_pk_target(pvp_target, 'server từ chối đánh (B074)', AUTO_PK_PROTECTION_DELAY)
+                # Party prefer: B074 = skill interrupt → retry next skill, keep prefer.
+                if is_party_sync_prefer_uid(pvp_target):
+                    party_prefer_handle_b074_refuse(attempt, 'B074 %s' % raw.hex(' '))
+                else:
+                    release_auto_pk_target(
+                        pvp_target, 'server từ chối đánh (B074)', AUTO_PK_PROTECTION_DELAY)
         action = push_action(opcode, raw, player_id) if not outgoing else None
         if action is not None:
             new_push = live and direct_target == pvp_target and action != pvp_push_action
@@ -6221,7 +8033,10 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
         if not minimum <= distance <= 20:
             push_trace_note('Áp sát: khoảng cách %.1f m ngoài khoảng %.1f–20 m.' % (distance, minimum), after_hit=True)
             return False
-        fraction = (distance - 4.0) / distance
+        # Prefer page approach range (F2 15 m) over hard-coded ~4 m melee stop.
+        stop_at = max(float(minimum), auto_pk_approach_range() - 0.5)
+        stop_at = min(stop_at, distance - 0.5) if distance > 1.0 else max(1.0, distance * 0.5)
+        fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
         dest_x, dest_y = x + dx * fraction, y + dy * fraction
         push_trace_mark('gọi move_to', 'cách đối thủ %.1f m' % distance)
         result = move(dest_x, dest_y, z)
@@ -6242,20 +8057,88 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
     return True
 
 
-def recover_auto_pk_cast(target, skill_id, reason):
-    global direct_expected, direct_retry_state, pvp_cast_deadline
-    runtime = auto_pk_runtime
-    if (not auto_pk_running or auto_pk_returning or not pvp_armed or runtime is None
-            or target != pvp_target or direct_expected != (skill_id, target)
-            or runtime.get('skill_probe_uid') == target):
+def is_party_sync_prefer_uid(uid, runtime=None):
+    """True when UID is the locked PartyLeader prefer target — never retire/skip."""
+    runtime = auto_pk_runtime if runtime is None else runtime
+    if not isinstance(runtime, dict):
         return False
-    runtime.setdefault('skill_retry_at', {})[skill_id] = monotonic() + AUTO_PK_CAST_RETRY_DELAY
-    direct_expected = direct_retry_state = None
-    pvp_cast_deadline = 0.0
-    message = 'Giữ UID %d · %s · xét skill kế tiếp.' % (target, reason)
+    try:
+        uid = int(uid or 0)
+        party_uid = int(runtime.get('party_sync_uid') or 0)
+    except (TypeError, ValueError):
+        return False
+    if not uid or not party_uid or uid != party_uid:
+        return False
+    return bool(runtime.get('party_lock') or runtime.get('party_follow_mode')
+                or party_uid)
+
+
+def recover_auto_pk_cast(target, skill_id, reason):
+    if not auto_pk_running or target != pvp_target or direct_expected != (skill_id, target):
+        return False
+    # Party prefer: soft-wait B070 forever — never release/retire.
+    if is_party_sync_prefer_uid(target):
+        soft_wait_b070_without_attempt(skill_id, target, reason)
+        return True
+    return release_auto_pk_target(target, reason)
+
+
+def soft_wait_b070_without_attempt(skill_id, target, reason):
+    """Tạo lại trạng thái chờ B070 — không dừng Ghost."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    packet = struct.pack('<BBIBI', 1, 4, int(skill_id), 1, int(target))
+    attempt = {
+        'owner': owner_of(get_character_data() or {}),
+        'skill': int(skill_id),
+        'target': int(target),
+        'packet': packet,
+        'retries': 0,
+        'sent_at': monotonic(),
+    }
+    return soft_wait_b070_focus(attempt, reason)
+
+
+def soft_wait_b070_focus(attempt, reason):
+    """HARD RULE: thiếu B070 / mất focus → không dừng Ghost; chờ rồi thử lại mãi."""
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    client = get_client() or {}
+    background = bool(auto_pk_running and auto_pk_in_background(client))
+    attempt['retries'] = 0
+    attempt['sent_at'] = monotonic()
+    direct_expected = (attempt['skill'], attempt['target'])
+    direct_retry_state = attempt
+    pvp_cast_deadline = monotonic() + (1.8 if background else 1.0)
+    if background:
+        message = ('Chưa B070 ID=%d · đang xem acc/cửa sổ khác · giữ UID %d, '
+                   'chờ foreground rồi cast tiếp (không dừng Auto Ghost).'
+                   % (attempt['skill'], attempt['target']))
+    else:
+        message = ('%s · giữ UID %d / ID=%d · thử lại (không dừng Auto Ghost).'
+                   % (reason, attempt['target'], attempt['skill']))
     QtBind.setText(gui, auto_pk_status_label, message)
-    report(message)
-    return True
+    QtBind.setText(gui, status_label, message)
+    # Party prefer: debounce Log hard — soft-wait can tick often.
+    runtime = auto_pk_runtime if auto_pk_running else None
+    if is_party_sync_prefer_uid(attempt.get('target'), runtime):
+        now = monotonic()
+        last = float((runtime or {}).get('party_prefer_soft_log_at') or 0)
+        if runtime is not None and (now - last) >= 3.0:
+            runtime['party_prefer_soft_log_at'] = now
+            report(message)
+    else:
+        report(message)
+    return False
+
+
+def skip_stale_direct_skill(skill_id, reason):
+    global direct_expected, direct_retry_state, pvp_cast_deadline
+    if auto_pk_running and direct_expected is not None:
+        recover_auto_pk_cast(direct_expected[1], skill_id, reason)
+    else:
+        direct_expected = direct_retry_state = None
+        pvp_cast_deadline = 0.0
+    report(reason)
+    return False
 
 
 def retry_direct_native_skill(character):
@@ -6263,21 +8146,25 @@ def retry_direct_native_skill(character):
     attempt=direct_retry_state
     if (not attempt or attempt['owner']!=owner_of(character)
             or (attempt['skill'],attempt['target'])!=direct_expected):return
-    if attempt['retries'] >= RECLICK_MAX_RETRIES:
-        reason = 'chưa có B070 khớp ID=%d sau %d lần thử lại' % (attempt['skill'], RECLICK_MAX_RETRIES)
-        if not recover_auto_pk_cast(attempt['target'], attempt['skill'], reason):
-            pause_pvp(reason, cancel_action=False)
+    group = runtime_skill_groups.get(current_page) or {}
+    if attempt['skill'] not in group.get('delays', {}):
+        skip_stale_direct_skill(
+            attempt['skill'],
+            'ID=%d không còn trong nhóm %s · bỏ ID cũ, không reclick.'
+            % (attempt['skill'], current_page or '?'))
         return False
+    if attempt['retries'] >= RECLICK_MAX_RETRIES:
+        # Do NOT use legacy stop phrasing — soft-wait forever.
+        reason = ('đang chờ B070 ID=%d · đã gửi lại %d lần · giữ combat, thử tiếp'
+                  % (attempt['skill'], RECLICK_MAX_RETRIES))
+        return soft_wait_b070_focus(attempt, reason)
     attempt['retries']+=1
     pvp_cast_deadline=monotonic()+reclick_wait
     push_trace_mark('Reclick đầu tiên', 'ID=%d' % attempt['skill'])
     report('Reclick ID: skill=%d, thử lại %d/3.'%(attempt['skill'],attempt['retries']))
     if inject_joymax(0x7074,attempt['packet'],False) is False:
-        reason = 'phBot từ chối lần gửi lại'
-        if auto_pk_running:
-            recover_auto_pk_cast(attempt['target'], attempt['skill'], reason)
-        else:
-            pause_pvp('PvP ID/ô số: ' + reason + '; không gửi thêm')
+        # Inject fail (thường do mất focus) — chờ rồi thử lại, không dừng.
+        soft_wait_b070_focus(attempt, 'phBot từ chối lần gửi lại')
 
 
 def confirm_direct_native_skill(skill_id):
@@ -6300,6 +8187,12 @@ def confirm_direct_native_skill(skill_id):
         direct_retry_state=None
 
 
+
+def party_sync_protects_target(target):
+    """Deprecated: party prefer MUST use normal Ghost 7081/B074 cut (never skip)."""
+    return False
+
+
 def begin_native_cut(owner, target, auto_background=False):
     global direct_exchange_wait, blocked_until
     if direct_action_ended:
@@ -6317,9 +8210,9 @@ def begin_native_cut(owner, target, auto_background=False):
     try:
         send_pvp_interrupt(context)
     except (OSError, ValueError, RuntimeError) as error:
-        if auto_background:
+        if auto_background or is_party_sync_prefer_uid(target):
             close_client_exchange()
-            wait_for_background_skill_end(owner, target, context, 'Ghost nền: ' + str(error))
+            wait_for_background_skill_end(owner, target, context, '7081: ' + str(error))
         else:
             pause_pvp('7081 trực tiếp: ' + str(error))
         return
@@ -6424,13 +8317,15 @@ def check_direct_exchange():
             return
         if context.get('transport') == 'client_7081':
             try:
-                if get_status():
+                if (status_blocks_auto_pk() if auto_pk_running else status_blocks_ghost_manual()):
                     pause_pvp('bot chính đã bật', cancel_action=False)
                 elif client_exchange_confirmed(context):
                     context['timeout'].cancel()
                     direct_exchange_wait = None
                     pvp_cast_deadline = 0.0
-                    blocked_until = monotonic() + (0 if auto_pk_running else PVP_KEY_INTERVAL)
+                    party_prefer = is_party_sync_prefer_uid(context['target'])
+                    gap = PVP_KEY_INTERVAL if party_prefer or not auto_pk_running else 0
+                    blocked_until = monotonic() + gap
                     if background_exchange_failed_uid == context['target']:
                         background_exchange_failed_uid = 0
                     if context.get('auto_background'):
@@ -6438,26 +8333,31 @@ def check_direct_exchange():
                         message = 'Ghost nền đã ngắt UID %d · xác nhận 7081 và B074 02 00.' % target
                         QtBind.setText(gui, auto_pk_status_label, message)
                         runtime = auto_pk_runtime
+                        if runtime is not None and not party_prefer:
+                            runtime['post_cut_check'] = (target, monotonic() + AUTO_PK_POST_CUT_TIMEOUT)
+                            runtime.pop('post_cut_block', None)
                         if runtime is not None and runtime.get('ghost_logged_uid') != target:
                             runtime['ghost_logged_uid'] = target
                             log('[%s] %s' % (NAME, message))
                     else:
                         report_direct('7081 đúng UID và B074 02 00; tiếp tục skill kế.')
-                elif context.get('auto_background') and context.get('natural_end'):
+                elif context.get('natural_end'):
                     close_client_exchange()
                     context['timeout'].cancel()
                     direct_exchange_wait = None
-                    blocked_until = pvp_cast_deadline = 0.0
-                    report_direct('Skill tự kết thúc trong khi đợi ngắt nền.')
+                    pvp_cast_deadline = 0.0
+                    blocked_until = (monotonic() + PVP_KEY_INTERVAL
+                                     if is_party_sync_prefer_uid(context['target']) else 0.0)
+                    report_direct('Skill tự kết thúc trong khi đợi ngắt.')
                 elif monotonic() >= context['deadline']:
                     close_client_exchange()
                     wait_for_background_skill_end(context['owner'], context['target'], context,
                                                   '7081 chưa xác nhận đúng UID và B074 02 00 sau 2 giây')
             except (OSError, ValueError, RuntimeError) as error:
-                if context.get('auto_background'):
+                if context.get('auto_background') or is_party_sync_prefer_uid(context['target']):
                     close_client_exchange()
                     wait_for_background_skill_end(context['owner'], context['target'], context,
-                                                  'Ghost nền: ' + str(error))
+                                                  '7081: ' + str(error))
                 else:
                     pause_pvp('7081 trực tiếp: ' + str(error))
             return
@@ -6560,7 +8460,8 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
         client = get_client() or {}
         monsters = get_monsters()
         background_pk = not is_boss and auto_pk_in_background(client)
-        if (get_status() or owner_of(character) != owner or character.get('dead')
+        busy = status_blocks_auto_pk() if not is_boss and auto_pk_running else get_status()
+        if (busy or owner_of(character) != owner or character.get('dead')
                 or character.get('player_id') != source or monsters is None
                 or not client.get('running') or client.get('pid') != pid
                 or (client.get('window') != window and not (background_pk and not client.get('window')))):
@@ -6596,12 +8497,18 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
                     and press_key(boss_interrupt_key, window)):
                 report('Ghost Boss: đã gửi phím ngắt %s cho UID=%s.' % (chr(boss_interrupt_key), target))
         elif direct_skills:
-            if (target == direct_target and target not in monsters and target not in (get_npcs() or {})):
+            if (target == direct_target and (pvp_person_target(target, character, monsters)
+                    if auto_pk_running else target not in monsters and target not in (get_npcs() or {}))):
+                party_prefer = is_party_sync_prefer_uid(target)
                 if background_pk:
-                    if (pvp_armed and pvp_target == target and auto_pk_radius_check(target)[0]
-                            and auto_pk_can_cut_in_background(client, target)):
-                        report('Ghost nền: ngắt UID %d · chờ 7081 và B074.' % target)
-                        begin_native_cut(owner, target, auto_background=True)
+                    # Force Ghost F interrupt (7081/B074) for party prefer + normal Auto PK.
+                    if party_prefer or (pvp_armed and pvp_target == target):
+                        if auto_pk_can_cut_in_background(client, target) or party_prefer:
+                            report('Ghost nền: ngắt UID %d · 7081/B074%s.'
+                                   % (target, ' · party prefer' if party_prefer else ''))
+                            begin_native_cut(owner, target, auto_background=True)
+                        else:
+                            wait_for_background_skill_end(owner, target)
                     else:
                         wait_for_background_skill_end(owner, target)
                 elif direct_native_exchange:
@@ -6619,9 +8526,53 @@ def fire_interrupt(ticket, owner, source, target, window, pid, is_boss):
             blocked_until = monotonic() + PVP_KEY_INTERVAL
 
 
+def _party_leader_wants_keep_pk():
+    """True when PartyLeader Phụ+arm is active — disconnect must not kill Auto PK."""
+    try:
+        for module in list(sys.modules.values()):
+            try:
+                if getattr(module, 'NAME', None) != 'PartyLeader':
+                    continue
+            except Exception:
+                continue
+            gui_ref = getattr(module, 'gui', None)
+            enabled = getattr(module, 'enabled_box', None)
+            arm = getattr(module, 'arm_box', None)
+            role_fn = getattr(module, 'role_index', None)
+            role_follower = getattr(module, 'ROLE_FOLLOWER', 0)
+            if gui_ref is None or enabled is None:
+                return False
+            if not QtBind.isChecked(gui_ref, enabled):
+                return False
+            if callable(role_fn) and int(role_fn()) != int(role_follower):
+                return False
+            if arm is not None and not QtBind.isChecked(gui_ref, arm):
+                # Still keep if already party_lock / following via runtime
+                return False
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def disconnected():
     global profile_owner
     teleported()
+    # Party follower sync / Phụ arm: Stable often fires false disconnect during
+    # enable/ks/trace. Keep Auto PK armed — do not hard-stop.
+    runtime = auto_pk_runtime if auto_pk_running else None
+    keep = False
+    if runtime is not None and (runtime.get('party_lock') or runtime.get('party_follow_mode')
+                                or int(runtime.get('party_sync_uid') or 0)):
+        keep = True
+    elif auto_pk_running and _party_leader_wants_keep_pk():
+        keep = True
+        if runtime is not None:
+            runtime['party_follow_mode'] = True
+    if keep:
+        hold_auto_pk('disconnect giả (party sync) · giữ prefer', retry_after=2.0)
+        log('[%s] disconnected: giữ Auto PK (party Phụ) — không tắt.' % NAME)
+        return
     if auto_pk_running:
         stop_auto_pk(reason='mất kết nối game')
     else:
@@ -6804,7 +8755,12 @@ def begin_natural_cast(skill_id, target, owner, reason=None):
         pending[1].cancel()
     ticket = object()
     data = skill_table().get(skill_id) or {}
-    timeout_seconds = max(10.0, float(data.get('cast_time') or 0) / 1000 + 5)
+    cast_seconds = imbue_seconds(data, 'cast_time')
+    timeout_seconds = max(10.0, cast_seconds + 5.0)
+    if auto_pk_running and not is_party_sync_prefer_uid(target):
+        # Missing end packet: give the animation time to finish, then let the
+        # normal cooldown/range checks decide whether to send the next skill.
+        timeout_seconds = max(1.0, cast_seconds + 0.35) if cast_seconds else 2.0
     timer = Timer(timeout_seconds, natural_cast_timeout, args=(ticket,))
     timer.daemon = True
     pending = (ticket, timer, False)
@@ -6818,11 +8774,30 @@ def begin_natural_cast(skill_id, target, owner, reason=None):
 
 
 def natural_cast_timeout(ticket):
+    global pending, natural_cast, blocked_until, pvp_cast_deadline
     with pvp_lock:
-        if natural_cast and natural_cast['ticket'] is ticket:
-            reason = natural_cast.get('reason')
-            message = 'chưa nhận kết thúc skill ID=%d từ server' % natural_cast['skill']
-            pause_pvp('%s; %s' % (reason, message) if reason else message, cancel_action=False)
+        cast = natural_cast
+        if not cast or cast['ticket'] is not ticket or pending is None or pending[0] is not ticket:
+            return
+        if (cast['page'] != current_page or cast['target'] != pvp_target
+                or owner_of(get_character_data() or {}) != cast['owner']):
+            pending = natural_cast = None
+            return
+        reason = cast.get('reason')
+        message = 'chưa nhận kết thúc skill ID=%d từ server' % cast['skill']
+        party_prefer = is_party_sync_prefer_uid(cast['target'])
+        if (pending is not None and pending[0] is ticket and pvp_armed and not pvp_paused
+                and cast['page'] == current_page and cast['target'] == pvp_target == direct_target
+                and owner_of(get_character_data() or {}) == cast['owner']
+                and (auto_pk_running or party_prefer)):
+            pending = natural_cast = None
+            if party_prefer:
+                pvp_cast_deadline = monotonic() + PVP_KEY_INTERVAL
+            else:
+                blocked_until = pvp_cast_deadline = 0.0
+            report('UID %d: %s; thử skill kế tiếp.' % (cast['target'], message))
+            return
+        pause_pvp('%s; %s' % (reason, message) if reason else message, cancel_action=False)
 
 
 def observe_natural_end(data):
@@ -6890,21 +8865,25 @@ def skill_cut_changed(checked):
     pass  # Settings are applied on Start, alongside the other row fields.
 
 
-def page_skill_rows(page):
-    return [row for row in skill_rows if row['page'] == page]
+def page_skill_rows(page, editor=None):
+    rows = editor[0] if editor is not None else skill_rows
+    return [row for row in rows if row['page'] == page]
 
 
-def replace_page_skill_rows(page, rows):
+def replace_page_skill_rows(page, rows, editor=None):
     # Keep the legacy rank field so existing profile readers retain the order.
     for index, row in enumerate(rows, 1):
         if row.get('stt', ''):
             row['stt'] = str(index)
-    skill_rows[:] = [row for row in skill_rows if row['page'] != page] + rows
+    storage = editor[0] if editor is not None else skill_rows
+    storage[:] = [row for row in storage if row['page'] != page] + rows
 
 
-def sync_skill_rows():
+def sync_skill_rows(editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
     for page, fields in skill_row_fields.items():
-        rows = page_skill_rows(page)
+        rows = page_skill_rows(page, editor)
         start = skill_row_offset[page]
         for i, (skill, delay, cut, selected) in enumerate(fields, start):
             uid = QtBind.text(gui, skill).strip()
@@ -6920,12 +8899,15 @@ def sync_skill_rows():
                            stt=str(i + 1) if uid and enabled else '')
         while rows and not (rows[-1]['id'] or rows[-1]['ms']):
             rows.pop()
-        replace_page_skill_rows(page, rows)
+        replace_page_skill_rows(page, rows, editor)
 
 
-def show_skill_rows():
+def show_skill_rows(editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
+    skill_row_labels = editor[4] if editor is not None else globals()['skill_row_labels']
     for page, fields in skill_row_fields.items():
-        rows = page_skill_rows(page)
+        rows = page_skill_rows(page, editor)
         start = skill_row_offset[page]
         for i, (skill, delay, cut, selected) in enumerate(fields, start):
             row = rows[i] if i < len(rows) else {}
@@ -6933,10 +8915,13 @@ def show_skill_rows():
             QtBind.setText(gui, delay, row.get('ms', ''))
             QtBind.setChecked(gui, cut, row.get('cut', True))
             set_checked_silent(selected, row.get('disabled', False))
-        QtBind.setText(gui, skill_row_labels[page], '%d–%d' % (start + 1, start + len(fields)))
+        # skill_row_labels kept for editor tuple compat; no visible 1–10 column.
 
 
-def select_skill_row(page, row, checked):
+def select_skill_row(page, row, checked, editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_selected = editor[2] if editor is not None else globals()['skill_row_selected']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
     if ui_sync:
         return
     index = skill_row_offset[page] + row
@@ -6950,15 +8935,18 @@ def select_skill_row(page, row, checked):
         skill_row_selected[page] = next((skill_row_offset[page] + i for i, (_, _, _, box) in enumerate(fields)
                                         if QtBind.isChecked(gui, box)), None)
     with pvp_lock:
-        sync_skill_rows()
-        if pvp_trigger_mode and direct_skills and page in pvp_allowed_pages:
+        sync_skill_rows(editor)
+        if editor is None and not auto_pk_running and pvp_trigger_mode and direct_skills and page in pvp_allowed_pages:
             try:
                 runtime_skill_groups[page] = compile_skill_groups({page}, allow_empty=True).get(page)
             except ValueError as error:
                 report_error('Chưa áp dụng thay đổi %s: %s' % (page, error))
 
 
-def move_selected_skill_row(page, direction):
+def move_selected_skill_row(page, direction, editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_selected = editor[2] if editor is not None else globals()['skill_row_selected']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
     index = skill_row_selected[page]
     if index is None:
         index = next((skill_row_offset[page] + i for i, (_, _, _, box) in enumerate(skill_row_fields[page])
@@ -6966,34 +8954,40 @@ def move_selected_skill_row(page, direction):
     if index is None:
         report('Tích một dòng skill ở bảng %s để dùng Lên/Xuống.' % page)
         return
-    move_skill_row(page, index - skill_row_offset[page], direction)
+    move_skill_row(page, index - skill_row_offset[page], direction, editor)
 
 
-def shift_skill_table(page, direction):
-    sync_skill_rows()
+def shift_skill_table(page, direction, editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_selected = editor[2] if editor is not None else globals()['skill_row_selected']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
+    sync_skill_rows(editor)
     size = len(skill_row_fields[page])
     offset = skill_row_offset[page]
-    if direction > 0 and not any(row['id'] for row in page_skill_rows(page)[offset:offset + size]):
+    if direction > 0 and not any(row['id'] for row in page_skill_rows(page, editor)[offset:offset + size]):
         return
     new_offset = max(0, offset + direction * size)
     if new_offset != offset:
         skill_row_selected[page] = None
     skill_row_offset[page] = new_offset
-    show_skill_rows()
+    show_skill_rows(editor)
 
 
-def move_skill_row(page, index, direction):
-    sync_skill_rows()
-    rows = page_skill_rows(page)
+def move_skill_row(page, index, direction, editor=None):
+    skill_row_offset = editor[1] if editor is not None else globals()['skill_row_offset']
+    skill_row_selected = editor[2] if editor is not None else globals()['skill_row_selected']
+    skill_row_fields = editor[3] if editor is not None else globals()['skill_row_fields']
+    sync_skill_rows(editor)
+    rows = page_skill_rows(page, editor)
     index += skill_row_offset[page]
     destination = index + direction
     if 0 <= index < len(rows) and 0 <= destination < len(rows) and rows[index]['id']:
         rows[index], rows[destination] = rows[destination], rows[index]
-        replace_page_skill_rows(page, rows)
+        replace_page_skill_rows(page, rows, editor)
         size = len(skill_row_fields[page])
         skill_row_offset[page] = destination // size * size
         skill_row_selected[page] = destination
-    show_skill_rows()
+    show_skill_rows(editor)
 
 
 def sync_pvp_editor():
@@ -7038,12 +9032,13 @@ def pvp_page_changed(page, checked):
                 pause_pvp('đã tắt nhóm %s' % page, notify=False)
 
 
-def compile_skill_groups(enabled_pages=None, allow_empty=False):
+def compile_skill_groups(enabled_pages=None, allow_empty=False, rows=None, known=None):
     groups = {}
-    known = set(skill_table())
+    if known is None:
+        known = set(skill_table())
     ranks = {}
     ranked_rows = []
-    for index, row in enumerate(skill_rows):
+    for index, row in enumerate(skill_rows if rows is None else rows):
         if enabled_pages is not None and row['page'] not in enabled_pages:
             continue
         if row.get('disabled') or (not row['id'] and not row['ms']):
@@ -7058,6 +9053,17 @@ def compile_skill_groups(enabled_pages=None, allow_empty=False):
             raise ValueError('%s bị trùng STT %s.' % (row['page'], raw))
         ranks[key] = True
         ranked_rows.append((int(raw), index, row))
+    explicit_delays = {}
+    for _, _, row in ranked_rows:
+        if not row.get('cut', True):
+            continue
+        ids = [part.strip() for part in row['id'].split('+')]
+        ms = [part.strip() for part in row['ms'].split('+')]
+        if len(ms) == 1:
+            ms *= len(ids)
+        for skill, delay in zip(ids, ms):
+            if skill.isdigit() and delay.isdigit() and 0 <= int(delay) <= 5000:
+                explicit_delays.setdefault((row['page'], int(skill)), set()).add(int(delay))
     for rank, _, row in sorted(ranked_rows, key=lambda item: item[:2]):
         if not row['id'] and not row['ms']:
             continue
@@ -7074,8 +9080,16 @@ def compile_skill_groups(enabled_pages=None, allow_empty=False):
             raise ValueError('Dùng một số ms chung hoặc đúng một số cho mỗi ID, ví dụ 20+35.')
         page = groups.setdefault(row['page'], {'order': [], 'delays': {}, 'natural': set(), 'ranks': []})
         for position, (skill, delay) in enumerate(zip(ids, ms)):
-            expression = skill + ('=' + delay if delay else '')
-            order, delays = parse_direct_order(expression, known, {})
+            if cut and not delay:
+                matches = explicit_delays.get((row['page'], int(skill)), set())
+                if len(matches) != 1:
+                    raise ValueError('%s dòng %d · ID %s đang bật Ngắt nhưng ô ms trống.'
+                                     % (row['page'], rank, skill))
+                delay = str(next(iter(matches)))
+            try:
+                order, delays = parse_direct_order(skill + '=' + delay, known, {})
+            except ValueError as error:
+                raise ValueError('%s dòng %d · %s' % (row['page'], rank, error)) from error
             uid = order[0]
             if uid in page['delays'] and page['delays'][uid] != delays[uid]:
                 raise ValueError('%s: ID %d có hai mốc ngắt khác nhau.' % (row['page'], uid))
@@ -7192,41 +9206,217 @@ def switch_pvp_editor():
     view_pvp()
 
 
-widget('pvp', 'createButton', 'switch_pvp_editor', 'F2 / F3', 315, 54)
+def pvp_frame_markup(width, height):
+    from base64 import b64encode
+    from zlib import compress, crc32
+
+    def chunk(kind, data):
+        return (struct.pack('>I', len(data)) + kind + data
+                + struct.pack('>I', crc32(kind + data) & 0xffffffff))
+
+    edge = bytes((98, 98, 98, 255))
+    horizontal = b'\0' + edge * width
+    middle = b'\0' + edge + bytes(4 * (width - 2)) + edge
+    pixels = horizontal + middle * (height - 2) + horizontal
+    png = (b'\x89PNG\r\n\x1a\n'
+           + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0))
+           + chunk(b'IDAT', compress(pixels)) + chunk(b'IEND', b''))
+    return '<img width="%d" height="%d" src="data:image/png;base64,%s">' % (
+        width, height, b64encode(png).decode('ascii'))
+
+
+for frame_x, frame_y, frame_width, frame_height in (
+        (5, 55, 211, 221), (219, 55, 211, 221), (433, 55, 264, 185)):
+    widget('pvp', 'createLabel', pvp_frame_markup(frame_width, frame_height), frame_x, frame_y)
+
+
+def sync_pvp_trigger_boxes():
+    selected = QtBind.text(gui, trigger_field)
+    if selected not in pvp_trigger_boxes:
+        selected = TRIGGER_MANUAL
+    for mode, box in pvp_trigger_boxes.items():
+        set_checked_silent(box, mode == selected)
+
+
+def select_pvp_trigger(mode, checked):
+    global pvp_trigger_mode
+    if ui_sync:
+        return
+    with pvp_lock:
+        if checked:
+            QtBind.setText(gui, trigger_field, mode)
+            if _combat_tab == 'pvp' and pvp_trigger_mode and not auto_pk_running:
+                pvp_trigger_mode = 'target' if mode == TRIGGER_TARGET else 'manual'
+        sync_pvp_trigger_boxes()
+
+
+def compact_row_button(view, callback, text, x, y):
+    """Narrow ↑/↓ push button. Create after LineEdits so it stays on top."""
+    handle = widget(view, 'createButton', callback, text, x, y)
+    style = ('QPushButton { min-width:18px; max-width:22px; min-height:14px; '
+             'max-height:16px; padding:0px; margin:0px; }')
+    for method in ('setStyleSheet', 'setStylesheet', 'setStyle'):
+        setter = getattr(QtBind, method, None)
+        if callable(setter):
+            try:
+                setter(gui, handle, style)
+                break
+            except Exception:
+                pass
+    return handle
+
+
+widget('pvp', 'createButton', 'switch_pvp_editor', 'F2 / F3', 339, 58)
 for column, page in enumerate(PAGES):
     toggle = 'pvp_toggle_' + page.lower()
     globals()[toggle] = lambda checked, selected=page: pvp_page_changed(selected, checked)
     if page not in PVP_EDIT_PAGES:
         pvp_page_boxes[page] = widget('hidden', 'createCheckBox', toggle, page, 0, 0)
         continue
-    x = 10 if column == 0 else 210
+    x = 13 if column == 0 else 227
     editor_view = 'pvp' if column == 0 else 'pvp_' + page
-    pvp_page_boxes[page] = widget(editor_view, 'createCheckBox', toggle, page + ' · Bật đánh', x, 56)
+    pvp_page_boxes[page] = widget(editor_view, 'createCheckBox', toggle, page + ' · Bật đánh', x, 58)
     set_checked_silent(pvp_page_boxes[page], page != 'F3')
-    for offset, label in ((0, 'Tắt'), (34, 'ID skill'), (121, 'ms'), (165, 'Ngắt')):
+    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (144, 'ms'), (184, 'Ngắt')):
         widget(editor_view, 'createLabel', label, x + offset, 77)
     fields = []
-    for row in range(5):
-        y = 92 + row * 21
+    for row in range(10):
+        y = 91 + row * 18
         name = 'skill_select_%s_%d' % (page, row)
         globals()[name] = lambda checked, p=page, r=row: select_skill_row(p, r, checked)
         selector = widget(editor_view, 'createCheckBox', name, '', x + 4, y)
-        skill = widget(editor_view, 'createLineEdit', '', x + 34, y, 77, 18)
-        delay = widget(editor_view, 'createLineEdit', '', x + 119, y, 37, 18)
-        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 171, y)
+        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 70, 16)
+        delay = widget(editor_view, 'createLineEdit', '', x + 144, y, 34, 16)
+        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 184, y)
+        up_name = 'skill_row_up_%s_%d' % (page, row)
+        down_name = 'skill_row_down_%s_%d' % (page, row)
+        globals()[up_name] = lambda p=page, r=row: move_skill_row(p, r, -1)
+        globals()[down_name] = lambda p=page, r=row: move_skill_row(p, r, 1)
+        compact_row_button(editor_view, up_name, '↑', x + 98, y - 1)
+        compact_row_button(editor_view, down_name, '↓', x + 120, y - 1)
         fields.append((skill, delay, cut, selector))
     skill_row_fields[page] = fields
-    up, down = 'skill_up_' + page, 'skill_down_' + page
-    globals()[up] = lambda p=page: move_selected_skill_row(p, -1)
-    globals()[down] = lambda p=page: move_selected_skill_row(p, 1)
-    widget(editor_view, 'createButton', up, '▲ Lên', x, 201)
-    widget(editor_view, 'createButton', down, '▼ Xuống', x + 112, 201)
-    back, more = 'skill_back_' + page, 'skill_more_' + page
-    globals()[back] = lambda p=page: shift_skill_table(p, -1)
-    globals()[more] = lambda p=page: shift_skill_table(p, 1)
-    widget(editor_view, 'createButton', back, 'Trước', x, 225)
-    skill_row_labels[page] = widget(editor_view, 'createLabel', '1–5', x + 83, 229)
-    widget(editor_view, 'createButton', more, 'Thêm / Sau', x + 112, 225)
+    skill_row_labels[page] = widget('hidden', 'createLabel', '', 0, 0)
+
+
+pk_page_boxes, pk_skill_fields, pk_skill_labels = {}, {}, {}
+pk_skill_editor = ([], dict.fromkeys(PVP_EDIT_PAGES, 0), dict.fromkeys(PVP_EDIT_PAGES),
+                   pk_skill_fields, pk_skill_labels)
+pk_reclick_box = widget('auto_pk', 'createCheckBox', 'skill_cut_changed', 'Reclick tối đa 3 lần', 445, 33)
+widget('auto_pk', 'createLabel', 'Chờ ms', 574, 36)
+pk_reclick_wait = widget('auto_pk', 'createLineEdit', '650', 618, 32, 47, 20)
+def switch_auto_pk_editor():
+    global auto_pk_right_editor
+    auto_pk_right_editor = 'F3' if auto_pk_right_editor == 'F2' else 'F2'
+    show_view('auto_pk')
+
+
+widget('auto_pk', 'createButton', 'switch_auto_pk_editor', 'F2 / F3', 359, 103)
+for page in PVP_EDIT_PAGES:
+    x = 10 if page == 'F1' else 236
+    editor_view = 'auto_pk' if page == 'F1' else 'auto_pk_' + page
+    toggle = 'pk_select_' + page
+    globals()[toggle] = lambda checked, p=page: auto_pk_page_changed(p, checked)
+    pk_page_boxes[page] = widget(editor_view, 'createCheckBox', toggle, page + ' · Bật đánh', x, 105)
+    set_checked_silent(pk_page_boxes[page], page == 'F2')
+    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (160, 'ms'), (202, 'Ngắt')):
+        widget(editor_view, 'createLabel', label, x + offset, 127)
+    fields = []
+    for row in range(10):
+        y = 141 + row * 16
+        name = 'pk_skill_select_%s_%d' % (page, row)
+        globals()[name] = lambda checked, p=page, r=row: select_skill_row(p, r, checked, pk_skill_editor)
+        selector = widget(editor_view, 'createCheckBox', name, '', x + 4, y)
+        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 85, 16)
+        delay = widget(editor_view, 'createLineEdit', '', x + 160, y, 36, 16)
+        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 202, y)
+        up_name = 'pk_skill_row_up_%s_%d' % (page, row)
+        down_name = 'pk_skill_row_down_%s_%d' % (page, row)
+        globals()[up_name] = lambda p=page, r=row: move_skill_row(p, r, -1, pk_skill_editor)
+        globals()[down_name] = lambda p=page, r=row: move_skill_row(p, r, 1, pk_skill_editor)
+        compact_row_button(editor_view, up_name, '↑', x + 113, y - 1)
+        compact_row_button(editor_view, down_name, '↓', x + 135, y - 1)
+        fields.append((skill, delay, cut, selector))
+    pk_skill_fields[page] = fields
+    pk_skill_labels[page] = widget('hidden', 'createLabel', '', 0, 0)
+
+
+def selected_auto_pk_page():
+    return next((page for page in PVP_EDIT_PAGES if QtBind.isChecked(gui, pk_page_boxes[page])), None)
+
+
+def select_auto_pk_page(page):
+    for name, box in pk_page_boxes.items():
+        set_checked_silent(box, name == page)
+
+
+def auto_pk_page_changed(page, checked):
+    if ui_sync:
+        return
+    if auto_pk_running and auto_pk_runtime is not None:
+        select_auto_pk_page(auto_pk_runtime['page'])
+        return
+    select_auto_pk_page(page)
+
+
+def load_auto_pk_editor(profile, owner, page):
+    global auto_pk_right_editor
+    rows, offsets, selected, _, _ = pk_skill_editor
+    saved = profile.get('skill_rows')
+    if not isinstance(saved, list):
+        if owner and owner == profile_owner:
+            sync_skill_rows()
+            saved = skill_rows
+        else:
+            try:
+                stored_pvp = read_profiles().get(json.dumps(owner), {})
+                saved = stored_pvp.get('skill_rows', []) if isinstance(stored_pvp, dict) else []
+            except (OSError, ValueError):
+                saved = []
+    rows[:] = [dict(page=row['page'], id=str(row.get('id', '')), ms=str(row.get('ms', '')),
+                    stt=str(row.get('stt', index + 1)), cut=row.get('cut', True) is not False,
+                    disabled=row.get('disabled') is True)
+               for index, row in enumerate(saved if isinstance(saved, list) else [])
+               if isinstance(row, dict) and row.get('page') in PVP_EDIT_PAGES]
+    for name in PVP_EDIT_PAGES:
+        offsets[name], selected[name] = 0, None
+    select_auto_pk_page(page if page in PVP_EDIT_PAGES else 'F2')
+    auto_pk_right_editor = 'F3' if page == 'F3' else 'F2'
+    show_view('auto_pk')
+    set_checked_silent(pk_reclick_box, profile.get('ghost_reclick', QtBind.isChecked(gui, reclick_box)) is True)
+    QtBind.setText(gui, pk_reclick_wait, str(profile.get('ghost_reclick_wait', QtBind.text(gui, reclick_wait_field) or '650')))
+    show_skill_rows(pk_skill_editor)
+
+
+def compile_auto_pk_group(page, report_skipped=False):
+    sync_skill_rows(pk_skill_editor)
+    rows = page_skill_rows(page, pk_skill_editor)
+    known = set(skill_table())
+    skipped = []
+    try:
+        groups = compile_skill_groups({page}, allow_empty=True, rows=rows, known=known)
+    except ValueError:
+        accepted = []
+        groups = {}
+        for row in rows:
+            try:
+                candidate = compile_skill_groups({page}, allow_empty=True,
+                                                 rows=accepted + [row], known=known)
+            except ValueError as error:
+                prefix = '%s dòng %s' % (page, row.get('stt') or '?')
+                detail = str(error)
+                skipped.append(detail if detail.startswith(prefix + ' ·') else prefix + ' · ' + detail)
+            else:
+                accepted.append(row)
+                groups = candidate
+    if page not in groups:
+        detail = (' · ' + skipped[0]) if skipped else ''
+        raise ValueError('Nhóm %s chưa có skill hợp lệ đang bật trong bảng Auto PK%s.' % (page, detail))
+    if report_skipped:
+        for detail in skipped:
+            report_error('Auto PK bỏ qua ' + detail)
+    return groups
+
 
 boss_mode_box = widget('pvp', 'createCheckBox', 'boss_mode_changed', 'Auto Boss', 140, 34)
 widget('pvp', 'createLabel', 'Nhóm Boss', 244, 36)
@@ -7241,23 +9431,39 @@ numeric_keys_field = widget('pvp', 'createLineEdit', '4567890', 542, 31, 65, 19)
 widget('pvp', 'createLabel', 'ms', 616, 36)
 numeric_ms_field = widget('pvp', 'createLineEdit', '20', 639, 31, 38, 19)
 profile_fields.update(numeric_keys=numeric_keys_field, numeric_interval_ms=numeric_ms_field)
-widget('pvp', 'createLabel', 'F4: Dừng', 634, 64)
-place_pvp(trigger_field, 413, 83)
-widget('pvp', 'createLabel', 'F', 413, 112)
-widget('pvp', 'createLabel', 'Vũ khí', 443, 112)
-widget('pvp', 'createLabel', 'Khiên', 522, 112)
+widget('pvp', 'createLabel', 'F', 441, 66)
+widget('pvp', 'createLabel', 'Vũ khí', 464, 66)
+widget('pvp', 'createLabel', 'Khiên', 534, 66)
 for index, page in enumerate(PAGES):
-    y = 131 + index * 19
-    widget('pvp', 'createLabel', page, 413, y)
-    place_pvp(weapon_fields[page], 443, y-3)
-    place_pvp(shield_fields[page], 522, y-3)
-    widget('pvp', 'createButton', 'capture_'+page.lower()+'_gear', 'Lấy', 594, y-4)
-place_pvp(imbue_box, 413, 205)
-widget('pvp', 'createButton', 'refresh_imbues', 'Quét', 594, 205)
-place_pvp(imbue_field, 413, 225)
-widget('pvp', 'createLabel', 'Làm mới sớm (giây)', 413, 252)
-imbue_early_field = widget('pvp', 'createLineEdit', '0.8', 548, 248, 52, 20)
-widget('pvp', 'createLabel', 'F4 dừng Ghost và Auto số. Ghost PvP mặc bộ F4.', 10, 252)
+    y = 88 + index * 22
+    widget('pvp', 'createLabel', page, 441, y)
+    place_pvp(weapon_fields[page], 464, y - 3)
+    place_pvp(shield_fields[page], 534, y - 3)
+    widget('pvp', 'createButton', 'capture_' + page.lower() + '_gear', 'Lấy', 610, y - 4)
+# Early gear imbue widgets stay hidden: the decorative PvP frame label is
+# created later and would sit on top of place_pvp'd copies, blocking the
+# combobox (Quét worked; dropdown stayed stuck on "(Không dùng)").
+imbue_box = widget('pvp', 'createCheckBox', 'imbue_mode_changed', 'Tự duy trì tay phép', 441, 174)
+widget('pvp', 'createButton', 'refresh_imbues', 'Quét', 610, 173)
+imbue_field = widget('pvp', 'createCombobox', 441, 209, 248, 22)
+QtBind.append(gui, imbue_field, '(Không dùng)')
+profile_fields['imbue_choice'] = imbue_field
+# The original dropdown remains offscreen for old profiles and AutoKS.
+pvp_trigger_boxes = {
+    TRIGGER_MANUAL: widget('pvp', 'createCheckBox', 'pvp_trigger_manual_changed', TRIGGER_MANUAL, 441, 249),
+    TRIGGER_TARGET: widget('pvp', 'createCheckBox', 'pvp_trigger_target_changed', TRIGGER_TARGET, 441, 278),
+}
+
+
+def pvp_trigger_manual_changed(checked):
+    select_pvp_trigger(TRIGGER_MANUAL, checked)
+
+
+def pvp_trigger_target_changed(checked):
+    select_pvp_trigger(TRIGGER_TARGET, checked)
+
+
+imbue_early_field = widget('hidden', 'createLineEdit', '0.8', 548, 248, 52, 20)
 show_skill_rows()
 view_pvp()
 
@@ -7305,270 +9511,169 @@ _boss_engine.__dict__.update(_boss_bot=_BossAPI(), _disarm_boss=disarm_boss,
                              imbue_is_active=imbue_is_active)
 exec(compile('# -*- coding: utf-8 -*-\n"""Ghost Boss nền theo ID, đồng bộ từng lượt đánh với phản hồi server."""\nimport json\nimport os\nimport queue\nimport struct\nimport subprocess\nimport tempfile\nfrom collections import deque\nfrom datetime import datetime\nfrom pathlib import Path\nfrom threading import Event, RLock, Thread\nfrom time import monotonic, time\nbot = _boss_bot\n\nNAME, VERSION = \'GhostBossBackground\', \'1.0.8\'\nLOCK=RLock()\nactive=None\nselected=0\nconfirmed_target=0\nselection_revision=0\nupdates=deque(maxlen=5)\n\n\ndef emit(j,text,quiet=False,error=False):\n    with LOCK:\n        if j and j.get(\'stream\'):\n            j[\'stream\'].write(\'[%s] +%d ms %s\\n\' % (datetime.now().strftime(\'%H:%M:%S.%f\')[:-3],round((monotonic()-j[\'start\'])*1000),text))\n            j[\'stream\'].flush()\n        if j and not j.get(\'details\') and j.get(\'cycle\',0)>1 and not any(k in text for k in (\'DỪNG\',\'KẾT THÚC\',\'Vòng\')):quiet=True\n        if not quiet:updates.append(text)\n    if error:bot.log(\'[Auto Boss] %s\' % text)\n\n\ndef identity(c):return c.get(\'server\'),c.get(\'name\'),c.get(\'player_id\')\n\n\ndef entity(records,uid):\n    if not isinstance(records,dict):return None\n    return records.get(uid) or records.get(str(uid))\n\n\ndef mob_alive(mob):\n    if not mob or mob.get(\'dead\'):\n        return False\n    try:\n        return float(mob.get(\'hp\') or 0) > 0\n    except (TypeError, ValueError):\n        return False\n\n\ndef live_target(uid):\n    return mob_alive(entity(bot.get_monsters() or {}, uid))\n\n\ndef stop(reason=\'bấm DỪNG\', notify=True):\n    with LOCK:\n        j=active\n        if not j:return\n        first=not j[\'stop\'].is_set()\n        if first:j[\'reason\']=reason\n        j[\'stop\'].set()\n        if first:\n            try:\n                mob=entity(bot.get_monsters() or {},j[\'target\'])\n                snapshot=dict(uid=j[\'target\'],expected=j.get(\'expected\'),visible=mob is not None,\n                              hp=(mob or {}).get(\'hp\'),dead=(mob or {}).get(\'dead\'))\n            except Exception:snapshot={\'uid\':j[\'target\'],\'expected\':j.get(\'expected\')}\n            emit(j,\'DỪNG: \'+reason, error=notify)\n            emit(j,\'Trạng thái khi dừng: \'+json.dumps(snapshot,ensure_ascii=False), quiet=True)\n\n\ndef valid(j):\n    if j[\'stop\'].is_set():return False\n    if any(monotonic() - at > 3 for at in j[\'cut_requests\'].values()):\n        stop(\'quá 3 giây chưa có hậu kiểm nút ngắt Boss\')\n        return False\n    c=bot.get_character_data() or {}\n    if identity(c)!=j[\'owner\'] or c.get(\'dead\') or bot.get_status():\n        stop(\'nhân vật thay đổi/chết hoặc bot chính được bật\');return False\n    mob=entity(bot.get_monsters() or {},j[\'target\'])\n    if not mob:\n        stop(\'không còn dữ liệu boss/quái trong tầm nhìn\');return False\n    if not mob_alive(mob):\n        if mob.get(\'dead\') or mob.get(\'hp\') == 0:\n            stop(\'boss/quái đã chết\', notify=False)\n        else:\n            stop(\'không đọc được HP của boss/quái\')\n        return False\n    return True\n\n\ndef wait(j,predicate,seconds):\n    end=monotonic()+seconds\n    while valid(j):\n        with LOCK:\n            if predicate():return True\n        if monotonic()>=end:return False\n        j[\'stop\'].wait(0.01)\n    return False\n\n\ndef pause(j,seconds):\n    end=monotonic()+seconds\n    return wait(j,lambda:monotonic()>=end,seconds+0.2)\n\n\ndef reader(j,process):\n    try:\n        for line in process.stdout:\n            try:\n                reply=json.loads(line)\n                # The focus report arrives after the cut\'s posted-message ack.\n                # Monitor it independently: it must not hold up the next skill.\n                with LOCK:\n                    cut=j.get(\'cut_requests\',{}).get(reply.get(\'id\'))\n                    if cut is not None and not reply.get(\'stage\'):\n                        j[\'cut_requests\'].pop(reply[\'id\'],None)\n                        emit(j,\'HẬU KIỂM postmouse: focus=%s → %s | gọi nút=%s ms | lỗi=%s\' %\n                             (reply.get(\'focus_before\'),reply.get(\'focus_after\'),reply.get(\'ms\'),reply.get(\'error\',\'không\')))\n                        if (reply.get(\'ok\') is not True or reply.get(\'focus_stolen\')) and active is j:\n                            stop(\'hậu kiểm Exchange lỗi hoặc phBot giành tiêu điểm; không chuyển Invoke\')\n                j[\'replies\'].put(reply)\n            except ValueError:\n                if line.strip():emit(j,\'HELPER: \'+line.strip()[:250],True)\n    finally:j[\'replies\'].put({\'ended\':True})\n\n\ndef request(j,action):\n    with LOCK:\n        if not valid(j):return None\n        if action == \'cut\' and j[\'ended\']:\n            return {\'ended_naturally\': True}\n        request_id=str(monotonic())\n        timeout=15 if action==\'probe\' else 2\n        q=dict(id=request_id,pid=os.getpid(),name=j[\'preferred_player\'] if action==\'probe\' else j[\'player\'],\n               own_name=j[\'owner\'][1],transport=\'postmouse\',\n               action=action,expires=round((time()+timeout)*1000))\n        process=j[\'process\']\n        if action==\'cut\':\n            j.setdefault(\'cut_requests\',{})[request_id]=monotonic()\n            j[\'cut_wait\']=dict(request_id=request_id,skill=j[\'expected\'],armed_at=monotonic(),cancel_at=None)\n        process.stdin.write(json.dumps(q,ensure_ascii=False)+\'\\n\');process.stdin.flush()\n    deadline=monotonic()+timeout+0.3\n    while valid(j) and monotonic()<deadline:\n        try:r=j[\'replies\'].get(timeout=0.03)\n        except queue.Empty:continue\n        if r.get(\'ended\'):raise ValueError(\'Helper đã dừng.\')\n        if r.get(\'id\')!=request_id:continue\n        if r.get(\'stage\'):\n            emit(j,\'POSTMESSAGE: \'+str(r[\'stage\']),True)\n            if action==\'cut\' and r[\'stage\']==\'mouse_posted\':\n                emit(j,\'ĐƯỜNG=postmouse | đã gửi cặp thông điệp, %s ms trong helper; chờ B074 02 00 rồi mới nối skill.\' % r.get(\'post_ms\'))\n                return r\n            continue\n        if not r.get(\'ok\'):raise ValueError(str(r.get(\'error\',\'Không gọi được nút Exchange\')))\n        if r.get(\'focus_stolen\'):raise ValueError(\'phBot giành tiêu điểm; dừng, không thử Invoke.\')\n        if action!=\'probe\':\n            emit(j,\'ĐƯỜNG=postmouse | Player=%s | gọi nút=%s ms | focus=%s → %s; không phải xác nhận server.\' %\n                 (r.get(\'name\'),r.get(\'ms\'),r.get(\'focus_before\'),r.get(\'focus_after\')))\n        return r\n    if valid(j):raise ValueError(\'Hết thời gian gọi nút phBot; không gửi lại.\')\n    return None\n\n\ndef acquire_player(j):\n    announced = False\n    while valid(j):\n        reply = request(j, \'probe\')\n        if reply is None:\n            return False\n        if reply.get(\'needs_phbot_foreground\'):\n            if announced != \'foreground\':\n                emit(j, \'Auto Boss: mở cửa sổ phBot để tự chọn acc hỗ trợ; sau đó có thể chuyển cửa sổ.\')\n                announced = \'foreground\'\n            j[\'stop\'].wait(1.0)\n            continue\n        player = str(reply.get(\'name\') or \'\').strip()\n        if player and not reply.get(\'no_player\') and player.casefold() != str(j[\'owner\'][1]).casefold():\n            j[\'player\'] = player\n            j[\'recheck_player\'] = False\n            emit(j, \'Đã chọn Player hỗ trợ Boss: \' + player)\n            return True\n        if announced != \'player\':\n            emit(j, \'Chưa có Player hỗ trợ trong tầm. Đang tự làm mới danh sách.\')\n            announced = \'player\'\n        j[\'stop\'].wait(1.0)\n    return False\n\n\ndef send_action(j, payload):\n    """Register an exact match before sending, including delayed callbacks."""\n    now = monotonic()\n    recent = j[\'recent_actions\']\n    while recent and recent[0][1] < now:\n        recent.popleft()\n    recent.append((payload, now + 1.5))\n    return bot.inject_joymax(0x7074, payload, False)\n\n\ndef describe_action(raw):\n    if raw == b\'\\x02\':\n        return \'hủy tác vụ\'\n    if len(raw) == 7 and raw[:3] == b\'\\x01\\x01\\x01\':\n        return \'đánh thường UID=%d\' % struct.unpack_from(\'<I\', raw, 3)[0]\n    if len(raw) in (7, 11) and raw[:2] == b\'\\x01\\x04\':\n        skill = struct.unpack_from(\'<I\', raw, 2)[0]\n        if len(raw) == 11 and raw[6] == 1:\n            return \'skill ID=%d UID=%d\' % (skill, struct.unpack_from(\'<I\', raw, 7)[0])\n        if len(raw) == 7 and raw[6] == 0:\n            return \'skill tự buff ID=%d\' % skill\n    return \'tác vụ chưa nhận diện\'\n\n\ndef maintain_imbue(j):\n    """Run only between attacks, before arming the next attack\'s B070 wait."""\n    uid = j.get(\'imbue_id\')\n    now = monotonic()\n    if not uid:\n        return True\n    data = entity(bot.get_skills() or {}, uid)\n    if not data:\n        return True\n    active = imbue_is_active(bot, uid, data)\n    payload = struct.pack(\'<BBIB\', 1, 4, uid, 0)\n    cast_time = max(0.2, imbue_seconds(data, \'cast_time\') + 0.1)\n    with LOCK:\n        if not valid(j):\n            return False\n        if uid != j[\'imbue_id\']:\n            return True\n        delay = imbue_refresh_delay(data, j[\'imbue_early\'])\n        if active:\n            if not j[\'imbue_seen_active\'] and not j[\'imbue_until\'] and delay:\n                j[\'imbue_until\'] = now + delay\n            j[\'imbue_seen_active\'] = True\n            if not j[\'imbue_until\']:\n                return True\n        elif j[\'imbue_seen_active\']:\n            j[\'imbue_seen_active\'] = False\n            j[\'imbue_until\'] = 0.0\n        if now < max(j[\'imbue_retry\'], j[\'imbue_until\']) or data.get(\'can_cast\') is False:\n            return True\n        j.update(imbue_payload=payload, imbue_ack=None)\n        j[\'imbue_retry\'] = now + max(2.0, imbue_seconds(data, \'cooldown\'))\n        accepted = send_action(j, payload)\n        emit(j, \'Tay phép Boss: %s (ID=%d), API=%r.\' % (data.get(\'name\') or \'Tự buff\', uid, accepted))\n    try:\n        if accepted is False:\n            with LOCK:\n                if uid == j[\'imbue_id\']:\n                    j[\'imbue_retry\'] = monotonic() + 2.0\n            return True\n        if wait(j, lambda: j[\'imbue_ack\'] is not None, 1.0):\n            with LOCK:\n                if uid == j[\'imbue_id\']:\n                    j[\'imbue_until\'] = j[\'imbue_ack\'] + (delay or 1.0)\n        elif not j[\'stop\'].is_set():\n            emit(j, \'Tay phép Boss: chưa thấy B070 xác nhận, tiếp tục chuỗi đánh.\')\n        return pause(j, max(0, now + cast_time - monotonic()))\n    finally:\n        with LOCK:\n            j[\'imbue_payload\'] = None\n\n\ndef skill_available(skill):\n    data = entity(bot.get_skills() or {}, skill)\n    return data is not None and data.get(\'can_cast\') is not False\n\n\n# B074 carries no skill ID. Use the ordered start/end pair only to\n# permit one reclick of the same skill, never as evidence of a hit.\nCAST_RECOVERY_GRACE = 0.35\n\n\ndef cast_attack(j, skill):\n    data = struct.pack(\'<BBIBI\', 1, 4, skill, 1, j[\'target\'])\n    for attempt in range(2):\n        if not skill_available(skill):\n            emit(j, \'ID=%d: phBot báo chưa thể dùng; đợi dữ liệu cập nhật.\' % skill)\n            if not wait(j, lambda: skill_available(skill) or (attempt and j[\'ack\'] is not None), 6):\n                if j[\'stop\'].is_set():\n                    return False\n                raise ValueError(\'ID=%d chưa thể dùng trong 6 giây; kiểm tra hồi chiêu, vũ khí và điều kiện của skill.\' % skill)\n        with LOCK:\n            if not valid(j):\n                return False\n            if attempt and j[\'ack\'] is not None:\n                return True\n            if attempt:\n                emit(j, \'Boss ID=%d: đã thấy B074 01 01 → 02 00, thiếu B070; thử lại đúng skill một lần.\' % skill)\n            j[\'cast_replies\'].clear()\n            j.update(expected=skill, expected_packet=data, ack=None, ended=False, sent=monotonic(),\n                     cast_started=False, cast_closed_at=None)\n            result = send_action(j, data)\n            emit(j, \'Gửi skill ID=%d; API=%r; chờ B070 đúng UID.\' % (skill, result))\n            if result is False:\n                raise ValueError(\'phBot từ chối gửi skill ID=%d.\' % skill)\n\n        def cast_resolved():\n            return j[\'ack\'] is not None or (\n                j[\'cast_closed_at\'] is not None and monotonic() >= j[\'cast_closed_at\'] + CAST_RECOVERY_GRACE)\n\n        wait(j, cast_resolved, 6)\n        with LOCK:\n            if not valid(j):\n                return False\n            if j[\'ack\'] is not None:\n                return True\n            if not attempt and j[\'cast_closed_at\'] is not None and cast_resolved():\n                continue\n            elapsed = round((monotonic() - j[\'sent\']) * 1000)\n            replies = \' | \'.join(j[\'cast_replies\']) or \'chưa thấy B070 của nhân vật hoặc B074\'\n            retry = \'Đã thử lại một lần. \' if attempt else \'\'\n            raise ValueError(\'ID=%d UID=%d: sau %d ms chưa có B070 khớp. %s. %sLog: %s\' %\n                             (skill, j[\'target\'], elapsed, replies, retry, j[\'path\']))\n\n\ndef stage(j):\n    for skill, delay in j[\'sequence\']:\n        if delay is not None and j[\'recheck_player\'] and not acquire_player(j):\n            return False\n        with LOCK:\n            if not valid(j):return False\n            ready_at=j[\'ready\'].get(skill,0)\n        if not wait(j,lambda:monotonic()>=ready_at,max(0,ready_at-monotonic())+0.5):return False\n        if not maintain_imbue(j):return False\n        if not cast_attack(j, skill):\n            return False\n        ack = j[\'ack\']\n        j[\'ready\'][skill] = ack + j[\'cooldowns\'].get(skill, 0) + 0.05\n        if delay is not None:\n            cut_at = ack + delay / 1000\n            if not wait(j, lambda: j[\'ended\'] or monotonic() >= cut_at, delay / 1000 + 0.5):\n                return False\n            with LOCK:\n                if not valid(j):\n                    return False\n                should_cut = not j[\'ended\']\n            if should_cut:\n                reply = request(j, \'cut\')\n                if reply is None:\n                    return False\n                if not reply.get(\'ended_naturally\'):\n                    wait(j, lambda: j[\'ended\'] or j[\'cut_wait\'][\'cancel_at\'] is not None, 1.5)\n                    with LOCK:\n                        if not valid(j):\n                            return False\n                        if j[\'cut_wait\'][\'cancel_at\'] is None:\n                            emit(j, \'Chưa xác nhận ngắt ID=%d. Đợi skill kết thúc rồi tự tìm lại Player.\' % skill)\n                            j[\'recheck_player\'] = True\n                        j[\'cut_wait\'] = None\n        if not wait(j, lambda: j[\'ended\'], 12):\n            if j[\'stop\'].is_set():\n                return False\n            raise ValueError(\'Thiếu B074 kết thúc cho skill ID=%d; dừng chuỗi.\' % skill)\n        if not pause(j, 0.1):\n            return False\n    return True\n\n\ndef run(j):\n    global active\n    helper_path = None\n    try:\n        emit(j,\'BẮT ĐẦU | target=%d | dãy=%r | log=%s\' % (j[\'target\'],j[\'sequence\'],j[\'path\']))\n        if any(delay is not None for _, delay in j[\'sequence\']):\n            emit(j, \'Auto Boss đang mở Hòm đồ phBot và chọn acc hỗ trợ.\')\n            # Windows caps the command line at 32767 characters. Keep the\n            # script in a file and use UTF-8 BOM for Windows PowerShell 5.1.\n            with tempfile.NamedTemporaryFile(mode=\'w\', encoding=\'utf-8-sig\', prefix=\'AGBoss-\',\n                                             suffix=\'.ps1\', delete=False) as script:\n                helper_path = Path(script.name)\n                script.write(HELPER)\n            exe = Path(os.environ.get(\'SystemRoot\', \'C:/Windows\')) / \'System32/WindowsPowerShell/v1.0/powershell.exe\'\n            with LOCK:\n                if not valid(j):\n                    return\n                process = subprocess.Popen(\n                    [str(exe), \'-NoProfile\', \'-NonInteractive\', \'-ExecutionPolicy\', \'Bypass\',\n                     \'-File\', str(helper_path)],\n                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,\n                    text=True, encoding=\'utf-8\', creationflags=0x08000000, bufsize=1)\n                j[\'process\'] = process\n            Thread(target=reader, args=(j, process), daemon=True).start()\n            if not acquire_player(j):\n                return\n        with LOCK:\n            if not valid(j) or confirmed_target != j[\'target\']:\n                return\n        emit(j,\'Đã sẵn sàng: Ghost Boss nền theo ID. F4 dừng.\')\n        quiet_after = monotonic() + j[\'rest\']\n        def ready_to_attack():\n            now = monotonic()\n            if now >= quiet_after and now - j[\'last_foreign_action\'] >= 1.4:\n                j[\'starting\'] = False\n                return True\n            return False\n        if not wait(j, ready_to_attack, j[\'rest\'] + 4):\n            if not j[\'stop\'].is_set():\n                stop(\'vẫn thấy lệnh ngoài khi chuẩn bị Boss; tắt Auto khác và ngừng đánh tay\')\n            return\n        while valid(j):\n            j[\'cycle\']+=1\n            if not stage(j):break\n            if j[\'cycle\']==1 or j[\'cycle\']%10==0:emit(j,\'Vòng %d đã hoàn tất đủ %d skill; tiếp tục, chờ hồi riêng từng ID.\' % (j[\'cycle\'],len(j[\'sequence\'])))\n    except Exception as error:\n        if not j[\'reason\']:\n            j[\'reason\'] = str(error)\n            emit(j, \'DỪNG: \' + j[\'reason\'], error=True)\n    finally:\n        with LOCK:\n            j[\'stop\'].set()\n            process = j.get(\'process\')\n        if process is not None and process.poll() is None:\n            try:\n                process.kill()\n                process.wait(timeout=2)\n            except (OSError, subprocess.TimeoutExpired):\n                pass\n        if helper_path is not None:\n            try:\n                helper_path.unlink(missing_ok=True)\n            except OSError as error:\n                emit(j, \'Chưa dọn được tệp helper tạm: \' + str(error), quiet=True)\n        with LOCK:\n            emit(j,\'KẾT THÚC: %s | FILE: %s\' % (j[\'reason\'] or \'đã dừng chuỗi\',j[\'path\']))\n            j[\'stream\'].close();j[\'stream\']=None\n            if active is j:active=None\n\n\ndef start(target, sequence, imbue_id, imbue_early, player):\n    global active, selected\n    with LOCK:\n        if active:\n            emit(None, \'Boss đang kết thúc lượt trước hoặc đã chạy.\')\n            return\n        try:\n            if os.name != \'nt\':\n                raise ValueError(\'Auto Boss dùng trên Windows/phBot.\')\n            c = bot.get_character_data() or {}\n            if not c.get(\'player_id\') or c.get(\'dead\'):\n                raise ValueError(\'Vào game và còn sống trước.\')\n            if bot.get_status():\n                raise ValueError(\'Dừng bot chính trước khi bật Auto Boss.\')\n            if not live_target(target):\n                raise ValueError(\'Chọn Boss/quái còn sống trong game rồi bấm Bật.\')\n            learned = {int(k): v for k, v in (bot.get_skills() or {}).items()}\n            if any(skill not in learned or skill == imbue_id for skill, _ in sequence):\n                raise ValueError(\'Kiểm tra ID skill và bỏ tay phép khỏi dãy đánh Boss.\')\n            rest = 0\n            folder=Path(bot.get_config_dir())/NAME;folder.mkdir(parents=True,exist_ok=True)\n            path=folder/(\'GhostBoss_\'+datetime.now().strftime(\'%Y%m%d_%H%M%S_%f\')+\'.log\')\n            selected=target\n            j=dict(owner=identity(c),source=c[\'player_id\'],target=target,sequence=sequence,rest=rest,ready={s:monotonic()+max(0,float(learned[s].get(\'cooldown\') or 0)/1000) for s,_ in sequence if learned[s].get(\'can_cast\') is False},cooldowns={s:max(0,float(learned[s].get(\'cooldown\') or 0)/1000) for s,_ in sequence},cycle=0,details=False,\n                   stream=path.open(\'w\',encoding=\'utf-8\'),path=path,start=monotonic(),stop=Event(),reason=\'\',\n                   expected=None,expected_packet=None,ack=None,ended=False,cast_replies=deque(maxlen=4),\n                   cast_started=False,cast_closed_at=None,\n                   preferred_player=player,player=\'\',recheck_player=False,process=None,replies=queue.Queue(),cut_requests={},cut_wait=None,\n                   imbue_id=imbue_id,imbue_early=imbue_early,imbue_seen_active=False,imbue_payload=None,imbue_ack=None,imbue_retry=0.0,imbue_until=0.0,\n                   starting=True,last_foreign_action=0.0,recent_actions=deque(maxlen=16))\n            emit(j, \'Auto Boss dùng chung dãy skill của Auto Ghost.\')\n            active=j;Thread(target=run,args=(j,),daemon=True).start()\n        except Exception as error:emit(None, str(error), error=True)\n\n\ndef packet(outgoing,opcode,data):\n    global selected, confirmed_target, selection_revision\n    raw=bytes(data or b\'\')\n    with LOCK:\n        if outgoing and opcode == 0x7045 and len(raw) == 4:\n            selected = struct.unpack(\'<I\', raw)[0]\n            if selected != confirmed_target:\n                confirmed_target = 0\n        elif outgoing and opcode == 0x7046:\n            selected = confirmed_target = 0\n        elif not outgoing and opcode == 0xB045:\n            target = struct.unpack_from(\'<I\', raw, 1)[0] if len(raw) >= 5 and raw[0] == 1 else 0\n            if target and target != confirmed_target:\n                selection_revision += 1\n            selected = confirmed_target = target\n        j=active\n        if not j or j[\'stop\'].is_set():return\n        if selected != j[\'target\']:\n            stop(\'đổi hoặc bỏ mục tiêu khi đang Auto Boss\', notify=False)\n            return\n        if outgoing and opcode == 0x7074:\n            now = monotonic()\n            if not any(payload == raw and now <= expires for payload, expires in j[\'recent_actions\']):\n                description = \'%s | 7074=%s | Boss đang chờ ID=%s\' % (\n                    describe_action(raw), raw[:48].hex(\' \').upper(), j[\'expected\'])\n                if j[\'starting\']:\n                    j[\'last_foreign_action\'] = now\n                    emit(j, \'Chuẩn bị: thấy lệnh ngoài, đợi ngừng đánh | \' + description, True)\n                else:\n                    stop(\'có lệnh ngoài: \' + description)\n                    return\n        if outgoing and opcode in (0x7034,0x7005):stop(\'đổi đồ hoặc thoát game khi Ghost Boss\')\n        if opcode==0x3085 or (not outgoing and opcode==0xB081 and raw[:1]==b\'\\x01\'):\n            stop(\'giao dịch thật được mở; không tự xác nhận đồ\')\n        if not outgoing and opcode==0xB070 and len(raw)>=11 and raw[0]==1:\n            skill, source = struct.unpack_from(\'<II\', raw, 3)\n            payload = j.get(\'imbue_payload\')\n            if (payload and skill == struct.unpack_from(\'<I\', payload, 2)[0]\n                    and source == j[\'source\'] and j[\'imbue_ack\'] is None):\n                j[\'imbue_ack\'] = monotonic()\n        waiting_cast = j[\'expected\'] is not None and j[\'ack\'] is None\n        if not outgoing and waiting_cast and opcode == 0xB074:\n            j[\'cast_replies\'].append(\'B074 \' + raw[:8].hex(\' \').upper())\n            if raw == b\'\\x02\\x00\' and j[\'cast_started\'] and j[\'cast_closed_at\'] is None:\n                j[\'cast_closed_at\'] = monotonic()\n            elif raw == b\'\\x01\\x01\':\n                j[\'cast_closed_at\'] = None\n            j[\'cast_started\'] = raw == b\'\\x01\\x01\'\n        if not outgoing and waiting_cast and opcode == 0xB070 and len(raw) >= 11 and raw[0] == 1:\n            skill, source = struct.unpack_from(\'<II\', raw, 3)\n            if source == j[\'source\']:\n                target = struct.unpack_from(\'<I\', raw, 15)[0] if len(raw) >= 19 else None\n                if skill == j[\'expected\'] and target == j[\'target\']:\n                    j[\'ack\'] = monotonic()\n                else:\n                    j[\'cast_replies\'].append(\'B070 ID=%d UID=%s\' % (skill, target))\n                    emit(j, \'B070 chưa khớp: \' + raw.hex(\' \').upper(), quiet=True)\n        if not outgoing and opcode == 0xB074 and not j.get(\'imbue_payload\') and j[\'ack\'] is not None:\n            if raw in (b\'\\x02\\x00\', b\'\\x02\\x01\'):\n                j[\'ended\'] = True\n            cut = j[\'cut_wait\']\n            if raw == b\'\\x02\\x00\' and cut and cut[\'skill\'] == j[\'expected\'] and cut[\'cancel_at\'] is None:\n                cut[\'cancel_at\'] = monotonic()\n                emit(j, \'Boss ID=%d · nhận B074 02 00 sau yêu cầu ngắt.\' % j[\'expected\'])\n        if j.get(\'details\') and opcode in (0x7045,0xB045,0x7074,0xB070,0xB074,0x3085):\n            emit(j,\'%s %04X: %s\' % (\'C→S\' if outgoing else \'S→C\',opcode,raw.hex(\' \').upper()),True)\n\n\ndef handle_silkroad(opcode,data):packet(True,opcode,data);return True\ndef handle_joymax(opcode,data):packet(False,opcode,data);return True\ndef disconnected():stop(\'mất kết nối\')\ndef teleported():stop(\'dịch chuyển\')\ndef finished():stop(\'đóng plugin\')\ndef stop_button():stop()\n\n\nHELPER = \'\\n$ErrorActionPreference=\\\'Stop\\\'\\nAdd-Type -AssemblyName UIAutomationClient\\nAdd-Type -AssemblyName UIAutomationTypes\\nAdd-Type -TypeDefinition @\\\'\\nusing System;\\nusing System.Runtime.InteropServices;\\npublic static class HHFocusSnapshot {\\n [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }\\n [DllImport("user32.dll",SetLastError=true)] public static extern bool PostMessage(IntPtr hwnd,uint msg,UIntPtr wp,IntPtr lp);\\n [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hwnd,ref POINT point);\\n [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint pid);\\n [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }\\n [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();\\n [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);\\n public static uint InputTick() { var info=new LASTINPUTINFO(); info.cbSize=(uint)Marshal.SizeOf(info); return GetLastInputInfo(ref info)?info.dwTime:0; }\\n}\\n\\\'@\\n[Console]::InputEncoding=New-Object System.Text.UTF8Encoding($false)\\n[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)\\n\\nfunction Send-NavMouse($element,[int]$expectedPid) {\\n if($element.Current.IsOffscreen){\\n  $scroll=$null\\n  if($element.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern,[ref]$scroll)){$scroll.ScrollIntoView();Start-Sleep -Milliseconds 100}\\n }\\n $rect=$element.Current.BoundingRectangle\\n if($element.Current.IsOffscreen -or $rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw \\\'Inventory navigation has no visible rectangle\\\'}\\n $node=$element;$hwnd=[IntPtr]::Zero\\n for($i=0;$node -and $i -lt 12;$i++){\\n  if($node.Current.ProcessId -ne $expectedPid){break}\\n  if($node.Current.NativeWindowHandle){$hwnd=[IntPtr]$node.Current.NativeWindowHandle;break}\\n  $node=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)\\n }\\n [uint32]$owner=0\\n [HHFocusSnapshot]::GetWindowThreadProcessId($hwnd,[ref]$owner)|Out-Null\\n if($hwnd -eq [IntPtr]::Zero -or $owner -ne $expectedPid){throw \\\'Inventory navigation window mismatch\\\'}\\n $point=New-Object HHFocusSnapshot+POINT\\n $point.X=[int]($rect.Left+$rect.Width/2);$point.Y=[int]($rect.Top+$rect.Height/2)\\n if(![HHFocusSnapshot]::ScreenToClient($hwnd,[ref]$point)){throw \\\'Inventory coordinate mapping failed\\\'}\\n if($point.X -lt 0 -or $point.Y -lt 0 -or $point.X -gt 32767 -or $point.Y -gt 32767){throw \\\'Inventory coordinates outside range\\\'}\\n $lp=[IntPtr](($point.Y -shl 16) -bor ($point.X -band 65535))\\n if(![HHFocusSnapshot]::PostMessage($hwnd,0x0201,[UIntPtr]::new([uint32]1),$lp)){throw \\\'Inventory mouse-down rejected\\\'}\\n if(![HHFocusSnapshot]::PostMessage($hwnd,0x0202,[UIntPtr]::Zero,$lp)){throw \\\'Inventory mouse-up rejected\\\'}\\n}\\n\\nfunction Test-PhBotForeground([int]$expectedPid) {\\n [uint32]$foregroundPid=0\\n [HHFocusSnapshot]::GetWindowThreadProcessId([HHFocusSnapshot]::GetForegroundWindow(),[ref]$foregroundPid)|Out-Null\\n return $foregroundPid -eq [uint32]$expectedPid\\n}\\n\\nfunction Test-PlayerName([string]$name,$q) {\\n if([string]::IsNullOrWhiteSpace($name) -or $name -ieq [string]$q.own_name){return $false}\\n if($q.name){return ($name -ieq [string]$q.name)}\\n return ($name.Trim() -notin @(\\\'-\\\',\\\'--\\\',\\\'(none)\\\',\\\'none\\\',\\\'player\\\',\\\'players\\\',\\\'select player\\\',\\\'no player\\\',\\\'no players\\\',\\\'...\\\',\\\'chọn người chơi\\\',\\\'không có người chơi\\\',\\\'chọn player\\\'))\\n}\\n\\n$button=$null\\n$inventoryOpened=$false\\n[Console]::WriteLine(\\\'{"stage":"ready"}\\\')\\nwhile ($line=[Console]::ReadLine()) {\\n $q=$null\\n try {\\n  $q=$line|ConvertFrom-Json\\n  @{id=$q.id;stage=\\\'searching_button\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires) {throw \\\'Request expired\\\'}\\n  if($q.action -eq \\\'probe\\\' -and !$inventoryOpened -and (Test-PhBotForeground ([int]$q.pid))) {\\n   $roots=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$q.pid)))\\n   $navDone=$false;$labels=New-Object System.Collections.Generic.List[string]\\n   foreach($root in $roots) {\\n    if($navDone){break}\\n    $nodes=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)\\n    foreach($node in $nodes) {\\n     $name=($node.Current.Name -replace \\\'[\\\\p{P}\\\\p{S}\\\\s]\\\',\\\'\\\').ToLowerInvariant()\\n     if($labels.Count -lt 30 -and $node.Current.Name){$labels.Add($node.Current.Name)}\\n     if($name -in @(\\\'inventory\\\',\\\'hòmđồ\\\',\\\'thùngđồ\\\')) {\\n      if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Expired before Inventory navigation\\\'}\\n      Send-NavMouse $node ([int]$q.pid)\\n      @{id=$q.id;stage=\\\'inventory_mouse_posted\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n      $navDone=$true;break\\n     }\\n    }\\n   }\\n   if(!$navDone){@{id=$q.id;stage=(\\\'inventory_navigation_not_found; labels=\\\'+($labels -join \\\' | \\\'))}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}}\\n   $inventoryOpened=$navDone\\n   $button=$null\\n  }\\n  if (!$button -or $button.Current.ProcessId -ne [int]$q.pid -or $button.Current.IsOffscreen) {\\n   $exchangeOpened=$false\\n   do {\\n   $roots=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$q.pid)))\\n   $matches=New-Object System.Collections.Generic.List[System.Windows.Automation.AutomationElement]\\n   $exchangeTabs=@()\\n   $captions=New-Object System.Collections.Generic.List[string]\\n   foreach($root in $roots) {\\n    $buttons=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)\\n    foreach($b in $buttons) {\\n     $caption=$b.Current.Name\\n     $normalized=($caption -replace \\\'&\\\',\\\'\\\' -replace \\\'\\\\s\\\',\\\'\\\').ToLowerInvariant()\\n     if($b.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $captions.Count -lt 30){$captions.Add($caption)}\\n     if($b.Current.ControlType -eq [System.Windows.Automation.ControlType]::TabItem -and !$b.Current.IsOffscreen -and $normalized -in @(\\\'exchange\\\',\\\'traođổi\\\',\\\'giaodịch\\\')){$exchangeTabs+= $b}\\n     if(!$b.Current.IsOffscreen -and $normalized -in @(\\\'requestexchange\\\',\\\'yêucầugiaodịch\\\',\\\'yêucầutraođổi\\\')) {\\n      $ip=$null\\n      $matches.Add($b)\\n     }\\n    }\\n   }\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !(Test-PhBotForeground ([int]$q.pid))){\\n    break\\n   }\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !$exchangeOpened -and $exchangeTabs.Count -eq 1){\\n    Send-NavMouse $exchangeTabs[0] ([int]$q.pid)\\n    $exchangeOpened=$true\\n   }\\n   if($q.action -in @(\\\'probe\\\',\\\'mouse_probe\\\') -and $matches.Count -ne 1){Start-Sleep -Milliseconds 100}\\n   } while($q.action -in @(\\\'probe\\\',\\\'mouse_probe\\\') -and $matches.Count -ne 1 -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt [long]$q.expires)\\n   if($q.action -eq \\\'probe\\\' -and $matches.Count -eq 0 -and !(Test-PhBotForeground ([int]$q.pid))){\\n    @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if($matches.Count -ne 1){throw (\\\'Request Exchange button count: \\\'+$matches.Count+\\\'; ProcessId=\\\'+$q.pid+\\\'; roots=\\\'+$roots.Count+\\\'; buttons=[\\\'+($captions -join \\\' | \\\')+\\\']\\\')}\\n   $button=$matches[0]\\n  }\\n  if($button.Current.IsOffscreen -or ($q.action -ne \\\'probe\\\' -and !$button.Current.IsEnabled)){throw \\\'Open phBot Inventory / Exchange page and leave it visible\\\'}\\n  $scope=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($button)\\n  $combos=$scope.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::ComboBox)))\\n  for($depth=0;$combos.Count -eq 0 -and $depth -lt 3;$depth++) {\\n   $parent=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($scope)\\n   if(!$parent -or $parent.Current.ProcessId -ne [int]$q.pid){break}\\n   $scope=$parent\\n   $combos=$scope.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::ComboBox)))\\n  }\\n\\n  if($q.action -eq \\\'probe\\\' -and $combos.Count -eq 1) {\\n   $combo=$combos[0]\\n   $focusBeforeSelection=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n   $selection=$null\\n   $selectedText=\\\'\\\'\\n   if($combo.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern,[ref]$selection)){\\n    $current=$selection.Current.GetSelection()\\n    if($current.Count -eq 1){$selectedText=$current[0].Current.Name}\\n   }\\n   $valuePattern=$null\\n   if(!$selectedText -and $combo.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$valuePattern)){\\n    $selectedText=$valuePattern.Current.Value\\n   }\\n   if(!(Test-PlayerName $selectedText $q)){\\n    if(!(Test-PhBotForeground ([int]$q.pid))){\\n     @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n     continue\\n    }\\n    $row=$combo.Current.BoundingRectangle\\n    $refresh=@()\\n    $refreshScope=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($scope)\\n    if(!$refreshScope -or $refreshScope.Current.ProcessId -ne [int]$q.pid){$refreshScope=$scope}\\n    foreach($node in $refreshScope.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)){\\n     $caption=($node.Current.Name -replace \\\'[&\\\\s]\\\',\\\'\\\').ToLowerInvariant()\\n     if($node.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button -or $node.Current.IsOffscreen -or !$node.Current.IsEnabled -or $caption -notin @(\\\'refresh\\\',\\\'refreshplayers\\\',\\\'làmmới\\\',\\\'cậpnhật\\\')){continue}\\n     $rect=$node.Current.BoundingRectangle\\n     if($rect.Left -ge $row.Right-4 -and [Math]::Abs(($rect.Top+$rect.Bottom)-($row.Top+$row.Bottom)) -le 30){$refresh+= $node}\\n    }\\n    if($refresh.Count -eq 1){\\n     Send-NavMouse $refresh[0] ([int]$q.pid)\\n     Start-Sleep -Milliseconds 100\\n    }\\n   }\\n   if(!$combo.Current.IsEnabled){\\n    @{id=$q.id;ok=$true;no_player=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if(!(Test-PlayerName $selectedText $q)){\\n    $selectedText=\\\'\\\'\\n    $expand=$null\\n    if(!$combo.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern,[ref]$expand)){\\n     throw \\\'Không đọc được danh sách Player tự động của phBot.\\\'\\n    }\\n    $wasCollapsed=$expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed\\n    try{\\n     if($wasCollapsed){$expand.Expand();Start-Sleep -Milliseconds 100}\\n     foreach($item in $combo.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)){\\n      $selector=$null\\n      $candidate=$item.Current.Name\\n      if($item.Current.ProcessId -eq [int]$q.pid -and (Test-PlayerName $candidate $q) -and $item.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern,[ref]$selector)){\\n       if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Hết thời gian chọn Player hỗ trợ.\\\'}\\n       $selector.Select()\\n       $selectedText=$candidate\\n       break\\n      }\\n     }\\n    } finally {\\n     if($wasCollapsed -and $expand.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded){$expand.Collapse()}\\n    }\\n   }\\n   [uint32]$ownerAfter=0\\n   $focusAfterSelection=[HHFocusSnapshot]::GetForegroundWindow()\\n   [HHFocusSnapshot]::GetWindowThreadProcessId($focusAfterSelection,[ref]$ownerAfter)|Out-Null\\n   if($focusAfterSelection.ToInt64() -ne $focusBeforeSelection -and $ownerAfter -eq [uint32]$q.pid){\\n    @{id=$q.id;ok=$true;needs_phbot_foreground=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n   if(!$selectedText){\\n    @{id=$q.id;ok=$true;no_player=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n    continue\\n   }\\n  }\\n\\n  $matched=0\\n  $comboDetails=New-Object System.Collections.Generic.List[string]\\n  foreach($combo in $combos) {\\n   $selectedText=\\\'\\\'\\n   $source=\\\'none\\\'\\n   $sp=$null\\n   if($combo.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern,[ref]$sp)) {\\n    $selected=$sp.Current.GetSelection()\\n    if($selected.Count -eq 1){$selectedText=$selected[0].Current.Name;$source=\\\'SelectionPattern\\\'}\\n   }\\n   if(!$selectedText) {\\n    $vp=$null\\n    if($combo.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$vp)) {\\n     $value=$vp.Current.Value\\n     $selectedText=$value\\n     $source=if($vp.Current.IsReadOnly){\\\'ReadOnlyValue\\\'}else{\\\'EditableValue\\\'}\\n    }\\n   }\\n   $comboDetails.Add((\\\'Name=\\\'+$combo.Current.Name+\\\', selected=\\\'+$selectedText+\\\', source=\\\'+$source))\\n   if(Test-PlayerName $selectedText $q){$matched++;$selectedName=$selectedText;$matchedCombo=$combo;$matchedSource=$source}\\n  }\\n  if($matched -ne 1){throw (\\\'Player selection matches=\\\'+$matched+\\\'; expected=[\\\'+$q.name+\\\']; ComboBoxes=\\\'+$combos.Count+\\\'; details=[\\\'+($comboDetails -join \\\' | \\\')+\\\']\\\')}\\n  if($q.action -eq \\\'probe\\\') {\\n   @{id=$q.id;ok=$true;name=$selectedName;probe=$true}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n   continue\\n  }\\n  @{id=$q.id;stage=\\\'posting_mouse\\\'}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Request expired before invoke\\\'}\\n  if($matchedSource -eq \\\'EditableValue\\\' -or $matchedSource -eq \\\'ReadOnlyValue\\\') {\\n   $verify=$matchedCombo.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)\\n   if($verify.Current.Value -cne $selectedName){throw \\\'Player changed before invoke\\\'}\\n  } else {\\n   $verify=$matchedCombo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern)\\n   $verifyItems=$verify.Current.GetSelection()\\n   if($verifyItems.Count -ne 1 -or $verifyItems[0].Current.Name -cne $selectedName){throw \\\'Player changed before invoke\\\'}\\n  }\\n  $focusBefore=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n  $inputBefore=[HHFocusSnapshot]::InputTick()\\n  $watch=[Diagnostics.Stopwatch]::StartNew()\\n  if($q.transport -eq \\\'postmouse\\\') {\\n   [uint32]$foregroundPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId([IntPtr]$focusBefore,[ref]$foregroundPid)|Out-Null\\n   if($q.action -eq \\\'mouse_probe\\\' -and $foregroundPid -eq [uint32]$q.pid){throw \\\'Switch to game or another window before the one-shot test; phBot must not be foreground\\\'}\\n   $rect=$button.Current.BoundingRectangle\\n   if($rect.IsEmpty -or $rect.Width -le 0 -or $rect.Height -le 0){throw \\\'Invalid Exchange button rectangle\\\'}\\n   $node=$button\\n   $hwnd=[IntPtr]::Zero\\n   for($n=0;$node -and $n -lt 12;$n++) {\\n    if($node.Current.ProcessId -ne [int]$q.pid){break}\\n    $handle=$node.Current.NativeWindowHandle\\n    if($handle){$hwnd=[IntPtr]$handle;break}\\n    $node=[System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($node)\\n   }\\n   if($hwnd -eq [IntPtr]::Zero){throw \\\'No native ancestor window for Exchange button\\\'}\\n   [uint32]$ownerPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId($hwnd,[ref]$ownerPid)|Out-Null\\n   if($ownerPid -ne [uint32]$q.pid){throw \\\'Exchange window belongs to another process\\\'}\\n   $point=New-Object HHFocusSnapshot+POINT\\n   $point.X=[int]($rect.Left+$rect.Width/2);$point.Y=[int]($rect.Top+$rect.Height/2)\\n   if(![HHFocusSnapshot]::ScreenToClient($hwnd,[ref]$point)){throw \\\'Cannot map Exchange coordinates\\\'}\\n   if($point.X -lt 0 -or $point.Y -lt 0 -or $point.X -gt 32767 -or $point.Y -gt 32767){throw \\\'Exchange coordinates outside supported range\\\'}\\n   if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt [long]$q.expires){throw \\\'Request expired before PostMessage\\\'}\\n   $lp=[IntPtr](($point.Y -shl 16) -bor ($point.X -band 65535))\\n   if(![HHFocusSnapshot]::PostMessage($hwnd,0x0201,[UIntPtr]::new([uint32]1),$lp)){throw \\\'WM_LBUTTONDOWN rejected\\\'}\\n   $released=[HHFocusSnapshot]::PostMessage($hwnd,0x0202,[UIntPtr]::Zero,$lp)\\n   if(!$released){throw \\\'WM_LBUTTONUP rejected; inspect phBot button state\\\'}\\n   @{id=$q.id;stage=\\\'mouse_posted\\\';post_ms=$watch.ElapsedMilliseconds}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n   [Console]::Out.Flush()\\n   Start-Sleep -Milliseconds 120\\n   $after=[HHFocusSnapshot]::GetForegroundWindow().ToInt64()\\n   [uint32]$afterPid=0\\n   [HHFocusSnapshot]::GetWindowThreadProcessId([IntPtr]$after,[ref]$afterPid)|Out-Null\\n   $stolen=($foregroundPid -ne [uint32]$q.pid -and $afterPid -eq [uint32]$q.pid)\\n   @{id=$q.id;ok=$true;name=$selectedName;transport=\\\'postmouse\\\';ms=$watch.ElapsedMilliseconds;focus_before=$focusBefore;focus_after=$after;focus_stolen=$stolen;input_before=$inputBefore;input_after=[HHFocusSnapshot]::InputTick();mouse_probe=($q.action -eq \\\'mouse_probe\\\')}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n  } else {throw \\\'Only PostMessage transport is supported\\\'}\\n } catch {\\n  $button=$null\\n  $inventoryOpened=$false\\n  @{id=$q.id;ok=$false;error=$_.Exception.Message}|ConvertTo-Json -Compress|%{[Console]::WriteLine($_)}\\n }\\n}\\n\'\n', __file__+':boss_background', 'exec'), _boss_engine.__dict__)
 
-# Solo Auto Ghost Boss: no support account required. Keep Exchange-helper path
-# when "Acc hỗ trợ ngắt Boss" is filled.
-#
-# Ghost method from hiep.txt ONLY (Client packets):
-#   skill 7074 → Boss UID, then ghost = 0x7081 + 4-byte Boss/monster UID
-#   (often doubled). Zero ESC. Zero 7074\x02 cancel. PvP NativeCut untouched.
-_boss_request_exchange = _boss_engine.request
-_boss_run_exchange = _boss_engine.run
-_boss_start_exchange = _boss_engine.start
-_boss_stage_exchange = _boss_engine.stage
-_boss_packet_exchange = _boss_engine.packet
-
-
-def _boss_solo_cut(j):
-    """Solo Boss/monster ghost = hiep 0x7081→UID (packet only). No ESC."""
-    with _boss_engine.LOCK:
-        if not _boss_engine.valid(j):
-            return None
-        if j['ended']:
-            return {'ended_naturally': True}
-        target = int(j['target'])
-        skill = j['expected']
-        packet = struct.pack('<I', target)
-        j['cut_wait'] = dict(request_id='solo-hiep-7081', skill=skill,
-                             armed_at=monotonic(), cancel_at=None,
-                             exchange_uid=target)
-        j['solo_exchange_uid'] = target
-        j['solo_exchange_until'] = monotonic() + 2.0
-
-    # hiep.txt: first ghost fires two 0x7081 to the same Boss UID back-to-back.
-    results = []
-    for index in (1, 2):
-        with _boss_engine.LOCK:
-            if not _boss_engine.valid(j) or j.get('ended'):
-                return {'ended_naturally': True} if j.get('ended') else None
-            accepted = _boss_send(0x7081, packet, False)
-            results.append(accepted)
-            _boss_engine.emit(
-                j,
-                'Solo Boss ghost hiep 7081×%d→UID quái/Boss %d, encrypted=False, API=%r.' %
-                (index, target, accepted))
-        if accepted is False:
-            break
-        if index == 1:
-            # Tiny gap matching the capture's consecutive 7081 pair.
-            j['stop'].wait(0.02)
-
-    if all(value is False for value in results):
-        with _boss_engine.LOCK:
-            j.pop('solo_exchange_uid', None)
-            j.pop('solo_exchange_until', None)
-            _boss_engine.emit(
-                j,
-                'Solo Boss: phBot từ chối inject 0x7081→UID %d (hiep ghost). Không dùng ESC. Đợi skill tự kết thúc.' %
-                target)
-            return {'ok': False, 'solo': True, 'soft_fail': True, 'uid': target,
-                    'method': None, 'api': results}
-
-    with _boss_engine.LOCK:
-        if j.get('cut_wait') is not None:
-            j['cut_wait']['request_id'] = 'solo-hiep-7081'
-        _boss_engine.emit(
-            j,
-            'Solo Boss đã gửi 7081 hiep (API=%r); chờ B074 02 00 / hủy trao đổi quái.' % results)
-    return {'ok': True, 'solo': True, 'method': 'hiep-7081', 'uid': target, 'api': results}
-
-
-def _boss_packet(outgoing, opcode, data):
-    """Allow intentional solo 7081↔monster cuts; do not treat auto-rejected trade as fatal."""
-    raw = bytes(data or b'')
-    with _boss_engine.LOCK:
-        job = _boss_engine.active
-        solo = bool(job and job.get('solo_cut') and not job['stop'].is_set())
-        exchange_uid = job.get('solo_exchange_uid') if solo else None
-        armed = bool(solo and exchange_uid and monotonic() < job.get('solo_exchange_until', 0))
-        if armed and outgoing and opcode == 0x7081 and len(raw) == 4:
-            if struct.unpack('<I', raw)[0] == exchange_uid:
-                job['solo_exchange_seen'] = True
-        if armed and not outgoing and opcode in (0xB081, 0x3085, 0x3088, 0xB084):
-            # Monster/boss 7081 is auto-cancelled by the server; that cancel is the
-            # interrupt. Never stop the solo chain for the petition we just sent.
-            cut = job.get('cut_wait')
-            if cut and cut.get('exchange_uid') == exchange_uid:
-                job['solo_exchange_reply'] = raw[:8]
-                return
-            if opcode in (0xB081, 0x3085) and raw[:1] == b'\x01':
-                return
-    return _boss_packet_exchange(outgoing, opcode, data)
-
-
-def _boss_request(j, action):
-    if action == 'cut' and j.get('solo_cut'):
-        return _boss_solo_cut(j)
-    return _boss_request_exchange(j, action)
-
-
-def _boss_stage(j):
-    for skill, delay in j['sequence']:
-        if (delay is not None and j['recheck_player'] and not j.get('solo_cut')
-                and not _boss_engine.acquire_player(j)):
-            return False
-        with _boss_engine.LOCK:
-            if not _boss_engine.valid(j):
-                return False
-            ready_at = j['ready'].get(skill, 0)
-        if not _boss_engine.wait(j, lambda: monotonic() >= ready_at,
-                                 max(0, ready_at - monotonic()) + 0.5):
-            return False
-        if not _boss_engine.maintain_imbue(j):
-            return False
-        if not _boss_engine.cast_attack(j, skill):
-            return False
-        ack = j['ack']
-        j['ready'][skill] = ack + j['cooldowns'].get(skill, 0) + 0.05
-        if delay is not None:
-            cut_at = ack + delay / 1000
-            if not _boss_engine.wait(j, lambda: j['ended'] or monotonic() >= cut_at,
-                                     delay / 1000 + 0.5):
-                return False
-            with _boss_engine.LOCK:
-                if not _boss_engine.valid(j):
-                    return False
-                should_cut = not j['ended']
-            if should_cut:
-                reply = _boss_engine.request(j, 'cut')
-                if reply is None:
-                    return False
-                if not reply.get('ended_naturally'):
-                    _boss_engine.wait(
-                        j,
-                        lambda: j['ended'] or (j.get('cut_wait') or {}).get('cancel_at') is not None,
-                        1.5)
-                    with _boss_engine.LOCK:
-                        if not _boss_engine.valid(j):
-                            return False
-                        if j.get('cut_wait') is not None and j['cut_wait'].get('cancel_at') is None:
-                            if j.get('solo_cut'):
-                                _boss_engine.emit(
-                                    j,
-                                    'Solo Boss: chưa thấy B074 02 00 sau 7081 hiep cho ID=%d; đợi skill kết thúc rồi tiếp.' %
-                                    skill)
-                            else:
-                                _boss_engine.emit(
-                                    j,
-                                    'Chưa xác nhận ngắt ID=%d. Đợi skill kết thúc rồi tự tìm lại Player.' % skill)
-                                j['recheck_player'] = True
-                        j['cut_wait'] = None
-                        j.pop('solo_exchange_uid', None)
-                        j.pop('solo_exchange_until', None)
-        if not _boss_engine.wait(j, lambda: j['ended'], 12):
-            if j['stop'].is_set():
-                return False
-            raise ValueError('Thiếu B074 kết thúc cho skill ID=%d; dừng chuỗi.' % skill)
-        if not _boss_engine.pause(j, 0.1):
-            return False
-    return True
-
-
-def _boss_run(j):
-    pending = getattr(_boss_engine, '_pending_solo_cut', None)
-    if pending is not None and 'solo_cut' not in j:
-        j['solo_cut'] = bool(pending)
-    if not j.get('solo_cut'):
-        return _boss_run_exchange(j)
-    try:
-        _boss_engine.emit(
-            j,
-            'BẮT ĐẦU solo | target=%d | dãy=%r | log=%s' % (j['target'], j['sequence'], j['path']))
-        _boss_engine.emit(
-            j,
-            'Solo Boss: ghost theo hiep.txt = 0x7081→UID Boss/quái (×2). Không ESC, không NativeCut PvP.')
-        with _boss_engine.LOCK:
-            if not _boss_engine.valid(j) or _boss_engine.confirmed_target != j['target']:
-                return
-        _boss_engine.emit(j, 'Đã sẵn sàng: Ghost Boss solo (hiep 7081). F4 dừng.')
-        quiet_after = monotonic() + j['rest']
-
-        def ready_to_attack():
-            now = monotonic()
-            if now >= quiet_after and now - j['last_foreign_action'] >= 1.4:
-                j['starting'] = False
-                return True
-            return False
-
-        if not _boss_engine.wait(j, ready_to_attack, j['rest'] + 4):
-            if not j['stop'].is_set():
-                _boss_engine.stop('vẫn thấy lệnh ngoài khi chuẩn bị Boss; tắt Auto khác và ngừng đánh tay')
-            return
-        while _boss_engine.valid(j):
-            j['cycle'] += 1
-            if not _boss_engine.stage(j):
-                break
-            if j['cycle'] == 1 or j['cycle'] % 10 == 0:
-                _boss_engine.emit(
-                    j,
-                    'Vòng %d đã hoàn tất đủ %d skill; tiếp tục, chờ hồi riêng từng ID.' %
-                    (j['cycle'], len(j['sequence'])))
-    except Exception as error:
-        if not j['reason']:
-            j['reason'] = str(error)
-            _boss_engine.emit(j, 'DỪNG: ' + j['reason'], error=True)
-    finally:
-        with _boss_engine.LOCK:
-            j['stop'].set()
-            j.pop('solo_native_ready', None)
-            j.pop('solo_native_session', None)
-            _boss_engine.emit(j, 'KẾT THÚC: %s | FILE: %s' % (j['reason'] or 'đã dừng chuỗi', j['path']))
-            if j.get('stream') is not None:
-                j['stream'].close()
-                j['stream'] = None
-            if _boss_engine.active is j:
-                _boss_engine.active = None
-
-
-def _boss_start(target, sequence, imbue_id, imbue_early, player):
-    preferred = (player or '').strip()
-    solo = not preferred
-    _boss_engine._pending_solo_cut = solo
-    try:
-        _boss_start_exchange(target, sequence, imbue_id, imbue_early, preferred)
-        with _boss_engine.LOCK:
-            job = _boss_engine.active
-            if job is not None and not job['stop'].is_set() and job.get('target') == target:
-                job['solo_cut'] = solo
-                if solo:
-                    job['recheck_player'] = False
-                    job['solo_cut'] = True
-                    _boss_engine.emit(
-                        job,
-                        'Chế độ Solo Boss: hiep 0x7081→UID Boss/quái (×2). Không ESC. PvP không đổi.')
-    finally:
-        _boss_engine._pending_solo_cut = None
-
-
-_boss_engine.request = _boss_request
-_boss_engine.stage = _boss_stage
-_boss_engine.run = _boss_run
-_boss_engine.start = _boss_start
-_boss_engine.packet = _boss_packet
-_boss_engine.handle_silkroad = lambda opcode, data: (_boss_packet(True, opcode, data) or True)
-_boss_engine.handle_joymax = lambda opcode, data: (_boss_packet(False, opcode, data) or True)
-
-
-# Damage timing meter. Keep both clock origins because Ghost starts its
+# Passive timing meter. Keep both clock origins because Ghost starts its
 # interruption timer at the matching B070, not at the outgoing skill request.
+# ghep-2.6: multi-row F1 table — per-skill B070→hit → cut ms (dame đủ, Ghost nhanh).
 damage_meter = None
 damage_meter_lock = RLock()
 damage_meter_update = None
 DAMAGE_METER_SAMPLES = 3
+DAMAGE_METER_F1_ROWS = 6
+# Cast→hit wait: bows need room for projectile travel + late impact B070.
+DAMAGE_METER_CAST_TIMEOUT_NS = 12_000_000_000
 
-widget('meter', 'createLabel', 'ĐO MS NGẮT · Kết luận mốc gửi lệnh ngắt sau B070', 10, 36)
-widget('meter', 'createLabel', 'Bắt đầu đo rồi dùng cùng một skill lên cùng đối thủ 3 lần, đợi hồi giữa các lần.', 10, 61)
-widget('meter', 'createLabel', 'B070 là mốc server xác nhận skill. Giữ cùng khoảng cách để số đo dễ so sánh.', 10, 82)
-widget('meter', 'createButton', 'start_damage_meter', 'Bắt đầu đo', 10, 107)
-widget('meter', 'createButton', 'stop_damage_meter', 'Dừng đo', 111, 107)
-widget('meter', 'createLabel', 'Bù thêm ms', 223, 112)
-damage_margin_field = widget('meter', 'createLineEdit', '20', 310, 106, 50, 20)
-damage_status_field = widget('meter', 'createLabel', 'Chưa đo.', 10, 141)
-damage_result_list = widget('meter', 'createList', 10, 163, 655, 85)
-widget('meter', 'createLabel', 'Nhập ô ms', 10, 261)
-damage_suggested_field = widget('meter', 'createLineEdit', '', 92, 255, 70, 21)
-damage_conclusion_field = widget('meter', 'createLabel', '', 180, 261)
-damage_formula_field = widget('meter', 'createLabel', 'Công thức: làm tròn lên B070 → hit chậm nhất + ms bù.', 10, 282)
-widget('meter', 'createLabel', 'Đo hit đầu. Skill kế chờ server xác nhận ngắt; các hit sau cần đo riêng.', 10, 302)
+widget('meter', 'createLabel', 'ĐO MS NGẮT F1 · mỗi skill: B070 → hit → cut ms (không mất dame, Ghost nhanh)', 10, 34)
+widget('meter', 'createButton', 'start_damage_meter', 'Bắt đầu đo', 10, 56)
+widget('meter', 'createButton', 'stop_damage_meter', 'Dừng', 111, 56)
+widget('meter', 'createLabel', 'Bù ms', 180, 61)
+damage_margin_field = widget('meter', 'createLineEdit', '20', 230, 56, 42, 20)
+widget('meter', 'createButton', 'load_damage_meter_f1', 'Nạp F1', 285, 56)
+widget('meter', 'createButton', 'apply_damage_meter_f1', 'Ghi vào F1', 365, 56)
+damage_status_field = widget('meter', 'createLabel', 'Nạp F1 hoặc đo tay · 3 mẫu/skill · cùng đối thủ.', 10, 82)
+# Balanced columns (~655): wide Tên for full names; LineEdit avoids QtBind Label clip.
+widget('meter', 'createLabel', '#', 10, 104)
+widget('meter', 'createLabel', 'ID', 28, 104)
+widget('meter', 'createLabel', 'Tên', 108, 104)
+widget('meter', 'createLabel', 'B070→hit', 372, 104)
+widget('meter', 'createLabel', 'cut ms', 466, 104)
+widget('meter', 'createLabel', 'mẫu', 536, 104)
+damage_meter_f1_fields = []
+for _meter_row in range(DAMAGE_METER_F1_ROWS):
+    _y = 124 + _meter_row * 22
+    widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 2)
+    _id = widget('meter', 'createLineEdit', '', 28, _y, 72, 20)
+    _name = widget('meter', 'createLineEdit', '—', 108, _y, 254, 20)
+    _hit = widget('meter', 'createLineEdit', '—', 372, _y, 84, 20)
+    _cut = widget('meter', 'createLineEdit', '', 466, _y, 58, 20)
+    _samples = widget('meter', 'createLineEdit', '0/3', 536, _y, 48, 20)
+    damage_meter_f1_fields.append((_id, _name, _hit, _cut, _samples))
+damage_suggested_field = widget('meter', 'createLineEdit', '', 560, 56, 55, 20)
+damage_conclusion_field = widget('meter', 'createLabel', '', 560, 82)
+damage_formula_field = widget(
+    'meter', 'createLabel',
+    'Công thức: ceil(B070→hit chậm nhất) + bù. Cung/đạn: chờ hit muộn; n/a = nhập cut tay.',
+    10, 262)
+damage_result_list = widget('meter', 'createList', 10, 282, 655, 40)
+widget('meter', 'createLabel', 'Giữ khoảng cách; đợi hồi giữa mẫu. Ghi vào F1 cập nhật cột ms nhóm Ghost F1.', 10, 326)
+
+
+def _damage_meter_skill_name(uid):
+    skill = skill_table().get(int(uid)) if uid else None
+    if not skill:
+        return '(chưa có trên acc)' if uid else '—'
+    return str(skill.get('name') or skill.get('servername') or ('ID %s' % uid))[:48]
+
+
+def clear_damage_meter_f1_row(index):
+    uid_field, name_label, hit_label, cut_field, sample_label = damage_meter_f1_fields[index]
+    QtBind.setText(gui, uid_field, '')
+    QtBind.setText(gui, name_label, '—')
+    QtBind.setText(gui, hit_label, '—')
+    QtBind.setText(gui, cut_field, '')
+    QtBind.setText(gui, sample_label, '0/3')
+
+
+_damage_meter_name_cache = None
+
+
+def refresh_damage_meter_f1_table(force=False):
+    """Live ID → Tên while Đo ngắt is open (same idea as Auto PK buff names)."""
+    global _damage_meter_name_cache
+    if not force and _ui_current_view != 'meter':
+        return
+    texts = [QtBind.text(gui, uid_field).strip() for uid_field, *_ in damage_meter_f1_fields]
+    key = '|'.join(texts)
+    if not force and key == _damage_meter_name_cache:
+        return
+    _damage_meter_name_cache = key
+    for (uid_field, name_label, hit_label, cut_field, sample_label), text in zip(
+            damage_meter_f1_fields, texts):
+        if text.isdigit():
+            QtBind.setText(gui, name_label, _damage_meter_skill_name(int(text)))
+        elif not text:
+            QtBind.setText(gui, name_label, '—')
+
+
+def load_damage_meter_f1():
+    """Pull F1 Ghost PvP skill IDs into the measure table."""
+    sync_skill_rows()
+    rows = [row for row in page_skill_rows('F1') if str(row.get('id') or '').strip().isdigit()]
+    for index in range(DAMAGE_METER_F1_ROWS):
+        clear_damage_meter_f1_row(index)
+        if index >= len(rows):
+            continue
+        row = rows[index]
+        uid = str(row['id']).strip()
+        uid_field, name_label, hit_label, cut_field, sample_label = damage_meter_f1_fields[index]
+        QtBind.setText(gui, uid_field, uid)
+        QtBind.setText(gui, name_label, _damage_meter_skill_name(int(uid)))
+        ms = str(row.get('ms') or '').strip()
+        QtBind.setText(gui, cut_field, ms)
+        QtBind.setText(gui, hit_label, '—')
+        QtBind.setText(gui, sample_label, '0/3')
+    QtBind.setText(gui, damage_status_field,
+                   'Đã nạp %d skill F1. Bắt đầu đo → dùng lần lượt từng skill (3 mẫu).' % min(len(rows), DAMAGE_METER_F1_ROWS))
+
+
+def apply_damage_meter_f1():
+    """Write measured cut ms back into F1 skill rows (by ID)."""
+    sync_skill_rows()
+    updates = {}
+    for uid_field, _name, _hit, cut_field, _samples in damage_meter_f1_fields:
+        uid_text = QtBind.text(gui, uid_field).strip()
+        cut_text = QtBind.text(gui, cut_field).strip()
+        if not uid_text.isdigit() or not cut_text:
+            continue
+        try:
+            cut = int(cut_text)
+            if not 0 <= cut <= 5000:
+                raise ValueError
+        except ValueError:
+            QtBind.setText(gui, damage_status_field, 'cut ms phải là 0–5000 (ID %s).' % uid_text)
+            return
+        updates[uid_text] = str(cut)
+    if not updates:
+        QtBind.setText(gui, damage_status_field, 'Chưa có ID + cut ms để ghi vào F1.')
+        return
+    rows = page_skill_rows('F1')
+    changed = 0
+    for row in rows:
+        uid = str(row.get('id') or '').strip()
+        if uid in updates:
+            row['ms'] = updates[uid]
+            changed += 1
+    for uid, ms in updates.items():
+        if any(str(row.get('id') or '').strip() == uid for row in rows):
+            continue
+        rows.append({'stt': str(len(rows) + 1), 'id': uid, 'page': 'F1', 'ms': ms,
+                     'cut': True, 'disabled': False})
+        changed += 1
+    replace_page_skill_rows('F1', rows)
+    show_skill_rows()
+    QtBind.setText(gui, damage_status_field, 'Đã ghi %d mốc cut ms vào bảng F1. Lưu cấu hình PvP để giữ.' % changed)
+
+
+def upsert_damage_meter_result(uid, slowest_hit, suggested, sample_count):
+    """Place / update a measured skill in the F1 table."""
+    uid_text = str(uid)
+    slot = None
+    empty = None
+    for index, (uid_field, name_label, hit_label, cut_field, sample_label) in enumerate(damage_meter_f1_fields):
+        current = QtBind.text(gui, uid_field).strip()
+        if current == uid_text:
+            slot = index
+            break
+        if empty is None and not current:
+            empty = index
+    if slot is None:
+        slot = empty if empty is not None else 0
+    uid_field, name_label, hit_label, cut_field, sample_label = damage_meter_f1_fields[slot]
+    QtBind.setText(gui, uid_field, uid_text)
+    QtBind.setText(gui, name_label, _damage_meter_skill_name(uid))
+    QtBind.setText(gui, hit_label, '%.1f' % slowest_hit)
+    if suggested <= 5000:
+        QtBind.setText(gui, cut_field, str(suggested))
+    QtBind.setText(gui, sample_label, '%d/%d' % (sample_count, DAMAGE_METER_SAMPLES))
 
 
 def start_damage_meter():
@@ -7592,13 +9697,14 @@ def start_damage_meter():
     QtBind.clear(gui, damage_result_list)
     QtBind.setText(gui, damage_suggested_field, '')
     QtBind.setText(gui, damage_conclusion_field, '')
-    QtBind.setText(gui, damage_formula_field, 'Công thức: làm tròn lên B070 → hit chậm nhất + ms bù.')
-    QtBind.setText(gui, damage_status_field, 'Đang chờ lần dùng skill đầu tiên.')
+    QtBind.setText(gui, damage_formula_field,
+                   'Công thức: ceil(B070→hit chậm nhất) + bù ms. Xong 1 skill → đo skill F1 khác.')
+    QtBind.setText(gui, damage_status_field, 'Đang chờ skill · 3 mẫu/ID · cùng đối thủ.')
     with damage_meter_lock:
         damage_meter_update = None
         damage_meter = dict(owner=owner, source=character['player_id'], skill=None,
-                            deadline=perf_counter_ns() + 90_000_000_000,
-                            margin=margin, cast=None, target=None, samples=[])
+                            deadline=perf_counter_ns() + 180_000_000_000,
+                            margin=margin, cast=None, target=None, samples=[], multi=True)
 
 
 def end_damage_meter(message):
@@ -7630,6 +9736,25 @@ def inline_first_damage(raw, target):
     return damage if damage > 0 else None
 
 
+def mark_damage_meter_unmeasurable(uid, reason):
+    """Show n/a in the F1 meter row when hit inline never arrives (bow/buff).
+
+    Cut field is left alone so the user can type ms by hand, then Ghi vào F1.
+    """
+    uid_text = str(int(uid or 0))
+    if not uid_text or uid_text == '0':
+        return
+    for uid_field, name_label, hit_label, cut_field, sample_label in damage_meter_f1_fields:
+        if QtBind.text(gui, uid_field).strip() != uid_text:
+            continue
+        QtBind.setText(gui, name_label, _damage_meter_skill_name(int(uid_text)))
+        QtBind.setText(gui, hit_label, 'n/a')
+        # Keep any existing cut; blank stays blank for manual entry.
+        QtBind.setText(gui, sample_label, '0/3')
+        break
+    report('Đo ms: ID %s không đo được — %s · nhập cut ms tay rồi Ghi vào F1.' % (uid_text, reason))
+
+
 def observe_damage_meter(outgoing, opcode, data):
     global damage_meter, damage_meter_update
     if damage_meter is None or opcode not in ((0x7074,) if outgoing else (0xB070, 0xB071)):
@@ -7646,46 +9771,67 @@ def observe_damage_meter(outgoing, opcode, data):
                 return
             uid = struct.unpack_from('<I', raw, 2)[0]
             target = struct.unpack_from('<I', raw, 7)[0]
-            if not target or target == job['source'] or (job['skill'] is not None and uid != job['skill']):
+            if not target or target == job['source']:
                 return
-            if cast and now - cast['sent'] <= 8_000_000_000:
+            # Multi-skill F1 table: allow switching skill after a completed sample set.
+            if job['skill'] is not None and uid != job['skill'] and job['samples']:
+                return
+            if cast and now - cast['sent'] <= DAMAGE_METER_CAST_TIMEOUT_NS:
                 cast['repeated'] = True
                 return
             if job['target'] is not None and target != job['target']:
                 lines = damage_meter_update[0] if damage_meter_update else []
                 damage_meter_update = (lines, 'Chọn lại đúng đối thủ của lượt đo đầu tiên.', None)
                 return
+            if job['skill'] != uid:
+                job['samples'] = []
             job['skill'] = uid
             job['cast'] = dict(target=target, sent=now, ack=None, action=None, repeated=False)
             return
-        if not cast or now - cast['sent'] > 8_000_000_000:
+        if not cast or now - cast['sent'] > DAMAGE_METER_CAST_TIMEOUT_NS:
             return
         if opcode == 0xB071:
+            # B071 is logged for capture; meter still needs B070 inline ST (stack path).
             if cast['ack'] is not None and not cast.get('saw_b071'):
                 cast['saw_b071'] = True
-                report('Đo ms: B071 chờ đối chiếu ID=%d | %s' % (job['skill'], raw[:64].hex(' ').upper()))
+                report('Đo ms: B071 sau B070 ID=%d (chờ hit inline B070) | %s' %
+                       (job['skill'], raw[:64].hex(' ').upper()))
             return
         if len(raw) < 19 or raw[0] != 1:
             return
         uid, source, action, target = struct.unpack_from('<IIII', raw, 3)
-        if (uid, source, target) != (job['skill'], job['source'], cast['target']):
+        if uid != job['skill'] or source != job['source']:
             return
+        # Bow/projectile: cast confirm often has target=0; impact B070 carries UID.
+        expected = cast['target']
         if cast['ack'] is None:
+            if target not in (0, expected):
+                return
             cast.update(ack=now, action=action)
-        elif cast['action'] != action:
+            if target == 0 and not cast.get('logged_zero_target'):
+                cast['logged_zero_target'] = True
+                report('Đo ms: B070 confirm ID=%d target=0 · chờ hit UID %d (cung/đạn?).' %
+                       (uid, expected))
+        elif target not in (0, expected):
             return
-        damage = inline_first_damage(raw, target)
+        # Impact often uses a different action id than cast confirm — do not require match.
+        damage = inline_first_damage(raw, expected)
         if damage is None:
             if not cast.get('logged'):
                 cast['logged'] = True
-                report('Đo ms: B070 đúng skill, chưa đọc được hit trực tiếp ID=%d | %s' %
+                report('Đo ms: B070 đúng skill ID=%d, chưa có hit inline · chờ gói ST | %s' %
                        (uid, raw[:64].hex(' ').upper()))
+            lines = damage_meter_update[0] if damage_meter_update else []
+            damage_meter_update = (
+                lines,
+                'ID %d · đã B070 · đang chờ hit inline (cung/đạn có thể muộn)…' % uid,
+                None)
             return
         job['cast'] = None
         if cast['repeated']:
             report('Đo ms: bỏ lượt ID=%d do có nhiều lệnh chồng nhau. Bấm đúng một lần.' % uid)
             return
-        job['target'] = cast['target']
+        job['target'] = expected
         ack_ms = (cast['ack'] - cast['sent']) / 1_000_000
         hit_ms = (now - cast['ack']) / 1_000_000
         samples = job['samples']
@@ -7699,10 +9845,14 @@ def observe_damage_meter(outgoing, opcode, data):
             slowest_hit = max(hit for _, hit in samples)
             slowest_ack = max(ack for ack, _ in samples)
             suggested = math.ceil(slowest_hit) + job['margin']
-            result = (suggested, slowest_hit, job['margin'], slowest_ack + suggested)
-            status = ('ID %d · Kết luận sau %d mẫu. Chép số ở ô Nhập ô ms.' % (uid, number)
+            result = (uid, suggested, slowest_hit, job['margin'], slowest_ack + suggested, number)
+            status = ('ID %d · cut %d ms. Đo skill F1 tiếp theo hoặc Ghi vào F1.' % (uid, suggested)
                       if suggested <= 5000 else 'ID %d · Mốc đo vượt giới hạn nhập 5000 ms.' % uid)
-            damage_meter = None
+            # Keep session alive for the next F1 skill.
+            job['skill'] = None
+            job['samples'] = []
+            job['cast'] = None
+            job['deadline'] = perf_counter_ns() + 180_000_000_000
         lines = damage_meter_update[0] if damage_meter_update else []
         damage_meter_update = (lines + [line], status, result)
         report('Đo ms: ' + line)
@@ -7718,11 +9868,27 @@ def tick_damage_meter():
             if owner_of(character) != job['owner'] or character.get('dead') or get_status():
                 end_damage_meter('Dừng đo vì đổi nhân vật, đã chết hoặc bot chính đang chạy.')
             elif now >= job['deadline']:
-                end_damage_meter('Hết giờ. Chưa đủ 3 mẫu sát thương để gợi ý.')
-            elif job['cast'] and now - job['cast']['sent'] > 8_000_000_000:
+                end_damage_meter('Hết giờ đo. Ghi các mốc đã có vào F1 nếu đủ.')
+            elif job['cast'] and now - job['cast']['sent'] > DAMAGE_METER_CAST_TIMEOUT_NS:
+                cast = job['cast']
+                uid = job.get('skill')
+                had_ack = bool(cast.get('ack'))
                 job['cast'] = None
                 lines = damage_meter_update[0] if damage_meter_update else []
-                damage_meter_update = (lines, 'Chưa nhận diện được hit ở lượt vừa rồi. Xem log Đo ms.', None)
+                if had_ack and uid:
+                    reason = ('B070 OK nhưng không có hit inline trong %.0fs '
+                              '(cung/đạn/buff hoặc layout khác) — nhập cut ms tay'
+                              % (DAMAGE_METER_CAST_TIMEOUT_NS / 1e9))
+                    mark_damage_meter_unmeasurable(uid, reason)
+                    damage_meter_update = (
+                        lines,
+                        'ID %d · không đo được: %s' % (uid, reason),
+                        None)
+                else:
+                    damage_meter_update = (
+                        lines,
+                        'Chưa nhận diện được hit ở lượt vừa rồi. Xem log Đo ms.',
+                        None)
         update, damage_meter_update = damage_meter_update, None
     if update:
         lines, status, value = update
@@ -7730,14 +9896,13 @@ def tick_damage_meter():
             QtBind.append(gui, damage_result_list, line)
         QtBind.setText(gui, damage_status_field, status)
         if value is not None:
-            suggested, slowest_hit, margin, press_ms = value
+            uid, suggested, slowest_hit, margin, press_ms, sample_count = value
             QtBind.setText(gui, damage_suggested_field, str(suggested) if suggested <= 5000 else '')
             after_ack = ('%.3f' % (suggested / 1000)).replace('.', ',')
-            from_press = ('%.3f' % (press_ms / 1000)).replace('.', ',')
-            QtBind.setText(gui, damage_conclusion_field,
-                           '%s giây sau B070 · khoảng %s giây từ lúc bấm' % (after_ack, from_press))
+            QtBind.setText(gui, damage_conclusion_field, 'ID %d · %s s sau B070' % (uid, after_ack))
             QtBind.setText(gui, damage_formula_field,
-                           'Làm tròn lên %.1f ms + %d ms bù = %d ms.' % (slowest_hit, margin, suggested))
+                           'ID %d: ceil(%.1f) + %d = %d ms.' % (uid, slowest_hit, margin, suggested))
+            upsert_damage_meter_result(uid, slowest_hit, suggested, sample_count)
 
 
 
@@ -7825,7 +9990,6 @@ def read_boss_settings(owner):
     player = QtBind.text(gui, boss_exchange_player_field).strip()
     if player.casefold() == owner[1].casefold():
         raise ValueError('Acc hỗ trợ không thể là chính acc đánh Boss. Có thể để trống.')
-    # Empty support name => solo Boss (7081→Boss UID, SROPlus/hiep). Named support keeps helper Exchange.
     return dict(page=page, sequence=sequence, imbue_id=uid, imbue_early=early, player=player)
 
 
@@ -7936,15 +10100,78 @@ def report_callback_failure(where, error):
         return was_auto_pk
 
 
+leader_command_keys_held = set()
+leader_command_next_at = 0.0
+
+
+def tick_leader_command_keys():
+    global leader_command_keys_held, leader_command_next_at
+    if _combat_tab != 'pk' or not user32 or not party_leader_combat_hook('leader_hotkeys_enabled'):
+        leader_command_keys_held = set()
+        return
+    client = get_client() or {}
+    states = {key: user32.GetAsyncKeyState(key) for key in (0x70, 0x71, ord('3'), 0x73)}
+    keys = {key for key, flags in states.items() if flags & 0x8000}
+    tapped = {key for key, flags in states.items() if flags & 1}
+    fresh = (keys | tapped) - leader_command_keys_held
+    leader_command_keys_held = keys
+    if not client.get('window') or client['window'] != user32.GetForegroundWindow():
+        return
+    if any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12)):
+        return
+    if len(fresh) != 1:
+        return
+    key = next(iter(fresh))
+    with pvp_lock:
+        now = monotonic()
+        if key != 0x73 and now < leader_command_next_at:
+            return
+        synthetic = pvp_synthetic_page
+        if synthetic and now <= synthetic['until']:
+            synthetic_key = PAGE_KEYS[PAGES.index(synthetic['page'])]
+            if key == synthetic_key:
+                return
+        if key == 0x73:
+            if auto_pk_running:
+                party_sync_clear_target('leader bấm F4 dừng Ghost')
+            else:
+                pause_pvp('leader bấm F4 dừng Ghost', clear_target=True, notify=False)
+            leader_command_next_at = now + 0.75
+            notify_party_leader_ghost_stop('leader bấm F4 dừng Ghost')
+            return
+        uid = party_leader_combat_hook('leader_has_selected_uid')
+        if not uid:
+            report_error('Chọn mục tiêu trước khi bấm F1/F2/3.')
+            return
+        page = 'F2' if key == 0x71 else ('F1' if key == 0x70 else None)
+        if page is None:
+            page = selected_auto_pk_page() or 'F1'
+        if page not in PVP_EDIT_PAGES:
+            page = 'F1'
+        leader_command_next_at = now + 0.75
+        if party_sync_arm_auto_pk(page=page, prefer_uid=uid, source='Leader phím') and party_sync_has_target(uid):
+            if party_leader_combat_hook('on_leader_ghost_start', page, uid):
+                log('[%s] Leader đã phát lệnh đánh %s · UID %d.' % (NAME, page, uid))
+            else:
+                report_error('Leader đã bật Ghost %s nhưng chưa gửi được lệnh sang acc phụ.' % page)
+        else:
+            report_error('Leader chưa vào Ghost %s cho UID %d; xem trạng thái mục tiêu và nhóm F.' % (page, uid))
+
+
 def event_loop():
     try:
+        tick_leader_command_keys()
         tick_damage_meter()
         tick_armed_boss()
+        refresh_auto_pk_buff_names()
+        tick_skill_finder_live()
+        refresh_damage_meter_f1_table()
         with pvp_lock:
             runtime = auto_pk_runtime
             now = monotonic()
             if auto_pk_running and runtime and now >= runtime.get('display_at', 0):
-                runtime['display_at'] = now + 0.75
+                runtime['display_at'] = now + (
+                    AUTO_PK_DISPLAY_INTERVAL if not pvp_target else max(AUTO_PK_DISPLAY_INTERVAL, 0.5))
                 scan_auto_pk_evidence(runtime)
         with _boss_engine.LOCK:
             message = _boss_engine.updates[-1] if _boss_engine.updates else None
@@ -8018,5 +10245,947 @@ def finished():
     return _bg_base_finished()
 
 
+
+# AutoKS shares AutoGhost's tab strip and engine. Its configuration is still
+# scoped per character, with the same filenames as standalone AutoKS.
+def prepare_ks_pvp():
+    global run_section
+    run_section = 'pvp'
+
+
+class _AutoKSGhost:
+    @property
+    def __name__(self):
+        return __name__
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        globals()[name] = value
+
+
+class _AutoKSQt:
+    def init(self, _name, _title):
+        return gui
+
+    def __getattr__(self, kind):
+        if kind not in ('createLabel', 'createCheckBox', 'createLineEdit',
+                        'createCombobox', 'createButton'):
+            return getattr(QtBind, kind)
+
+        def create(_gui, *args):
+            args = list(args)
+            if kind in ('createButton', 'createCheckBox'):
+                args[0] = '_autoks_' + args[0]
+            y_index = -3 if kind in ('createLineEdit', 'createCombobox') else -1
+            args[y_index] += 27
+            return widget('auto_ks', kind, *args)
+
+        return create
+
+
+_autoks_source = r'''# -*- coding: utf-8 -*-
+"""Auto KS: party commands and trace for the existing Ghost PvP engine."""
+
+import ctypes
+import hashlib
+import json
+import struct
+import sys
+from pathlib import Path
+from threading import RLock
+from time import monotonic
+
+try:
+    import phBotChat
+except ImportError:
+    phBotChat = None
+from phBot import (get_character_data, get_client, get_config_dir, get_party,
+                   inject_joymax, log, start_trace, stop_trace)
+from phBot import stop_bot
+
+NAME = 'AutoKS'
+VERSION = '2.4-test'
+PAGES = ('F1', 'F2', 'F3')
+F1, F2, F3, F4 = 0x70, 0x71, 0x72, 0x73
+NUMBER_3 = ord('3')
+LEADER_PAGES = {F1: 'F1', F2: 'F2'}
+PARTY_CHAT = 4
+lock = RLock()
+user32 = ctypes.windll.user32 if sys.platform == 'win32' else None
+if user32:
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+
+gui = QtBind.init(__name__, 'Auto KS ' + VERSION)
+enabled = QtBind.createCheckBox(gui, 'on_enable', 'Bật Auto KS', 10, 12)
+leader = QtBind.createCheckBox(gui, 'on_role', 'Chủ phát lệnh', 145, 12)
+leader_pvp = QtBind.createCheckBox(gui, 'on_leader_pvp', 'Bật Auto PvP cho Chủ', 280, 12)
+QtBind.createLabel(gui, 'Tên Chủ (acc Phụ)', 10, 43)
+leader_name = QtBind.createLineEdit(gui, '', 130, 40, 205, 22)
+QtBind.createLabel(gui, 'Ghost của Phụ', 10, 73)
+page = QtBind.createCombobox(gui, 130, 70, 65, 22)
+for item in PAGES:
+    QtBind.append(gui, page, item)
+QtBind.setText(gui, page, 'F1')
+QtBind.createButton(gui, 'save', 'Lưu', 215, 69)
+follower_status = QtBind.createLabel(gui, 'Acc Phụ: Chưa đánh mục tiêu hiện tại.', 10, 106)
+status = QtBind.createLabel(gui, 'Trạng thái: chờ bật Auto KS và cấu hình tổ đội.', 10, 133)
+
+owner = None
+applying = False
+selected = requested = 0
+selection_deadline = 0.0
+queued_start = False
+fighting = False
+follower_confirmed = False
+follower_f4_handled = False
+follower_force_follow = False
+tracing = ''
+trace_retry_at = 0.0
+held = set()
+f3_presses = 0
+engine = None
+engine_previous_mode = None
+leader_group = 'F1'
+leader_arm_attempt = None
+
+
+ghost_f3_reader = None
+ghost_f3_module = None
+
+
+class GhostKeyReader:
+    """Reserve F3 for AutoKS without changing the shared Windows API."""
+
+    def __init__(self, windows):
+        self.windows = windows
+
+    def GetAsyncKeyState(self, key):
+        if key == F3:
+            return 0
+        return self.windows.GetAsyncKeyState(key)
+
+    def __getattr__(self, name):
+        return getattr(self.windows, name)
+
+
+def release_ghost_f3():
+    global ghost_f3_module, ghost_f3_reader
+    if ghost_f3_module is not None and ghost_f3_module.user32 is ghost_f3_reader:
+        ghost_f3_module.user32 = ghost_f3_reader.windows
+    ghost_f3_module = ghost_f3_reader = None
+
+
+def reserve_ghost_f3(ghost):
+    global ghost_f3_module, ghost_f3_reader
+    if ghost is ghost_f3_module and (ghost is None or ghost.user32 is ghost_f3_reader):
+        return
+    release_ghost_f3()
+    windows = getattr(ghost, 'user32', None)
+    if windows is not None and callable(getattr(windows, 'GetAsyncKeyState', None)):
+        ghost_f3_reader = GhostKeyReader(windows)
+        ghost_f3_module = ghost
+        ghost.user32 = ghost_f3_reader
+
+
+def report(message):
+    QtBind.setText(gui, status, message)
+    log('[AutoKS] ' + message)
+
+
+def set_follower_status(message, confirmed=False):
+    global follower_confirmed
+    follower_confirmed = confirmed
+    QtBind.setText(gui, follower_status, 'Acc Phụ: ' + message)
+
+
+def active():
+    return combat_mode_selected()
+
+
+def is_leader():
+    return QtBind.isChecked(gui, leader)
+
+
+def character_key():
+    data = get_character_data() or {}
+    server, name = data.get('server'), data.get('name')
+    return (str(server), str(name)) if server and name else None
+
+
+def config_path(key):
+    digest = hashlib.sha256(json.dumps(key).encode('utf-8')).hexdigest()[:24]
+    return Path(get_config_dir()) / ('AutoKS_%s.json' % digest)
+
+
+def save():
+    key = character_key()
+    if key is None:
+        report('Vào game trước khi lưu.')
+        return
+    path = config_path(key)
+    temp = path.with_suffix('.tmp')
+    data = dict(enabled=active(), leader=is_leader(),
+                name=QtBind.text(gui, leader_name), page=QtBind.text(gui, page),
+                leader_pvp=QtBind.isChecked(gui, leader_pvp))
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        temp.replace(path)
+        report('Đã lưu cấu hình Auto KS.')
+    except OSError as error:
+        report('Lưu Auto KS lỗi: %s' % error)
+
+
+def load(key):
+    global owner, applying
+    reset()
+    owner = key
+    try:
+        data = json.loads(config_path(key).read_text(encoding='utf-8')) if key else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    applying = True
+    try:
+        QtBind.setChecked(gui, leader, data.get('leader') is True)
+        QtBind.setText(gui, leader_name, str(data.get('name') or ''))
+        group = data.get('page')
+        QtBind.setText(gui, page, group if group in PAGES else 'F1')
+        QtBind.setChecked(gui, leader_pvp, data.get('leader_pvp') is True)
+        QtBind.setChecked(gui, enabled, combat_mode_selected())
+    finally:
+        applying = False
+
+
+def aliases(text):
+    return {part.strip().lstrip('*').casefold() for part in str(text or '').split(',')
+            if part.strip().lstrip('*')}
+
+
+def party_members():
+    records = get_party() or {}
+    return [item for item in records.values() if isinstance(item, dict)] if isinstance(records, dict) else []
+
+
+def follow_member():
+    names = aliases(QtBind.text(gui, leader_name))
+    for item in party_members():
+        name = item.get('name') or ''
+        job = item.get('job_name') or item.get('jobName') or item.get('job') or ''
+        if names & (aliases(name) | aliases(job)):
+            return str(name or job), names | aliases(name) | aliases(job)
+    return '', set()
+
+
+def allowed_target(uid):
+    if not 0 < uid <= 0xffffffff or uid == (get_character_data() or {}).get('player_id'):
+        return False
+    for member in party_members():
+        if any(str(member.get(key) or '') == str(uid)
+               for key in ('player_id', 'unique_id', 'uid', 'id')):
+            return False
+    return True
+
+
+def find_ghost():
+    return embedded_ghost
+
+
+def stop_following():
+    global tracing
+    if tracing and stop_trace() is False:
+        return False
+    tracing = ''
+    return True
+
+
+def stop_ghost(cancel_action=True):
+    global engine, engine_previous_mode
+    ghost, engine = engine, None
+    previous_mode, engine_previous_mode = engine_previous_mode, None
+    if ghost is not None:
+        with ghost.pvp_lock:
+            try:
+                ghost.pause_pvp('Auto KS dừng đánh', clear_target=True,
+                                cancel_action=cancel_action, notify=False)
+            finally:
+                if ghost.pvp_trigger_mode == 'manual' and previous_mode is not None:
+                    ghost.pvp_trigger_mode = previous_mode
+
+
+def clear_target(cancel_action=True):
+    global selected, requested, selection_deadline, queued_start, fighting
+    stop_ghost(cancel_action=cancel_action)
+    selected = requested = 0
+    selection_deadline = 0.0
+    queued_start = fighting = False
+    set_follower_status('Chưa đánh.')
+
+
+def reset():
+    global f3_presses, leader_group, leader_arm_attempt, follower_f4_handled, follower_force_follow
+    follower_f4_handled = follower_force_follow = False
+    leader_arm_attempt = None
+    release_ghost_f3()
+    f3_presses = 0
+    leader_group = 'F1'
+    clear_target()
+    stop_following()
+
+
+def send(action, uid=0):
+    if phBotChat is None:
+        report('Thiếu phBotChat để gửi lệnh AutoKS.')
+        return False
+    try:
+        return phBotChat.Party('!aks %s %d' % (action, uid)) is not False
+    except (OSError, RuntimeError, ValueError) as error:
+        report('Gửi lệnh tổ đội lỗi: %s' % error)
+        return False
+
+
+def on_enable(checked):
+    if not applying and not checked:
+        with lock:
+            if is_leader() and fighting:
+                send('stop')
+            reset()
+
+
+def on_role(checked):
+    if not applying:
+        with lock:
+            if not checked and (selected or fighting):
+                send('clear')
+            reset()
+
+
+def on_leader_pvp(checked):
+    global leader_arm_attempt
+    if not applying and is_leader():
+        with lock:
+            leader_arm_attempt = None
+            if not checked:
+                stop_ghost()
+
+
+def handle_silkroad(opcode, data):
+    global selected, requested, selection_deadline, fighting
+    if not active() or not is_leader():
+        return True
+    if opcode not in (0x7045, 0x7046) or (opcode == 0x7045 and len(data) != 4):
+        return True
+    uid = struct.unpack('<I', data)[0] if opcode == 0x7045 else 0
+    with lock:
+        if uid != selected:
+            if selected or fighting:
+                send('clear')
+                clear_target()
+        requested = uid if allowed_target(uid) else 0
+        selection_deadline = monotonic() + 2.0 if requested else 0.0
+    return True
+
+
+def handle_joymax(opcode, data):
+    global selected, requested, selection_deadline, queued_start
+    if not active() or not data:
+        return True
+    if opcode == 0xB070 and not is_leader() and len(data) >= 19 and data[0] == 1:
+        skill, source = struct.unpack_from('<II', data, 3)
+        uid = struct.unpack_from('<I', data, 15)[0]
+        with lock:
+            if (fighting and not follower_confirmed and engine is not None and not engine.pvp_paused
+                    and source and source == (get_character_data() or {}).get('player_id')
+                    and uid == selected == engine.pvp_target
+                    and skill in engine.direct_skills):
+                set_follower_status('Đã đánh.', confirmed=True)
+                log('[AutoKS] Phụ đã đánh UID %d · B070 skill %d.' % (uid, skill))
+                send('hit', uid)
+        return True
+    if opcode in (0x3015, 0x3016) and len(data) == 4:
+        uid = struct.unpack('<I', data)[0]
+        with lock:
+            if uid and uid in (selected, requested):
+                if is_leader():
+                    send('clear')
+                clear_target()
+                report('UID %d đã biến mất. Đợi Chủ chọn mục tiêu mới.' % uid)
+        return True
+    if opcode != 0xB045 or not is_leader():
+        return True
+    with lock:
+        if not requested or monotonic() > selection_deadline:
+            return True
+        if data[0] != 1:
+            requested = 0
+            queued_start = False
+            report('Game từ chối chọn mục tiêu.')
+        elif len(data) >= 5 and struct.unpack_from('<I', data, 1)[0] == requested:
+            selected, requested = requested, 0
+            selection_deadline = 0.0
+            send('target', selected)
+            report('Đã xác nhận mục tiêu UID %d.' % selected)
+    return True
+
+
+def resume_following(name):
+    global tracing, trace_retry_at
+    trace_retry_at = monotonic() + 2.0
+    if stop_following() and start_trace(name) is not False:
+        tracing = name
+        report('Đang trace Chủ %s.' % name)
+
+
+def block_follower_combat(opcode, data):
+    return (follower_force_follow and active() and not is_leader()
+            and (opcode == 0x7045 or (opcode == 0x7074 and data and data[0] == 1)))
+
+
+def cancel_follower_attack(name):
+    global follower_f4_handled, follower_force_follow, tracing
+    follower_force_follow = True
+    if follower_f4_handled:
+        return
+    follower_f4_handled = True
+    # A basic attack can outlive the Ghost state and its target pointers.
+    clear_target(cancel_action=False)
+    failures = []
+    # Stop the bot's attack source before cancelling the current client action.
+    try:
+        if stop_bot() is False:
+            failures.append('dừng bot chính')
+        else:
+            tracing = ''
+    except (OSError, RuntimeError, ValueError):
+        failures.append('dừng bot chính')
+    for opcode, payload, label in ((0x7074, b'\x02', 'hủy đòn'),
+                                   (0x7046, b'', 'bỏ target')):
+        try:
+            if inject_joymax(opcode, payload, False) is False:
+                failures.append(label)
+        except (OSError, RuntimeError, ValueError):
+            failures.append(label)
+    if failures:
+        report('F4: Ghost đã dừng. phBot chưa nhận: %s.' % ', '.join(failures))
+    else:
+        report('F4: Ghost đã dừng. Đã gửi hủy đòn và bỏ target.')
+    resume_following(name)
+
+
+def handle_chat(chat_type, player, message):
+    global selected, queued_start, fighting, follower_f4_handled
+    if not active() or chat_type not in (PARTY_CHAT, str(PARTY_CHAT)):
+        return
+    words = str(message or '').strip().split()
+    if len(words) != 3 or words[0] != '!aks' or not words[2].isascii() or not words[2].isdigit() or len(words[2]) > 10:
+        return
+    with lock:
+        action, uid = words[1], int(words[2])
+        if is_leader():
+            if action != 'hit' or not fighting or uid != selected or follower_confirmed:
+                return
+            sender = aliases(player)
+            if sender & aliases((get_character_data() or {}).get('name')):
+                return
+            if any(sender & (aliases(member.get('name')) | aliases(member.get('job_name'))
+                             | aliases(member.get('jobName')) | aliases(member.get('job')))
+                   for member in party_members()):
+                set_follower_status('Đã đánh.', confirmed=True)
+                log('[AutoKS] %s đã đánh UID %d · Phụ xác nhận B070.' % (player, uid))
+            return
+        name, names = follow_member()
+        if not (aliases(player) & names):
+            return
+        if action == 'f4':
+            cancel_follower_attack(name)
+        elif action == 'clear':
+            clear_target()
+            report('Chủ đã bỏ mục tiêu. Tiếp tục trace Chủ.')
+        elif action == 'stop':
+            stop_ghost()
+            queued_start = fighting = False
+            set_follower_status('Chưa đánh.')
+            report('Đã nghỉ Ghost. Tiếp tục trace Chủ.')
+        elif action in ('target', 'go') and allowed_target(uid):
+            if action == 'target' and selected == uid:
+                return
+            if action == 'go' and fighting and selected == uid:
+                return
+            follower_f4_handled = False
+            stop_ghost()
+            fighting = False
+            selected = uid
+            queued_start = action == 'go'
+            set_follower_status('Chưa đánh · chờ xác nhận.' if queued_start else 'Chưa đánh.')
+            if not queued_start:
+                report('Đã nhận UID %d từ Chủ. Chờ lệnh đánh.' % uid)
+
+
+def ghost_readiness(ghost, group):
+    if not getattr(ghost, 'hunt_stop', None):
+        return 'vòng Ghost chưa chạy'
+    mode = getattr(ghost, 'pvp_trigger_mode', None)
+    if mode not in ('manual', 'target'):
+        return 'chế độ Ghost hiện tại chưa hỗ trợ (%r)' % mode
+    if not getattr(ghost, 'direct_skills', None) or not getattr(ghost, 'direct_native_exchange', False):
+        return 'Ghost chưa chạy Skill ID nền'
+    if group not in getattr(ghost, 'pvp_allowed_pages', ()):
+        return 'nhóm %s chưa được bật trong Ghost' % group
+    return ''
+
+
+def start_idle_ghost(ghost, group):
+    start = getattr(ghost, 'start_clicked', None)
+    pvp_box = getattr(ghost, 'pvp_box', None)
+    boss_box = getattr(ghost, 'boss_mode_box', None)
+    if (not callable(start) or pvp_box is None or not QtBind.isChecked(ghost.gui, pvp_box)
+            or (boss_box is not None and QtBind.isChecked(ghost.gui, boss_box))
+            or getattr(ghost, 'run_section', 'pvp') != 'pvp'
+            or getattr(ghost, 'numeric_running', False)
+            or getattr(ghost, 'hunt_stop', None)):
+        return ghost_readiness(ghost, group)
+    try:
+        start()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        return 'lỗi khi bật Ghost: %s' % error
+    return ghost_readiness(ghost, group)
+
+
+def arm_leader_pvp(ghost):
+    global leader_arm_attempt
+    if ghost is None or leader_arm_attempt is ghost:
+        return
+    if ghost_auto_pk_running(ghost):
+        return
+    leader_arm_attempt = ghost
+    start = getattr(ghost, 'start_clicked', None)
+    pvp_box = getattr(ghost, 'pvp_box', None)
+    if not getattr(ghost, 'hunt_stop', None):
+        if not callable(start) or pvp_box is None:
+            report('Chủ: AutoGhost thiếu nút bật Ghost PvP.')
+            return
+        try:
+            view = getattr(ghost, 'view_pvp', None)
+            if callable(view):
+                view()
+            for attr in ('boss_mode_box', 'numeric_box'):
+                box = getattr(ghost, attr, None)
+                if box is not None:
+                    QtBind.setChecked(ghost.gui, box, False)
+            QtBind.setChecked(ghost.gui, pvp_box, True)
+            trigger = getattr(ghost, 'trigger_field', None)
+            manual = getattr(ghost, 'TRIGGER_MANUAL', None)
+            if trigger is not None and manual:
+                QtBind.setText(ghost.gui, trigger, manual)
+            start()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+            report('Chủ chưa bật được Ghost PvP: %s.' % error)
+            return
+    with ghost.pvp_lock:
+        groups = getattr(ghost, 'pvp_allowed_pages', ())
+        group = next((name for name in PAGES if name in groups), 'F1')
+        issue = ghost_readiness(ghost, group)
+        if issue:
+            report('Chủ chưa sẵn sàng Ghost PvP: %s.' % issue)
+            return
+        if ghost.pvp_trigger_mode == 'target':
+            ghost.pvp_trigger_mode = 'manual'
+    report('Chủ: Ghost PvP sẵn sàng. Chọn mục tiêu rồi bấm F1, F2 hoặc số 3.')
+
+
+def start_follower():
+    global queued_start, follower_force_follow
+    queued_start = False
+    start_ghost(QtBind.text(gui, page), 'Phụ')
+    if fighting:
+        follower_force_follow = False
+    else:
+        set_follower_status('Chưa đánh.')
+
+
+def ghost_auto_pk_running(ghost):
+    flag = getattr(ghost, 'auto_pk_running', False)
+    if callable(flag):
+        flag = flag()
+    # The Auto PK loop requires a runtime; a stopped instance can retain a flag.
+    runtime = getattr(ghost, 'auto_pk_runtime', flag)
+    return bool(flag and runtime is not None)
+
+
+def start_ghost(group, role):
+    global fighting, engine, engine_previous_mode
+    ghost = find_ghost()
+    if ghost is None:
+        report('Cần nạp AutoGhost trên acc %s.' % role)
+        return
+    hooks = ('auto_pk_players', 'auto_pk_ally_skip_reason', 'pvp_person_target',
+             'request_pvp_page', 'pause_pvp')
+    if not all(callable(getattr(ghost, hook, None)) for hook in hooks):
+        report('AutoGhost thiếu hàm Ghost PvP cần cho AutoKS.')
+        return
+    with ghost.pvp_lock:
+        if ghost_auto_pk_running(ghost):
+            report('Acc %s: AutoGhost %s báo Auto PK đang chạy (%s).'
+                   % (role, getattr(ghost, 'VERSION', '?'), ghost.__name__))
+            return
+        players = ghost.auto_pk_players() or {}
+        player = players.get(selected) or players.get(str(selected))
+        if (not allowed_target(selected) or not ghost.pvp_person_target(selected)
+                or ghost.auto_pk_ally_skip_reason({}, selected, player)):
+            report('UID %d không hợp lệ cho Ghost PvP hoặc là đồng minh.' % selected)
+            return
+    if not stop_following():
+        report('phBot chưa dừng trace. Chờ lệnh đánh tiếp theo.')
+        return
+    issue = start_idle_ghost(ghost, group)
+    if issue:
+        report('%s chưa đánh: %s.' % (role, issue))
+        return
+    with ghost.pvp_lock:
+        issue = ghost_readiness(ghost, group)
+        if issue:
+            report('%s chưa đánh: %s.' % (role, issue))
+            return
+        previous_mode = ghost.pvp_trigger_mode
+        ghost.pvp_trigger_mode = 'manual'
+        if role == 'Chủ':
+            # Ghost also polls these physical keys. Avoid handling a held F key twice.
+            ghost_held = getattr(ghost, 'f_keys_held', None)
+            if isinstance(ghost_held, set):
+                ghost_held.update(p for k, p in ((F1, 'F1'), (F2, 'F2')) if k in held)
+        try:
+            ghost.pvp_selection_request = ghost.direct_select_request = 0
+            ghost.pvp_target = ghost.direct_target = selected
+            ghost.request_pvp_page(group)
+            if ghost.pvp_activation or ghost.pvp_armed:
+                engine = ghost
+                if role == 'Phụ':
+                    fighting = True
+                engine_previous_mode = previous_mode
+        finally:
+            if engine is not ghost:
+                try:
+                    ghost.pause_pvp('Auto KS chưa kích hoạt được Ghost', clear_target=True,
+                                    cancel_action=False, notify=False)
+                finally:
+                    ghost.pvp_trigger_mode = previous_mode
+        if engine is not ghost:
+            report('Ghost PvP chưa kích hoạt được nhóm %s.' % group)
+            return
+    report('%s: đã giao UID %d cho Ghost PvP nhóm %s.' % (role, selected, group))
+
+
+def tick_leader():
+    global held, fighting, f3_presses, leader_group
+    if not user32:
+        return
+    window = (get_client() or {}).get('window')
+    if not window or window != user32.GetForegroundWindow():
+        held.clear()
+        return
+    own_pvp = QtBind.isChecked(gui, leader_pvp)
+    keys = (F1, F2, F3, F4, NUMBER_3) if own_pvp else (F3, F4)
+    flags = {key: user32.GetAsyncKeyState(key) for key in keys}
+    down = {key for key in keys if flags[key] & 0x8000}
+    fresh = (down | {key for key in keys if flags[key] & 1}) - held
+    held = down
+    if not fresh or any(user32.GetAsyncKeyState(key) & 0x8000 for key in (0x10, 0x11, 0x12)):
+        return
+    if F4 in fresh:
+        sent = send('f4')
+        clear_target()
+        report('F4: đã dừng và gửi lệnh bỏ khóa cho Phụ.' if sent
+               else 'F4: đã dừng trên Chủ, gửi lệnh bỏ khóa cho Phụ thất bại.')
+        return
+    if len(fresh) != 1:
+        return
+    key = next(iter(fresh))
+    if key == F3:
+        f3_presses += 1
+        prefix = 'Đã bấm F3 - %d lần. ' % f3_presses
+        if not allowed_target(selected):
+            report(prefix + 'Chọn mục tiêu và đợi game xác nhận trước khi ra lệnh.')
+        elif send('go', selected):
+            if not fighting:
+                set_follower_status('Chưa đánh · chờ xác nhận.')
+            fighting = True
+            report(prefix + 'Đã gửi lệnh đánh UID %d cho Phụ.' % selected)
+        else:
+            report(prefix + 'Gửi lệnh đánh cho Phụ thất bại.')
+        return
+
+    if not allowed_target(selected):
+        report('Chủ: chọn mục tiêu và đợi game xác nhận trước khi đánh.')
+        return
+    if key in LEADER_PAGES and engine is not None:
+        same_group = LEADER_PAGES[key] == leader_group
+        stop_ghost()
+        if same_group:
+            report('%s: đã tạm dừng Ghost trên Chủ.' % leader_group)
+            return
+    elif engine is not None:
+        return
+    ghost = find_ghost()
+    arm_leader_pvp(ghost)
+    groups = getattr(ghost, 'pvp_allowed_pages', ())
+    if key in LEADER_PAGES:
+        leader_group = LEADER_PAGES[key]
+    elif leader_group not in groups:
+        leader_group = next((name for name in ('F1', 'F2') if name in groups), 'F1')
+    start_ghost(leader_group, 'Chủ')
+
+
+def event_loop():
+    global requested, queued_start, tracing, trace_retry_at
+    with lock:
+        key = character_key()
+        if key != owner:
+            load(key)
+        if not active() or key is None:
+            return
+        now = monotonic()
+        if requested and now >= selection_deadline:
+            report('Hết chờ xác nhận mục tiêu UID %d.' % requested)
+            requested = 0
+            queued_start = False
+        if is_leader():
+            ghost = find_ghost()
+            reserve_ghost_f3(ghost)
+            if QtBind.isChecked(gui, leader_pvp) and not (get_character_data() or {}).get('dead'):
+                arm_leader_pvp(ghost)
+            if not party_members() or (get_character_data() or {}).get('dead'):
+                if selected or requested or fighting:
+                    send('clear')
+                    clear_target()
+                return
+            if engine is not None:
+                with engine.pvp_lock:
+                    if engine.pvp_paused or engine.pvp_target != selected:
+                        stop_ghost()
+            tick_leader()
+            return
+        name, _ = follow_member()
+        if not name or (get_character_data() or {}).get('dead'):
+            reset()
+            return
+        if queued_start and selected:
+            start_follower()
+        if fighting and engine is not None:
+            with engine.pvp_lock:
+                if (engine.pvp_paused or engine.pvp_target != selected
+                        or not (engine.pvp_armed or engine.pvp_activation)):
+                    # Release the UID so the next GO starts a fresh Ghost session.
+                    clear_target()
+                    report('Ghost đã nhả mục tiêu. Tiếp tục trace Chủ.')
+        if not fighting and not queued_start and tracing != name and now >= trace_retry_at:
+            resume_following(name)
+
+
+def joined_game():
+    with lock:
+        load(character_key())
+
+
+def disconnected():
+    with lock:
+        reset()
+
+
+def finished():
+    with lock:
+        reset()
+
+
+log('[AutoKS] Đã nạp ' + VERSION)
+'''
+_autoks = {'__name__': __name__ + '.autoks', 'QtBind': _AutoKSQt(),
+           'embedded_ghost': _AutoKSGhost(),
+           'combat_mode_selected': lambda: _combat_tab == 'ks'}
+exec(compile(_autoks_source, __file__ + ':AutoKS', 'exec'), _autoks)
+del _autoks_source
+for _autoks_name in ('on_enable', 'on_role', 'on_leader_pvp', 'save'):
+    globals()['_autoks_' + _autoks_name] = _autoks[_autoks_name]
+del _autoks_name
+
+_ghost_event_loop = event_loop
+_ghost_handle_joymax = handle_joymax
+_ghost_handle_silkroad = handle_silkroad
+_ghost_disconnected = disconnected
+_ghost_teleported = teleported
+_ghost_finished = finished
+
+
+def event_loop():
+    _autoks['event_loop']()
+    if _ui_current_view == 'auto_pk':
+        refresh_auto_pk_nearby()
+    return _ghost_event_loop()
+
+
+def handle_joymax(opcode, data):
+    result = _ghost_handle_joymax(opcode, data)
+    _autoks['handle_joymax'](opcode, data)
+    return result
+
+
+def handle_silkroad(opcode, data):
+    if _autoks['block_follower_combat'](opcode, data):
+        return False
+    # Outer belt: same Auto PK đánh thường drop as base silkroad (AOS-44).
+    if _should_block_auto_pk_basic_attack(opcode, data):
+        return False
+    result = _ghost_handle_silkroad(opcode, data)
+    if result is not False:
+        _autoks['handle_silkroad'](opcode, data)
+    return result
+
+
+def handle_chat(chat_type, player, message):
+    _autoks['handle_chat'](chat_type, player, message)
+
+
+def joined_game():
+    _autoks['joined_game']()
+
+
+def teleported():
+    try:
+        _autoks['disconnected']()
+    finally:
+        _ghost_teleported()
+
+
+def disconnected():
+    try:
+        _autoks['disconnected']()
+    finally:
+        _ghost_disconnected()
+
+
+def finished():
+    try:
+        _autoks['finished']()
+    finally:
+        _ghost_finished()
+
+# Only one mode owns the shared Ghost engine at a time.
+_tab_switches = {'pvp': _pvp_tab_switch, 'ks': _ks_tab_switch, 'pk': _pk_tab_switch}
+_combat_tab = None
+_base_pvp_changed = pvp_changed
+_base_boss_mode_changed = boss_mode_changed
+_base_numeric_mode_changed = numeric_mode_changed
+
+
+def _stop_combat_tab(tab):
+    global _combat_tab
+    _combat_tab = None
+    set_checked_silent(_tab_switches[tab], False)
+    if tab == 'pk':
+        stop_auto_pk()
+        return
+    if tab == 'ks':
+        set_checked_silent(_autoks['enabled'], False)
+        _autoks['on_enable'](False)
+    stop_clicked()
+
+
+def _switch_combat_tab(tab, checked):
+    global _combat_tab
+    if ui_sync:
+        return
+    if not checked:
+        if _combat_tab == tab:
+            _stop_combat_tab(tab)
+        return
+    if _combat_tab == tab:
+        return
+    if _combat_tab is not None:
+        _stop_combat_tab(_combat_tab)
+    _combat_tab = tab
+    set_checked_silent(_tab_switches[tab], True)
+    if tab == 'pvp':
+        start_selected_pvp()
+    elif tab == 'pk':
+        start_tab_auto_pk()
+    else:
+        set_checked_silent(_autoks['enabled'], True)
+        view_auto_ks()
+
+
+def _pvp_tab_changed(checked):
+    _switch_combat_tab('pvp', checked)
+
+
+def _ks_tab_changed(checked):
+    _switch_combat_tab('ks', checked)
+
+
+def _pk_tab_changed(checked):
+    _switch_combat_tab('pk', checked)
+
+
+def start_selected_pvp():
+    if _combat_tab != 'pvp':
+        _switch_combat_tab('pvp', True)
+        return
+    view_pvp()
+    if not (QtBind.isChecked(gui, boss_mode_box) or QtBind.isChecked(gui, numeric_box)):
+        set_checked_silent(pvp_box, True)
+    start_clicked()
+    if not (hunt_stop or numeric_running or boss_plan or boss_running()):
+        _stop_combat_tab('pvp')
+
+
+def stop_selected_pvp():
+    _switch_combat_tab('pvp', False)
+    set_checked_silent(_pvp_tab_switch, False)
+
+
+def start_tab_auto_pk():
+    if _combat_tab != 'pk':
+        report_error('Tích ô cạnh tab Auto PK để chạy.')
+        return
+    view_auto_pk()
+    if not auto_pk_running:
+        request_auto_pk_arm()
+    if not auto_pk_running:
+        reset_auto_pk_switch()
+
+
+def stop_tab_auto_pk():
+    _switch_combat_tab('pk', False)
+    set_checked_silent(_pk_tab_switch, False)
+
+
+def _autoks_on_enable(checked):
+    if not _autoks['applying']:
+        _switch_combat_tab('ks', checked)
+
+
+def pvp_changed(checked):
+    if _combat_tab == 'pvp':
+        _base_pvp_changed(checked)
+
+
+def boss_mode_changed(checked):
+    if _combat_tab == 'pvp':
+        _base_boss_mode_changed(checked)
+
+
+def numeric_mode_changed(checked):
+    if _combat_tab == 'pvp':
+        _base_numeric_mode_changed(checked)
+
+
+for _tab_box in _tab_switches.values():
+    set_checked_silent(_tab_box, False)
+del _tab_box
+
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s · Auto PK: Target chọn; đánh chữ đỏ/tím hoặc khăn · không ALT.' % (NAME, VERSION))
+log('[%s] Đã nạp thành công v%s [Sửa tầm áp sát khi chưa có nhóm · nối skill khi thiếu B074 · lọc đánh thường Auto PK].' % (NAME, VERSION))
