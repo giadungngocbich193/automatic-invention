@@ -2,6 +2,12 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.13: AOS-55 — lock mid-cut to GhostCutProbe A/B winner: after 7074+cfg_ms
+  (~100), NativeCut **client_7081 → monster/boss UID ×2** (+15ms hiep). Self
+  7081 flaky (MID-CUT then CAST-REFUSED); 7074\\x02 / move / ESC / sit = no real
+  mid-cut — not used. Solo monster/boss only; never player neighbor; never
+  inject_joymax(0x7081) when Stable refuses. Skill field prefill =
+  `80031=1;66007=50;54016=1;81019=50;7678=1;81016=7;7653=50` (=5→50).
 - v1.0.12: Ghost loop — cast → mid-cut at **7074+cfg_ms** (~100) → next skill.
   Cut UID = **Self OR Monster/Boss only** (never player / never trade).
   Modes: Monster 7081 (SroPlus, default) | Self. Optional arm(2)×2 ~15ms (hiep).
@@ -90,10 +96,12 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.12'
-# ~120ms cast → 7074+~100ms NativeCut at monster UID (SroPlus/hiep). Solo, no trade.
+VERSION = '1.0.13'
+# Locked A/B path: cast → cfg_ms NativeCut 7081@monster ×2 (hiep).
+# Solo monster/boss only — no self primary, no player neighbor, no inject 7081.
+# User Skill IDs default (=5→50 if cut too fast; keep =1/=7) — open → Start.
 SKILL_FIELD_EXAMPLE = (
-    '80031=100;66007=100;54016=100;81019=100;7678=100;81016=100;7653=100')
+    '80031=1;66007=50;54016=1;81019=50;7678=1;81016=7;7653=50')
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
 CLIENT_SHA256 = {
@@ -126,7 +134,8 @@ THUNK = bytes.fromhex(
 )
 
 MODE_MONSTER = 'Monster/Boss 7081'
-MODE_SELF = 'Self'
+# Self kept in combo for layout only — A/B locked farm cut to monster UID (AOS-55).
+MODE_SELF = 'Self (A/B fail)'
 MODE_LABELS = (MODE_MONSTER, MODE_SELF)
 
 DEFAULT_RADIUS = 50.0
@@ -215,8 +224,8 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 236)
 
 QtBind.createLabel(
     gui,
-    'v1.0.12: cast→mid-cut 7074+~100ms→next. Cut=Self|Monster/Boss ONLY '
-    '(no player). FULL-CAST FAIL vs OK MID-CUT.',
+    'v1.0.13: locked mid-cut = NativeCut 7081@monster ×2 @7074+~100ms '
+    '(A/B). Solo boss only — no Self/player/inject.',
     10, 268,
 )
 
@@ -618,6 +627,9 @@ def farming_active():
 
 def current_mode():
     text = (QtBind.text(gui, mode_combo) or '').strip()
+    # Legacy "Self" label → A/B-fail label; farm cut always monster (AOS-55).
+    if text in ('Self', MODE_SELF):
+        text = MODE_SELF
     if text not in MODE_LABELS:
         text = MODE_MONSTER
         QtBind.setText(gui, mode_combo, text)
@@ -935,9 +947,10 @@ def _pick_monster_row(rows):
 
 
 def resolve_cut_uid(job, self_uid=None):
-    """Ghost cut UID = Self OR Monster/Boss only. Never a player.
+    """Ghost cut UID = current monster/boss only (AOS-55 locked A/B path).
 
-    Mode Self → own UID. Mode Monster/Boss → select/monster UID (boss/mob).
+    Never self primary, never a player, never neighbor trade. Self combo
+    selection is ignored for the 7081 UID — still cuts monster/boss.
     """
     if self_uid is None:
         self_uid = read_self_uid()
@@ -946,8 +959,6 @@ def resolve_cut_uid(job, self_uid=None):
     except (TypeError, ValueError):
         self_uid = 0
     mode = (job or {}).get('mode') or current_mode()
-    kind = (job or {}).get('cut_target_kind') or (
-        'self' if mode == MODE_SELF else 'monster')
     monster_uid = 0
     try:
         monster_uid = int(
@@ -956,13 +967,13 @@ def resolve_cut_uid(job, self_uid=None):
             or 0)
     except (TypeError, ValueError):
         monster_uid = 0
-    if kind == 'self' or mode == MODE_SELF:
-        if not 0 < self_uid <= 0xffffffff:
-            raise ValueError('Self UID trống — Ghost chỉ Self|Monster/Boss.')
-        return self_uid, 'self'
+    if mode == MODE_SELF or (job or {}).get('cut_target_kind') == 'self':
+        _log(
+            'CUT PATH LOCK · Self mode ignored — A/B winner is '
+            '7081@monster ×2 (NativeCut client_7081)')
     if not 0 < monster_uid <= 0xffffffff:
         raise ValueError(
-            'Monster/Boss UID trống — Ghost chỉ Self|Monster/Boss (không player).')
+            'Monster/Boss UID trống — farm Ghost chỉ 7081@monster/boss.')
     if self_uid and monster_uid == self_uid:
         raise ValueError('Monster/Boss UID trùng Self — từ chối cut player-like.')
     return monster_uid, 'monster'
@@ -971,8 +982,8 @@ def resolve_cut_uid(job, self_uid=None):
 def pick_farm_job(rows):
     """Build farm job only when a living monster/NPC/boss is in range.
 
-    EVERY cycle: 7045(monster/boss) → 7074(skill) → NativeCut 7081@Self|Monster.
-    Never cut a player UID. Never trade/neighbor.
+    EVERY cycle: 7045(monster/boss) → 7074(skill) → NativeCut 7081@monster ×2.
+    Never cut self/player. Never trade/neighbor. Never inject 7081.
     """
     if not rows:
         return None
@@ -987,8 +998,8 @@ def pick_farm_job(rows):
         return None
     mode = current_mode()
     monster_uid = int(monster['uid'])
-    cut_kind = 'self' if mode == MODE_SELF else 'monster'
-    cut_uid = self_uid if cut_kind == 'self' else monster_uid
+    cut_kind = 'monster'
+    cut_uid = monster_uid
     return {
         'ghost_uid': cut_uid,
         'select_uid': monster_uid,
@@ -1118,9 +1129,9 @@ def btn_start():
         % (self_uid, 'OK' if prewarm_ok else 'PENDING/FAIL', ag))
     _log(
         'START farm · skills=%s · self=%d · interrupt=NativeCut client_7081 '
-        'cut_uid=Self|Monster/Boss ONLY (NOT player, NOT inject, NOT trade) · '
+        'cut_uid=monster/boss ×2 ONLY (A/B lock; NOT self/player/inject/trade) · '
         'cut_anchor=7074+cut_cfg ms · expect: CAST → arm(2) since_7074≈cfg → '
-        '7081 → B074 02 00 = OK MID-CUT · natural B074 before arm = FULL-CAST FAIL · '
+        '7081×2 → B074 02 00 = OK MID-CUT · natural B074 before arm = FULL-CAST FAIL · '
         'tắt Training; unload AG Ghost nếu móc conflict.%s'
         % (preview, self_uid, ag))
     if low:
@@ -1149,7 +1160,7 @@ def _pack_uid(uid):
 
 
 def queue_native(farm_job):
-    """Queue combat: 7045(monster/boss) → 7074 → NativeCut@Self|Monster. No player cut."""
+    """Queue combat: 7045(monster/boss) → 7074 → NativeCut 7081@monster ×2."""
     if not isinstance(farm_job, dict):
         set_status('Job farm không hợp lệ.')
         return False
@@ -1169,11 +1180,9 @@ def queue_native(farm_job):
     if delay_ms < 0:
         delay_ms = DEFAULT_GHOST_DELAY_MS
     mode = farm_job.get('mode') or current_mode()
-    cut_kind = farm_job.get('cut_target_kind') or (
-        'self' if mode == MODE_SELF else 'monster')
     draft = {
         'mode': mode,
-        'cut_target_kind': cut_kind,
+        'cut_target_kind': 'monster',
         'monster_uid': select_uid,
         'select_uid': select_uid,
     }
@@ -1185,7 +1194,7 @@ def queue_native(farm_job):
     label = _safe_text(farm_job.get('label') or 'monster')
     entity_kind = _safe_text(farm_job.get('kind') or '?')
     job = {
-        'uid': cut_uid,  # NativeCut / 7081 = Self OR Monster/Boss only
+        'uid': cut_uid,  # NativeCut / 7081 = monster/boss UID only (AOS-55)
         'cut_uid': cut_uid,
         'cut_target_kind': cut_kind,
         'select_uid': select_uid,
@@ -1314,7 +1323,7 @@ def _retarget_bridge(session, uid):
 
 
 def _fire_native_cut(job, uid, now=None, reason='cut'):
-    """NativeCut arm(2) at Self OR Monster/Boss UID only — never player / never inject."""
+    """NativeCut arm(2) ×2 at monster/boss UID — never self/player/inject."""
     now = monotonic() if now is None else now
     with lock:
         active = state.get('active')
@@ -1338,7 +1347,7 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
             return False
         job['phase'] = 'cut_now'
     try:
-        # Hard rule: cut UID = Self | Monster/Boss only (user: no players).
+        # Locked A/B: cut UID = living monster/boss only (Probe Cut Monster hiep×2).
         cut_uid, kind = resolve_cut_uid(job)
         job['cut_uid'] = cut_uid
         job['cut_target_kind'] = kind
@@ -1383,12 +1392,12 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
         anchor = job.get('cut_anchor') or '7074'
         _log(
             'NativeCut arm(2) MID-CUT · 7081@%s=%d · transport=client_7081 · '
-            'Self|Monster/Boss ONLY · NOT player/inject/trade · reason=%s · '
+            'monster×2 LOCKED · NOT self/player/inject/trade · reason=%s · '
             'skill=%d · cut_cfg=%dms · since_7074=%dms · since_B070=%dms · hex=%s'
             % (kind, cut_uid, reason, int(job.get('skill_id') or 0), delay_ms,
                since_7074, since_b070, job.get('hex') or '?'))
         set_status(
-            'MID-CUT 7081@%s=%d · cut_cfg=%dms · since_7074=%dms · skill=%d'
+            'MID-CUT 7081@%s=%d ×2 · cut_cfg=%dms · since_7074=%dms · skill=%d'
             % (kind, cut_uid, delay_ms, since_7074, int(job.get('skill_id') or 0)))
 
         # hiep often double-fires 7081 ~0–20ms apart on same monster UID.
@@ -1420,7 +1429,7 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
             state['last_nativcut_error'] = '%s: %s' % (type(error).__name__, error)
         _log_traceback('CUT TRACE', error)
         set_status(
-            'GHOST FAIL arm(2) · %s — NativeCut Self|Monster/Boss (Windows). '
+            'GHOST FAIL arm(2) · %s — NativeCut 7081@monster ×2 (Windows). '
             'Unload AutoGhost Ghost nếu conflict.'
             % error)
         return False
@@ -1433,7 +1442,7 @@ def _schedule_ag_cut_timer(job, uid, delay_ms, anchor='7074'):
     try:
         cut_uid, cut_kind = resolve_cut_uid(job)
     except ValueError:
-        cut_uid, cut_kind = int(uid), job.get('cut_target_kind') or 'self'
+        cut_uid, cut_kind = int(uid), job.get('cut_target_kind') or 'monster'
     job['cut_uid'] = int(cut_uid)
     job['cut_target_kind'] = cut_kind
     job['uid'] = int(cut_uid)
@@ -1573,7 +1582,7 @@ def _advance_or_finish(job, ok_shot):
             state['ghost_ok_count'] = int(state.get('ghost_ok_count') or 0) + 1
             state['last_ghost_fail'] = ''
         set_stats()
-        cut_kind = job.get('cut_target_kind') or 'self'
+        cut_kind = job.get('cut_target_kind') or 'monster'
         cut_uid = int(job.get('cut_uid') or job.get('uid') or 0)
         _finish_job(
             job,
@@ -1582,7 +1591,7 @@ def _advance_or_finish(job, ok_shot):
             ok=True)
         _log(
             'OK MID-CUT · cut_cfg=%dms · since_7074=%dms · skill=%d · '
-            '7081@%s=%d · Self|Monster/Boss ONLY (NOT player/trade)'
+            '7081@%s=%d ×2 · monster ONLY (NOT self/player/trade/inject)'
             % (cfg, since_7074, int(job.get('skill_id') or 0), cut_kind, cut_uid))
         return
 
@@ -1745,7 +1754,7 @@ def _drive_native_queue(now):
             job['b070_seen'] = False
             job['b070_at'] = 0.0
             job['natural_end_before_cut'] = False
-            # Farm mid-cut: cfg ms from 7074. Cut UID = Self|Monster/Boss only.
+            # Farm mid-cut: cfg ms from 7074. Cut UID = monster/boss ×2 only.
             try:
                 cut_uid, cut_kind = resolve_cut_uid(job)
             except ValueError as error:
@@ -2031,7 +2040,7 @@ def handle_joymax(opcode, data):
     """B070 = cast confirm (log). Mid-cut already scheduled from 7074+cfg.
 
     B074 before arm(2) = FULL-CAST FAIL. B074 after arm(2)+7081 = OK MID-CUT.
-    Cut UID = Self|Monster/Boss only — never player / trade.
+    Cut UID = monster/boss only — never self/player/trade/inject.
     """
     if not plugin_enabled():
         return
@@ -2129,8 +2138,8 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — cast→mid-cut 7074+~100ms @Self|Monster/Boss ONLY. '
-        'OK MID-CUT vs FULL-CAST FAIL. Không cut player.'
+        'Nạp %s v%s — mid-cut NativeCut 7081@monster ×2 · '
+        'F1 80031=1;66007=50;… OK MID-CUT vs FULL-CAST FAIL.'
         % (NAME, VERSION))
 except Exception as error:
     try:
