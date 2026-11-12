@@ -6369,11 +6369,23 @@ def tick_skill_finder_live():
     search_skill_finder()
 
 
+_finder_list_sig = None
+
+
 def show_skill_finder():
-    """Rebuild the scrollable list — all matches, no 6-row pager."""
-    global finder_visible_ids
+    """Rebuild the scrollable list — all matches, no 6-row pager.
+
+    Skip clear/append when the visible ID set is unchanged (avoids UI hitch
+    while typing filters that still match the same rows).
+    """
+    global finder_visible_ids, _finder_list_sig
+    ids = [row['id'] for row in finder_matches]
+    sig = tuple(ids)
+    if sig == _finder_list_sig and finder_visible_ids == ids:
+        return
+    _finder_list_sig = sig
+    finder_visible_ids = ids
     QtBind.clear(gui, finder_list)
-    finder_visible_ids = [row['id'] for row in finder_matches]
     for row in finder_matches:
         QtBind.append(gui, finder_list, _finder_format_row(row))
 
