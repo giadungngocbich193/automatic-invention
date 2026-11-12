@@ -67,6 +67,6 @@ FULL-CAST FAIL · natural B074 BEFORE mid-cut · cut_cfg=… · since_7074=…
 
 ## jsDelivr
 
-After push, pin commit SHA:
+https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@49a46c6db3fb19d466e9ca5cddc804bf10308775/GhostFarm.py
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@<commit>/GhostFarm.py`
+Raw: https://github.com/giadungngocbich193/automatic-invention/raw/49a46c6db3fb19d466e9ca5cddc804bf10308775/GhostFarm.py
