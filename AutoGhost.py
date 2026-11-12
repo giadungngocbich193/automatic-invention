@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX AOS-44] Auto PK: chặn mọi 7074 đánh thường (01 01 01) khi đang armed —
+  không cần khớp UID / natural set (F2 cung hết xen đánh thường).
 - [UI AOS-43] Tìm Skill: bảng 1 hàng trống mặc định; gõ ID → chỉ hiện skill đó;
   Copy / Thêm F1–F3 (Auto PK hoặc PvP). Không dump list. Tab khác nguyên.
 - [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); không đổi Auto PK/PvP.
@@ -7086,6 +7088,33 @@ def trace_manual_packet(outgoing, opcode, data):
             finish_trace()
 
 
+def _is_client_basic_attack_7074(data):
+    raw = bytes(data or b'')
+    return len(raw) == 7 and raw[:3] == b'\x01\x01\x01'
+
+
+def _should_block_auto_pk_basic_attack(opcode, data):
+    """Drop client đánh thường while Auto PK Ghost is fighting.
+
+    Prior gate required runtime_natural_skills + exact pvp_target UID match.
+    F2 bow clients often fire 01 01 01 during retarget / before arm settles /
+    between no-cut skills — those packets slipped through. Block whenever Auto
+    PK is armed (or mid natural cast / already locked on a fight target).
+    """
+    if opcode != 0x7074 or not auto_pk_running or pvp_paused:
+        return False
+    if not _is_client_basic_attack_7074(data):
+        return False
+    # natural_cast is assigned later in this module; resolve at call time.
+    if globals().get('natural_cast') is not None:
+        return True
+    if pvp_armed:
+        return True
+    if pvp_target or direct_target:
+        return True
+    return False
+
+
 def handle_silkroad(opcode, data):
     # All globals first — never use a name above its global (SyntaxError on load).
     global pvp_target, pvp_resume_page
@@ -7097,11 +7126,10 @@ def handle_silkroad(opcode, data):
     if (auto_pk_running and (auto_pk_runtime or {}).get('party_hold_fight')
             and opcode == 0x7074 and data and data[0] == 1):
         return False
-    # No-cut chain: block client basic attack so it cannot wedge mid-cast.
-    if (auto_pk_running and pvp_armed and not pvp_paused and runtime_natural_skills
-            and pvp_target and opcode == 0x7074 and len(data or b'') == 7
-            and data[:3] == b'\x01\x01\x01'
-            and struct.unpack_from('<I', data, 3)[0] == pvp_target):
+    # Auto PK skill chain (F1/F2/F3): drop client đánh thường so it cannot
+    # wedge before/between Ghost skills. Do not require natural-set or UID match —
+    # bow clients often race retarget / fire 01 01 01 while no-cut or cut skills run.
+    if _should_block_auto_pk_basic_attack(opcode, data):
         return False
     if auto_pk_running and opcode == 0x7045:
         with pvp_lock:
@@ -10932,6 +10960,9 @@ def handle_joymax(opcode, data):
 
 def handle_silkroad(opcode, data):
     if _autoks['block_follower_combat'](opcode, data):
+        return False
+    # Outer belt: same Auto PK đánh thường drop as base silkroad (AOS-44).
+    if _should_block_auto_pk_basic_attack(opcode, data):
         return False
     result = _ghost_handle_silkroad(opcode, data)
     if result is not False:
