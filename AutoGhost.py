@@ -2,7 +2,10 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 12 m;
+- [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); Tìm Skill: gõ ID số
+  hiện tên ngay + lọc prefix; không đổi layout Auto PK/PvP.
+- [AOS-41 F2] Auto PK áp sát F2 = 15 m (F1 vẫn 6 m); camp/attack vẫn 40 m.
+- [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 15 m;
   meter bow target=0 + n/a; Tên/hit LineEdit cùng tọa độ cột (hết clip).
 - [UI ghep-2.6] Auto PK full tab: skill buff inline + ID số → tên ngay + 1 dòng copy ID;
   ẩn □ AutoKS (session = Bật Auto KS). Đo ngắt: bảng F1 nhiều skill (B070→hit → cut ms).
@@ -96,9 +99,9 @@ AUTO_PK_RETURN_STEP = 8.0
 AUTO_PK_MAX_RADIUS = 40
 AUTO_PK_REPORT_RADIUS = 60
 # Approach = character→enemy. Camp/attack radius stays AUTO_PK_MAX_RADIUS from anchor.
-# F1 đại đao 6 m; F2 cung 12 m; F3 default 6 m.
+# F1 đại đao 6 m; F2 cung 15 m (independent); F3 default 6 m.
 AUTO_PK_APPROACH_RANGE = 6.0
-AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 12.0, 'F3': 6.0}
+AUTO_PK_APPROACH_BY_PAGE = {'F1': 6.0, 'F2': 15.0, 'F3': 6.0}
 AUTO_PK_APPROACH_MOVE_INTERVAL = 0.35
 AUTO_PK_APPROACH_STALL_TIMEOUT = 1.5
 AUTO_PK_TARGET_COORD_GRACE = 0.25
@@ -213,6 +216,8 @@ def show_view(view):
         QtBind.move(gui,handle,-10000 if view in ('tools','auto_pk','auto_pk_options','auto_pk_buffs','auto_pk_advanced','auto_ks','presets','boss','meter') else x,y)
     if view == 'meter' and 'refresh_damage_meter_f1_table' in globals():
         refresh_damage_meter_f1_table()
+    if view == 'tools' and 'refresh_skill_finder' in globals():
+        refresh_skill_finder()
 
 def view_pvp():
     show_view('pvp')
@@ -352,40 +357,44 @@ probe_draft_field = widget('hidden', 'createLineEdit', '', 10, 216, 580, 20)
 # The old probe widgets remain hidden compatibility storage. The visible finder
 # only reads learned skills and the clipboard; it never edits combat settings.
 widget('tools','createLabel','Tìm tên / ID',10,36)
-finder_query_field=widget('tools','createLineEdit','',100,32,340,22)
-widget('tools','createButton','search_skill_finder','Tìm',450,31)
-widget('tools','createButton','refresh_skill_finder','Quét lại',510,31)
-widget('tools','createButton','clear_skill_finder','Xóa lọc',590,31)
-finder_status_label=widget('tools','createLabel','Tìm theo tên không dấu hoặc ID. Copy ID ngay tại bảng.',10,64)
-widget('tools','createLabel','ID skill',10,87)
-widget('tools','createLabel','Tên skill',110,87)
-widget('tools','createLabel','Cấp',540,87)
+finder_query_field=widget('tools','createLineEdit','',100,32,300,22)
+widget('tools','createButton','search_skill_finder','Tìm',410,31)
+widget('tools','createButton','refresh_skill_finder','Quét lại',470,31)
+widget('tools','createButton','clear_skill_finder','Xóa',555,31)
+finder_id_preview=widget('tools','createLabel','Gõ ID số → hiện tên ngay (lọc tự chạy).',10,58)
+finder_status_label=widget('tools','createLabel','Tìm theo tên không dấu hoặc chuỗi số ID. Copy ID tại bảng.',10,78)
+widget('tools','createLabel','#',10,100)
+widget('tools','createLabel','ID skill',28,100)
+widget('tools','createLabel','Tên skill',115,100)
+widget('tools','createLabel','Cấp',520,100)
 finder_row_fields=[]
 for index in range(6):
-    y=107+index*23
-    uid=widget('tools','createLineEdit','',10,y,85,21)
-    name=widget('tools','createLineEdit','',105,y,425,21)
-    level=widget('tools','createLineEdit','',540,y,42,21)
+    y=120+index*22
+    widget('tools','createLabel',str(index+1),10,y+2)
+    uid=widget('tools','createLineEdit','',28,y,78,20)
+    name=widget('tools','createLineEdit','',115,y,390,20)
+    level=widget('tools','createLineEdit','',520,y,42,20)
     callback='copy_finder_id_'+str(index)
     globals()[callback]=lambda index=index:copy_finder_id(index)
-    widget('tools','createButton',callback,'Copy ID',595,y-1)
+    widget('tools','createButton',callback,'Copy',575,y-1)
     finder_row_fields.append((uid,name,level))
-widget('tools','createButton','finder_previous','Trước',10,247)
-finder_page_label=widget('tools','createLabel','0 kết quả',110,251)
-widget('tools','createButton','finder_next','Sau',350,247)
-widget('tools','createLabel','Có thể Ctrl+A / Ctrl+C trực tiếp trong ô ID.',440,251)
+widget('tools','createButton','finder_previous','◀ Trước',10,258)
+finder_page_label=widget('tools','createLabel','0 kết quả',110,262)
+widget('tools','createButton','finder_next','Sau ▶',280,258)
+widget('tools','createLabel','Ctrl+A / Ctrl+C trong ô ID · gõ số = ưu tiên khớp ID.',390,262)
 finder_owner=None
 finder_skills=[]
 finder_matches=[]
 finder_offset=0
 finder_visible_ids=[]
-widget('tools','createButton','start_hotbar_finder','Dò ô số',10,273)
-widget('tools','createButton','stop_hotbar_finder','Dừng dò',105,273)
-hotbar_slot_label=widget('tools','createLabel','Ô: —',185,277)
-hotbar_id_field=widget('tools','createLineEdit','',240,273,90,22)
-hotbar_name_field=widget('tools','createLineEdit','',340,273,245,22)
-widget('tools','createButton','copy_hotbar_id','Copy ID',595,272)
-hotbar_status_label=widget('tools','createLabel','Bấm Dò ô số → sang game bấm skill → quay lại copy ID.',10,299)
+_finder_live_query=None
+widget('tools','createButton','start_hotbar_finder','Dò ô số',10,286)
+widget('tools','createButton','stop_hotbar_finder','Dừng dò',105,286)
+hotbar_slot_label=widget('tools','createLabel','Ô: —',185,290)
+hotbar_id_field=widget('tools','createLineEdit','',240,286,90,22)
+hotbar_name_field=widget('tools','createLineEdit','',340,286,230,22)
+widget('tools','createButton','copy_hotbar_id','Copy ID',580,285)
+hotbar_status_label=widget('tools','createLabel','Bấm Dò ô số → sang game bấm skill → quay lại copy ID.',10,312)
 hotbar_found=None
 
 # Auto PK main tab: camp controls above its independent Ghost editor.
@@ -4607,7 +4616,7 @@ def auto_pk_target_unavailable(runtime, uid, target, now):
 
 
 def auto_pk_approach_range(runtime=None):
-    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 12 m)."""
+    """Character→enemy cast distance by Ghost page (F1 dao 6 m / F2 bow 15 m)."""
     page = None
     if isinstance(runtime, dict):
         page = runtime.get('page')
@@ -4661,7 +4670,7 @@ def auto_pk_ready_to_cast(runtime, uid, now):
         return False
     if now >= approach['move_at']:
         approach['move_at'] = now + AUTO_PK_APPROACH_MOVE_INTERVAL
-        # Stop at page approach range (F2 12 m) — never pull bow into ~4 m melee.
+        # Stop at page approach range (F2 15 m) — never pull bow into ~4 m melee.
         stop_at = max(1.0, approach_range - 0.5)
         fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
         z = float(position.get('z', anchor['z']))
@@ -6234,9 +6243,10 @@ def normalize_finder_text(text):
 
 
 def refresh_skill_finder():
-    global finder_owner,finder_skills
+    global finder_owner,finder_skills,_finder_live_query
     finder_owner=owner_of(get_character_data() or {})
     finder_skills=[]
+    _finder_live_query=None
     if finder_owner is not None:
         for uid,skill in (get_skills() or {}).items():
             try:uid=int(uid)
@@ -6249,20 +6259,79 @@ def refresh_skill_finder():
     search_skill_finder()
 
 
+def _finder_id_preview_text(raw_query):
+    """Live line: digits → resolve name on this account (buff-name pattern)."""
+    text = (raw_query or '').strip()
+    if not text:
+        return 'Gõ ID số → hiện tên ngay (lọc tự chạy).'
+    if not text.isdigit():
+        return 'Lọc tên / không dấu: «%s» · hoặc chỉ gõ số để tra ID.' % text[:40]
+    try:
+        uid = int(text)
+    except ValueError:
+        return 'ID không hợp lệ.'
+    if not (0 < uid <= 0xffffffff):
+        return 'ID ngoài phạm vi.'
+    skill = skill_table().get(uid)
+    if skill:
+        name = str(skill.get('name') or skill.get('servername') or ('ID %d' % uid))
+        return 'ID %d → %s  ·  Copy ID ở bảng / nút Copy.' % (uid, name[:48])
+    if any(str(row['id']).startswith(text) for row in finder_skills):
+        return 'ID %d… · khớp prefix trong danh sách · chưa đúng ID đầy đủ trên acc.' % uid
+    return 'ID %d · (chưa có trên acc này) — vẫn có thể Copy nếu đã biết ID.' % uid
+
+
 def search_skill_finder():
-    global finder_matches,finder_offset
+    global finder_matches,finder_offset,_finder_live_query
     if finder_owner!=owner_of(get_character_data() or {}):
         refresh_skill_finder()
         return
-    query=normalize_finder_text(QtBind.text(gui,finder_query_field)).strip()
-    terms=query.split()
-    finder_matches=[row for row in finder_skills if all(term in row['search'] for term in terms)]
-    if query.isdigit():finder_matches.sort(key=lambda row:(str(row['id'])!=query,normalize_finder_text(row['name']),row['id']))
-    finder_offset=0
+    raw = QtBind.text(gui, finder_query_field)
+    query = normalize_finder_text(raw).strip()
+    _finder_live_query = raw
+    terms = query.split()
+    if query.isdigit():
+        # Prefer ID prefix / exact while typing digits; still allow substring in search blob.
+        finder_matches = [
+            row for row in finder_skills
+            if str(row['id']).startswith(query) or query in row['search']
+        ]
+        finder_matches.sort(
+            key=lambda row: (
+                0 if str(row['id']) == query else 1 if str(row['id']).startswith(query) else 2,
+                normalize_finder_text(row['name']),
+                row['id'],
+            ))
+    else:
+        finder_matches = [
+            row for row in finder_skills if all(term in row['search'] for term in terms)
+        ]
+    finder_offset = 0
     show_skill_finder()
-    message=('%d skill khớp / %d skill của acc. Bấm Copy ID hoặc copy trực tiếp trong ô ID.'%(len(finder_matches),len(finder_skills))
-             if finder_owner else 'Chưa có nhân vật vào game; đăng nhập rồi bấm Quét lại.')
-    QtBind.setText(gui,finder_status_label,message)
+    if 'finder_id_preview' in globals():
+        QtBind.setText(gui, finder_id_preview, _finder_id_preview_text(raw))
+    message = (
+        '%d skill khớp / %d skill của acc. Bấm Copy hoặc Ctrl+A/C trong ô ID.'
+        % (len(finder_matches), len(finder_skills))
+        if finder_owner else
+        'Chưa có nhân vật vào game; đăng nhập rồi bấm Quét lại.')
+    QtBind.setText(gui, finder_status_label, message)
+
+
+def tick_skill_finder_live():
+    """While Tools is open: re-filter as the user types; digits resolve name live."""
+    global _finder_live_query
+    if _ui_current_view != 'tools':
+        return
+    if finder_owner is None and not finder_skills:
+        # First open / no scan yet — try once so ID digits can resolve from skill_table.
+        if QtBind.text(gui, finder_query_field).strip():
+            refresh_skill_finder()
+        return
+    raw = QtBind.text(gui, finder_query_field)
+    if raw == _finder_live_query:
+        return
+    search_skill_finder()
 
 
 def show_skill_finder():
@@ -7789,7 +7858,7 @@ def approach_pvp_target(uid, minimum=6.0, recovery=None):
         if not minimum <= distance <= 20:
             push_trace_note('Áp sát: khoảng cách %.1f m ngoài khoảng %.1f–20 m.' % (distance, minimum), after_hit=True)
             return False
-        # Prefer page approach range (F2 12 m) over hard-coded ~4 m melee stop.
+        # Prefer page approach range (F2 15 m) over hard-coded ~4 m melee stop.
         stop_at = max(float(minimum), auto_pk_approach_range() - 0.5)
         stop_at = min(stop_at, distance - 0.5) if distance > 1.0 else max(1.0, distance * 0.5)
         fraction = (distance - stop_at) / distance if distance > stop_at else 0.0
@@ -9253,38 +9322,38 @@ damage_margin_field = widget('meter', 'createLineEdit', '20', 230, 56, 42, 20)
 widget('meter', 'createButton', 'load_damage_meter_f1', 'Nạp F1', 285, 56)
 widget('meter', 'createButton', 'apply_damage_meter_f1', 'Ghi vào F1', 365, 56)
 damage_status_field = widget('meter', 'createLabel', 'Nạp F1 hoặc đo tay · 3 mẫu/skill · cùng đối thủ.', 10, 82)
-# Keep user column X positions; Tên/B070→hit/mẫu = LineEdit (QtBind Label "—" clips).
+# Balanced columns (~655): wide Tên for full names; LineEdit avoids QtBind Label clip.
 widget('meter', 'createLabel', '#', 10, 104)
-widget('meter', 'createLabel', 'ID', 30, 104)
-widget('meter', 'createLabel', 'Tên', 115, 104)
-widget('meter', 'createLabel', 'B070→hit', 340, 104)
-widget('meter', 'createLabel', 'cut ms', 430, 104)
-widget('meter', 'createLabel', 'mẫu', 500, 104)
+widget('meter', 'createLabel', 'ID', 28, 104)
+widget('meter', 'createLabel', 'Tên', 108, 104)
+widget('meter', 'createLabel', 'B070→hit', 372, 104)
+widget('meter', 'createLabel', 'cut ms', 466, 104)
+widget('meter', 'createLabel', 'mẫu', 536, 104)
 damage_meter_f1_fields = []
 for _meter_row in range(DAMAGE_METER_F1_ROWS):
-    _y = 122 + _meter_row * 22
-    widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 3)
-    _id = widget('meter', 'createLineEdit', '', 30, _y, 78, 20)
-    _name = widget('meter', 'createLineEdit', '—', 115, _y, 216, 20)
-    _hit = widget('meter', 'createLineEdit', '—', 340, _y, 80, 20)
-    _cut = widget('meter', 'createLineEdit', '', 430, _y, 55, 20)
-    _samples = widget('meter', 'createLineEdit', '0/3', 500, _y, 48, 20)
+    _y = 124 + _meter_row * 22
+    widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 2)
+    _id = widget('meter', 'createLineEdit', '', 28, _y, 72, 20)
+    _name = widget('meter', 'createLineEdit', '—', 108, _y, 254, 20)
+    _hit = widget('meter', 'createLineEdit', '—', 372, _y, 84, 20)
+    _cut = widget('meter', 'createLineEdit', '', 466, _y, 58, 20)
+    _samples = widget('meter', 'createLineEdit', '0/3', 536, _y, 48, 20)
     damage_meter_f1_fields.append((_id, _name, _hit, _cut, _samples))
 damage_suggested_field = widget('meter', 'createLineEdit', '', 560, 56, 55, 20)
 damage_conclusion_field = widget('meter', 'createLabel', '', 560, 82)
 damage_formula_field = widget(
     'meter', 'createLabel',
     'Công thức: ceil(B070→hit chậm nhất) + bù. Cung/đạn: chờ hit muộn; n/a = nhập cut tay.',
-    10, 258)
-damage_result_list = widget('meter', 'createList', 10, 278, 655, 40)
-widget('meter', 'createLabel', 'Giữ khoảng cách; đợi hồi giữa mẫu. Ghi vào F1 cập nhật cột ms nhóm Ghost F1.', 10, 322)
+    10, 262)
+damage_result_list = widget('meter', 'createList', 10, 282, 655, 40)
+widget('meter', 'createLabel', 'Giữ khoảng cách; đợi hồi giữa mẫu. Ghi vào F1 cập nhật cột ms nhóm Ghost F1.', 10, 326)
 
 
 def _damage_meter_skill_name(uid):
     skill = skill_table().get(int(uid)) if uid else None
     if not skill:
         return '(chưa có trên acc)' if uid else '—'
-    return str(skill.get('name') or skill.get('servername') or ('ID %s' % uid))[:36]
+    return str(skill.get('name') or skill.get('servername') or ('ID %s' % uid))[:48]
 
 
 def clear_damage_meter_f1_row(index):
@@ -9296,9 +9365,21 @@ def clear_damage_meter_f1_row(index):
     QtBind.setText(gui, sample_label, '0/3')
 
 
-def refresh_damage_meter_f1_table():
-    for uid_field, name_label, hit_label, cut_field, sample_label in damage_meter_f1_fields:
-        text = QtBind.text(gui, uid_field).strip()
+_damage_meter_name_cache = None
+
+
+def refresh_damage_meter_f1_table(force=False):
+    """Live ID → Tên while Đo ngắt is open (same idea as Auto PK buff names)."""
+    global _damage_meter_name_cache
+    if not force and _ui_current_view != 'meter':
+        return
+    texts = [QtBind.text(gui, uid_field).strip() for uid_field, *_ in damage_meter_f1_fields]
+    key = '|'.join(texts)
+    if not force and key == _damage_meter_name_cache:
+        return
+    _damage_meter_name_cache = key
+    for (uid_field, name_label, hit_label, cut_field, sample_label), text in zip(
+            damage_meter_f1_fields, texts):
         if text.isdigit():
             QtBind.setText(gui, name_label, _damage_meter_skill_name(int(text)))
         elif not text:
@@ -9448,7 +9529,10 @@ def inline_first_damage(raw, target):
 
 
 def mark_damage_meter_unmeasurable(uid, reason):
-    """Show n/a in the F1 meter row when hit inline never arrives (bow/buff)."""
+    """Show n/a in the F1 meter row when hit inline never arrives (bow/buff).
+
+    Cut field is left alone so the user can type ms by hand, then Ghi vào F1.
+    """
     uid_text = str(int(uid or 0))
     if not uid_text or uid_text == '0':
         return
@@ -9457,9 +9541,10 @@ def mark_damage_meter_unmeasurable(uid, reason):
             continue
         QtBind.setText(gui, name_label, _damage_meter_skill_name(int(uid_text)))
         QtBind.setText(gui, hit_label, 'n/a')
+        # Keep any existing cut; blank stays blank for manual entry.
         QtBind.setText(gui, sample_label, '0/3')
         break
-    report('Đo ms: ID %s không đo được — %s' % (uid_text, reason))
+    report('Đo ms: ID %s không đo được — %s · nhập cut ms tay rồi Ghi vào F1.' % (uid_text, reason))
 
 
 def observe_damage_meter(outgoing, opcode, data):
@@ -9871,6 +9956,8 @@ def event_loop():
         tick_damage_meter()
         tick_armed_boss()
         refresh_auto_pk_buff_names()
+        tick_skill_finder_live()
+        refresh_damage_meter_f1_table()
         with pvp_lock:
             runtime = auto_pk_runtime
             now = monotonic()
