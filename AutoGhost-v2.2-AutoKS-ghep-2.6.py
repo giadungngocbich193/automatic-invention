@@ -6876,6 +6876,9 @@ def trace_manual_packet(outgoing, opcode, data):
 
 
 def handle_silkroad(opcode, data):
+    # Globals first — any use of pvp_target above a later `global` is SyntaxError.
+    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
+    global pvp_target, pvp_resume_page
     # Chỉ nhường bot train thật. Tracing (ks) phải để 7045/7074 Ghost + PartyLeader chạy.
     if (auto_pk_running and opcode in (0x7045, 0x7046, 0x7074)
             and status_blocks_auto_pk()):
@@ -6901,8 +6904,6 @@ def handle_silkroad(opcode, data):
         if opcode==0x7045 or (opcode==0x7074 and raw and raw[0]==1):
             return False  # No new target/attack can restart pursuit during withdrawal.
     observe_numeric_request(opcode, data)
-    global selected_monster_uid, hunt_request, direct_target, direct_select_request, direct_index, pvp_selection_request, active_sequence, sequence_index
-    global pvp_target, pvp_resume_page
     trace_manual_packet(True, opcode, data)
     observe_hotbar_finder_request(opcode,data)
     if (opcode==0x7074 and pvp_trigger_mode=='manual' and not pvp_armed
