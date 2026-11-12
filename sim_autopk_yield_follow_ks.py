@@ -116,6 +116,16 @@ def main():
     assert m.auto_pk_running is True
     assert m.auto_pk_runtime.get('ks_defer_local') is True
 
+    # 5) Follow owns + mismatched requested → B045 must not lock camp UID
+    m = build_module()
+    m._ks_active = True
+    m.auto_pk_runtime = {
+        'party_sync_uid': 0, 'party_lock': False, 'party_follow_mode': False,
+        'requested': 99,
+    }
+    assert m.follow_or_ks_owns_target(m.auto_pk_runtime) is True
+    assert m.local_select_allowed(m.auto_pk_runtime) is False
+
     print('SHIP_OK sim_autopk_yield_follow_ks')
 
 

@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX Follow arm + Target steal] PartyLeader arm không còn phụ thuộc tick
+  tab Auto PK; Target Enemy/B045 không khóa địch local khi Follow/AutoKS owns.
 - [FIX Follow/AutoKS > local Auto PK] Khi Bật Auto KS hoặc PartyLeader
   follow/prefer/hold: local Auto PK không tự chọn địch. AutoKS Ghost nhường
   (tắt) local camp Auto PK; giữ PartyLeader prefer UID nếu đang lock.
@@ -3997,6 +3999,10 @@ def auto_pk_outgoing_selection(data):
                        'PartyLeader sync UID %d · chờ B045.' % uid)
         pvp_selection_request = direct_select_request = uid
         return True
+    # Follow/AutoKS owns target — do not arm local Target Enemy into Auto PK.
+    # return False = observe only (phBot: True blocks C→S 7045).
+    if follow_or_ks_owns_target(runtime):
+        return False
     # HARD: party_lock → không nhận target khác UID chủ.
     if runtime.get('party_lock') and party_uid and uid != party_uid:
         return False
@@ -5255,6 +5261,12 @@ def auto_pk_select_reply(data):
             return
     if runtime.get('party_hold_fight') or party_sync_has_target(runtime.get('party_sync_uid') or 0):
         return
+    # Follow/AutoKS owns: only accept B045 for Prefer UID — never lock camp Target.
+    if follow_or_ks_owns_target(runtime):
+        party_uid = int(runtime.get('party_sync_uid') or 0)
+        req = int(runtime.get('requested') or 0)
+        if not party_uid or req != party_uid:
+            return
     uid = runtime['requested']
     if not uid or now >= runtime['select_until']:
         return
@@ -5341,10 +5353,9 @@ def party_sync_apply_page(page):
 
 def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
     """Hook công khai: PartyLeader bật Auto PK theo nhóm F (F1–F3)."""
-    if _combat_tab != 'pk':
-        return False
     global auto_pk_owner
     try:
+        # Follow may arm without the UI Auto PK tab tick (same-class as KS yield).
         # ks/trace được phép — không stop_bot, không chặn get_status tracing.
         page = str(page or '').strip().upper()
         if page and page not in PVP_EDIT_PAGES:
@@ -5371,7 +5382,7 @@ def party_sync_arm_auto_pk(page=None, prefer_uid=0, source='PartyLeader'):
             if prefer_uid:
                 party_sync_select_uid(prefer_uid, source=source)
             return True
-        request_auto_pk_arm()
+        request_auto_pk_arm(force=True)
         if not auto_pk_running:
             return False
         if page in PVP_EDIT_PAGES:
@@ -5537,11 +5548,32 @@ def party_sync_hold_fight(reason=None, source='PartyLeader'):
 
 
 
-def request_auto_pk_arm():
+def request_auto_pk_arm(force=False):
+    """Arm Auto PK. force=True: PartyLeader Follow bypasses UI tab tick."""
+    global _combat_tab, auto_pk_running, auto_pk_returning, auto_pk_runtime, auto_pk_anchor, run_section
     if _combat_tab != 'pk':
-        report_error('Tích ô cạnh tab Auto PK để bật.')
+        if not force:
+            report_error('Tích ô cạnh tab Auto PK để bật.')
+            return
+        # Follow arm: drop exclusive PvP session if needed, then claim PK tab.
+        if _combat_tab == 'pvp':
+            try:
+                stop_clicked(keep_bridge=True)
+            except Exception:
+                pass
+            try:
+                set_checked_silent(_pvp_tab_switch, False)
+            except Exception:
+                pass
+        _combat_tab = 'pk'
+        try:
+            set_checked_silent(_pk_tab_switch, True)
+        except Exception:
+            pass
+        log('[%s] Follow force-arm Auto PK (bỏ qua tick tab UI).' % NAME)
+    elif not force and auto_ks_session_active():
+        report_error('AutoKS đang bật · tắt Auto KS trước khi Bật Auto PK camp.')
         return
-    global auto_pk_running,auto_pk_returning,auto_pk_runtime,auto_pk_anchor,run_section
     try:
         owner,radius,page=read_auto_pk_settings()
         options = read_auto_pk_options()
