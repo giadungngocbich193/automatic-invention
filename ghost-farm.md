@@ -47,4 +47,6 @@ Never self primary · never player neighbor · never `inject_joymax(0x7081)`.
 
 ## jsDelivr
 
-*(pin filled after ship commit)*
+https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@c75ba0ba3e7697dea0f40fcd1a5c3e80a21255aa/GhostFarm.py
+
+Raw: https://github.com/giadungngocbich193/automatic-invention/raw/c75ba0ba3e7697dea0f40fcd1a5c3e80a21255aa/GhostFarm.py
