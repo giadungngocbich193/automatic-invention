@@ -92,6 +92,6 @@ Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 ## jsDelivr
 
-jsDelivr pin (update after push to the commit that ships 1.0.10):
+jsDelivr pin:
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@PIN/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@dac38a949b609f25ee5fff105f12e31c21cbfa10/GhostFarm.py`
