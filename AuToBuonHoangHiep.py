@@ -12,7 +12,7 @@ import types as _types
 import time as _time
 
 pName = 'hoang hiep'
-pVersion = '2.28'
+pVersion = '2.29'
 gui = _qt.init(__name__, pName + ' v' + pVersion)
 _hh_active_page = 'caravan'
 _hh_modules = {}
@@ -1363,25 +1363,39 @@ default_skill_grid = (
 SKILL_PAGE_SIZE = 10
 skill_switches, skill_widgets, page_labels = [], [], []
 grid = [[], []]
+def compact_row_button(callback, text, x, y):
+    handle = QtBind.createButton(gui, callback, text, x, y)
+    style = ('QPushButton { min-width:18px; max-width:22px; min-height:14px; '
+             'max-height:16px; padding:0px; margin:0px; }')
+    for method in ('setStyleSheet', 'setStylesheet', 'setStyle'):
+        setter = getattr(QtBind, method, None)
+        if callable(setter):
+            try:
+                setter(gui, handle, style)
+                break
+            except Exception:
+                pass
+    return handle
+
+
 for group, x in enumerate((12, 245)):
     skill_switches.append(QtBind.createCheckBox(gui, 'skill_row_changed', 'F%d · Bật đánh' % (group + 1), x, 74))
-    for label, dx in (('Tắt', 0), ('ID skill', 26), ('ms', 168), ('Ngắt', 210)):
+    for label, dx in (('Tắt', 0), ('ID skill', 26), ('ms', 160), ('Ngắt', 205)):
         QtBind.createLabel(gui, label, x + dx, 94)
     widgets = []
     for row, y in enumerate(range(108, 108 + SKILL_PAGE_SIZE * 17, 17)):
+        off = QtBind.createCheckBox(gui, 'skill_row_changed', '', x, y)
+        id_box = QtBind.createLineEdit(gui, '', x + 25, y, 85, 16)
+        ms_box = QtBind.createLineEdit(gui, '', x + 160, y, 39, 16)
+        cut = QtBind.createCheckBox(gui, 'skill_row_changed', '', x + 205, y)
         up = 'skill_row_up_%d_%d' % (group, row)
         down = 'skill_row_down_%d_%d' % (group, row)
         globals()[up] = lambda g=group, r=row: move_skill_row(g, r, -1)
         globals()[down] = lambda g=group, r=row: move_skill_row(g, r, 1)
-        # Two separate push buttons beside ID (not a spinbox / not a 1–10 column).
-        QtBind.createButton(gui, up, '↑', x + 123, y - 2)
-        QtBind.createButton(gui, down, '↓', x + 145, y - 2)
-        widgets.append((
-            QtBind.createLineEdit(gui, '', x + 25, y, 95, 16),
-            QtBind.createLineEdit(gui, '', x + 168, y, 39, 16),
-            QtBind.createCheckBox(gui, 'skill_row_changed', '', x + 210, y),
-            QtBind.createCheckBox(gui, 'skill_row_changed', '', x, y),
-        ))
+        # After LineEdits so ↑↓ stay visible above ms/ID.
+        compact_row_button(up, '↑', x + 112, y - 1)
+        compact_row_button(down, '↓', x + 134, y - 1)
+        widgets.append((id_box, ms_box, cut, off))
     skill_widgets.append(widgets)
     page_labels.append(None)  # no visible 1–10 column
 
