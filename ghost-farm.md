@@ -1,97 +1,82 @@
-# GhostFarm v1.0.10
+# GhostFarm v1.0.11
 
-Standalone phBot farm with **overlapping Ghost interrupt** via the proven AutoGhost / GhostNativeProbe `NativeCut` path (`client_7081`).
+Standalone phBot farm with **overlapping Ghost interrupt** via NativeCut `client_7081` (same path as GhostNativeProbe / AutoGhost PVP).
+
+**Interrupt = NativeCut `bridge.arm(2)` self UID → C→S `0x7081` → B074 `02 00`.**  
+Never `inject_joymax(0x7081)`.
+
+## Why 1.0.11 (overnight “có ghost đâu”)
+
+1.0.9 DROP-basic (+ 1.0.10 Skill ID prefill) was not enough. Silent fails still hid missing Ghost:
+
+- Timer thread could skip `arm(2)` when `active`/phase gates failed **without a log**
+- B070 skill/source/target rejects were **silent**
+- Failed cycles ended as vague `XONG` instead of loud **GHOST FAIL**
+- Unconditional `7074` cancel before cast could abort the skill (no B070)
+
+v1.0.11:
+
+- **Event-loop fires cut at `cut_at`** (Timer is nudge only)
+- **Retarget** self UID in thunk page before every `arm(2)`
+- Log every **B070 REJECT** / **CUT SKIP**
+- Every miss: loud **`GHOST FAIL`** (`cut_fired` / `7081` / `B074` / NativeCut error)
+- Cancel before cast **only if** basic was dropped
+- Start refuses non-Windows / missing HWND with **GHOST BLOCKED**
 
 ## Why 1.0.10
 
-Prefill **Skill IDs** from the confirmed Auto PK **F1 skill+Ngắt** table (filled ID + ms only; skip blank IDs; ignore blank-ID ms 850; **no 81037**).
+Prefill Skill IDs from confirmed Auto PK F1 skill+Ngắt table (blank IDs skipped; no 81037).
 
-Default field:
-
-```text
-80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5
-```
-
-If the UI still shows an old empty/config value after reload, paste that string into **Skill IDs (F1)**.
-
-## Why 1.0.9 (fix “toàn đánh thường”)
-
-After `7045` select, **phBot Training / client basic** `7074 01 01 01` kept swinging while GhostFarm waited on NativeCut prewarm. Skill `7074` often never got `B070`, so the loop looked like plain basic attacks and Ghost never lined up.
-
-v1.0.9:
-
-- While farming: **DROP** client basic `7074 01 01 01`
-- **Cancel** current action before skill cast
-- **Prewarm NativeCut at Start** (non-blocking `arm(1)`)
-- `close_session` no longer clears `active` (B070 Timer could skip `arm(2)`)
-- Empty Skill IDs → loud STOP (no silent basic-only)
-- cut_wait **backup** if Timer died without cut
-
-## Why 1.0.8
-
-v1.0.7 fired `Timer(cfg)` from **7074 send**. With `cfg≈1–30ms` that aborted the cast **before** the server confirm (`B070`), so skills did not hit (`skill không đánh`) and there was no real mid-animation Ghost.
-
-## Timing (AutoGhost PVP, byte-for-byte)
-
-AG `handle_joymax` on `0xB070` (len≥19, skill@3, source@7, target@15):
-
-`Timer(delay)` → `queue_interrupt` → `fire_interrupt` → `begin_native_cut` → `send_pvp_interrupt` → `bridge.arm(2)`
-
-Farm mirrors that:
+## Timing
 
 1. **7045** select living monster  
-2. **Pre-warm** NativeCut (`arm(1)` → `completed(4)`) **before** cast (also kicked at Start)  
-3. DROP training basic · cancel · **7074** cast skill on monster  
-4. **Wait S→C B070** (same skill / self source / select target)  
-5. **`Timer(cfg_ms)` from B070** → `bridge.arm(2)` (self UID)  
-6. Fallback: if no B070 within **800ms**, cut as **7074+cfg_ms** (remaining time)  
-7. Success = observed C→S `0x7081` + B074 `02 00`  
-8. Log should show `since_B070≈cfg ms` (and a B070 line before the cut)
+2. Pre-warm NativeCut (`arm(1)` → `completed(4)`) — also at Start  
+3. DROP training basic · **7074** skill  
+4. Wait **S→C B070** (skill + self source; target mismatch = WARN but still cut)  
+5. **`cut_at = B070 + cfg_ms`** → event_loop **`arm(2)`** self  
+6. Fallback: no B070 in **800ms** → cut from 7074+cfg  
+7. Success = **C→S 0x7081** + **B074 `02 00`**
 
-## Skill IDs
+## Skill IDs (prefilled)
 
 ```text
 80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5
 ```
 
-`skillId=ms` after **B070** (AG), not after 7074.
+`skillId=ms` after **B070**, not after 7074.
 
 ## User must set
 
-1. Tick **Bật**
-2. Confirm **Skill IDs** (prefilled; empty = no 7074 / no Ghost)
-3. **Start farm**
-4. Prefer **Self** mode
-5. Disable phBot **Training combat** (farm drops basic, but Training still fights the bot)
-6. If NativeCut install fails: unload **AutoGhost Ghost/PvP** (shared GetTickCount) or let Farm adopt the same THUNK
+1. Tick **Bật**  
+2. Confirm **Skill IDs** (prefilled; edit if needed)  
+3. **Start farm** (Windows phBot + Silkroad window — not Clientless)  
+4. Prefer disable Training combat  
+5. If NativeCut / GetTickCount conflict: unload **AutoGhost Ghost/PvP** (Farm can adopt same THUNK)
 
-## Verify logs (cut vs basic-only)
-
-**Ghost OK:**
+## Log lines that MUST appear if Ghost worked
 
 ```text
-C→S 0x7074 CAST · skill=…
-S→C 0xB070 CAST CONFIRM · …
-CUT TIMER scheduled · AG Timer(…) after B070
-NativeCut arm(2) CUT NOW · … · since_B070≈cfg ms
-C→S 0x7081 OBSERVED (NativeCut self)
+S→C 0xB070 CAST CONFIRM · skill=… · hẹn NativeCut arm(2) …
+NativeCut arm(2) CUT NOW · transport=client_7081 · NOT inject · since_B070≈cfg
+C→S 0x7081 OBSERVED (NativeCut self) …
 S→C 0xB074 … 02 00 · NGẮT OK
+OK GHOST NativeCut self · 7081=YES · B074 02 00
 ```
 
-**Basic-only / misconfig:**
+## Overnight “no Ghost” diagnostics
 
 ```text
-START từ chối — Skill IDs trống
-DROP C→S 0x7074 basic (đánh thường)
-B070 MISSING after 800ms · … (nếu chỉ thấy đánh thường: …)
+GHOST FAIL · no Ghost this cycle · cut_fired=… · observed_7081=NO · B074=…
+B070 REJECT skill · …
+CUT SKIP · …
+GHOST BLOCKED — NativeCut chỉ chạy Windows …
+GHOST FAIL NativeCut … GetTickCount … unload AutoGhost
 ```
 
 ## Install
 
-Copy `GhostFarm.py` into phBot `Plugins/`, reload.
+Copy `GhostFarm.py` → phBot `Plugins/`, reload.
 
 ## jsDelivr
 
-jsDelivr pin:
-
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@492c439926f77c17a3f3eb1e927c896f2e5ac1eb/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@COMMIT/GhostFarm.py`

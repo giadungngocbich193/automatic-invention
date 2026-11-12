@@ -2,6 +2,13 @@
 """GhostFarm — Ghost farm quái/NPC (standalone, NativeCut client_7081).
 
 Changelog:
+- v1.0.11: Overnight “có ghost đâu” harden — interrupt is ONLY NativeCut
+  client_7081 self (arm(2)), never inject 7081. Event-loop fires cut at
+  cut_at (Timer is nudge only; no silent Timer/active skip). Retarget self
+  UID in thunk page before every arm(2). Log every B070 reject + every CUT
+  SKIP. Every failed cycle LOUD `GHOST FAIL` (no 7081 / no B074 02 00) with
+  phase/cut_fired/b070/bridge. Cancel before cast only if basic was dropped.
+  NativeCut install fail stays on status every cycle. Windows host required.
 - v1.0.10: Prefill Skill IDs from confirmed Auto PK F1 skill+Ngắt table
   (skip blank IDs; ignore blank-ID ms 850; no 81037):
   `80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5`.
@@ -79,8 +86,7 @@ from phBot import (
     inject_joymax, log)
 
 NAME = 'GhostFarm'
-VERSION = '1.0.10'
-# Confirmed Auto PK F1 skill+Ngắt (filled ID + ms; blank IDs skipped; no 81037).
+VERSION = '1.0.11'
 SKILL_FIELD_EXAMPLE = '80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5'
 
 # Verified Hùng Vương client builds — copied from GhostNativeProbe / AutoGhost.
@@ -160,6 +166,11 @@ state = {
     'ok_count': 0,
     'fail_count': 0,
     'basic_drop_count': 0,
+    'ghost_ok_count': 0,
+    'ghost_fail_count': 0,
+    'last_ghost_fail': '',
+    'last_nativcut_error': '',
+    'live_timers': set(),
 }
 
 QtBind.createLabel(gui, '%s v%s — Ghost farm quái/NPC (NativeCut)' % (NAME, VERSION), 10, 8)
@@ -191,8 +202,8 @@ stats_label = QtBind.createLabel(gui, 'OK: 0 · Fail/timeout: 0', 10, 236)
 
 QtBind.createLabel(
     gui,
-    'v1.0.10: Bật+Start+Skill IDs → 7045→(drop basic)→7074→B070→Timer→arm(2). '
-    'Tắt Training/AG Ghost nếu móc conflict. VD: 80031=1;66007=5;…',
+    'v1.0.11: NativeCut self 7081 after B070+Timer (NOT inject). '
+    'Log must show arm(2)+7081+B074 02 00. VD: 80031=1;66007=20.',
     10, 268,
 )
 
@@ -270,7 +281,12 @@ def set_stats():
     with lock:
         ok = int(state.get('ok_count') or 0)
         fail = int(state.get('fail_count') or 0)
-    QtBind.setText(gui, stats_label, 'OK: %d · Fail/timeout: %d' % (ok, fail))
+        ghost_ok = int(state.get('ghost_ok_count') or 0)
+        ghost_fail = int(state.get('ghost_fail_count') or 0)
+    QtBind.setText(
+        gui, stats_label,
+        'OK: %d · Fail: %d · GhostOK: %d · GhostFAIL: %d'
+        % (ok, fail, ghost_ok, ghost_fail))
 
 
 def kernel_api():
@@ -558,10 +574,15 @@ def show_client():
 
 def read_self_uid():
     character = get_character_data() or {}
-    try:
-        uid = int(character.get('player_id') or 0)
-    except (TypeError, ValueError):
-        uid = 0
+    uid = 0
+    for key in ('player_id', 'unique_id', 'uid'):
+        try:
+            value = int(character.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            uid = value
+            break
     with lock:
         state['self_uid'] = uid
     name = character.get('name') or '?'
@@ -611,7 +632,7 @@ def read_skill_entries():
     """Parse Skill IDs field as [(skill_id, ghost_delay_ms), ...].
 
     Formats:
-      80031=1;66007=5;54016=1;81019=5
+      80031=1;66007=5;54016=1;81019=5;7678=1;81016=7;7653=5
       80031=1,66007=5
       3048,3050          → delay DEFAULT_GHOST_DELAY_MS
     """
@@ -987,6 +1008,14 @@ def btn_start():
         set_status('Plugin đang TẮT — tick Bật trước khi Start.')
         _log('START từ chối — plugin TẮT (chỉ Bật checkbox không đủ nếu chưa Start).')
         return
+    if sys.platform != 'win32' or not user32:
+        set_status(
+            'GHOST BLOCKED — NativeCut chỉ chạy Windows phBot host (không Clientless).')
+        _log(
+            'START từ chối — platform=%s user32=%s. Interrupt = NativeCut '
+            'client_7081, không inject_joymax(0x7081).'
+            % (sys.platform, bool(user32)))
+        return
     read_radius()
     current_mode()
     self_uid = read_self_uid()
@@ -1004,6 +1033,12 @@ def btn_start():
             % SKILL_FIELD_EXAMPLE)
         return
     show_client()
+    client = get_client()
+    if not (client.get('running') and client.get('pid') and client.get('window')):
+        set_status(
+            'GHOST BLOCKED — thiếu client PID/HWND (cần cửa sổ Silkroad, không Clientless).')
+        _log('START từ chối — get_client() thiếu running/pid/window.')
+        return
     with lock:
         active = state.get('active')
         state['farming'] = True
@@ -1011,16 +1046,20 @@ def btn_start():
         state['queue'] = []
         state['active'] = None
         state['skill_index'] = 0
+        state['last_ghost_fail'] = ''
+        state['last_nativcut_error'] = ''
     _cancel_cut_timer(active)
-    _prewarm_self_at_start()
+    prewarm_ok = _prewarm_self_at_start()
     preview = ';'.join('%d=%d' % pair for pair in entries[:6])
+    ag = ' · AutoGhost đang nạp (có thể conflict GetTickCount)' if _autoghost_hint() else ''
     set_status(
-        'START farm · r=%gm · %s — 7045→drop-basic→7074→B070→Timer→arm(2)'
-        % (read_radius(), preview))
+        'START · self=%d · %s · path=NativeCut arm(2) after B070 · prewarm=%s%s'
+        % (self_uid, preview, 'OK' if prewarm_ok else 'PENDING/FAIL', ag))
     _log(
-        'START farm · skills=%s · self=%d · tắt phBot Training combat nếu còn '
-        'đánh thường; unload AutoGhost Ghost nếu NativeCut conflict.'
-        % (preview, self_uid))
+        'START farm · skills=%s · self=%d · interrupt=NativeCut client_7081 '
+        'self (NOT inject) · expect log: B070 → arm(2) → C→S 7081 → B074 02 00 · '
+        'tắt Training; unload AG Ghost nếu móc conflict.%s'
+        % (preview, self_uid, ag))
 
 
 def btn_stop():
@@ -1149,7 +1188,12 @@ def _prewarm_native(job, uid, now):
         _log('NativeCut PREWARM OK · UID=%d · sẵn sàng arm(2) overlapping cast' % uid)
         return True
     if now >= float(job.get('prewarm_deadline') or 0):
-        raise ValueError('prewarm NativeCut timeout — không ngắt được overlapping cast.')
+        with lock:
+            state['last_nativcut_error'] = 'prewarm timeout 3s'
+        raise ValueError(
+            'prewarm NativeCut timeout — không arm(2)/7081 được. '
+            'Cần Windows phBot + client Hùng Vương đã pin; nếu AutoGhost đang '
+            'móc GetTickCount: tắt Ghost/PvP AG hoặc unload AG rồi Start lại.')
     return False
 
 
@@ -1160,25 +1204,67 @@ def _cancel_cut_timer(job):
             timer.cancel()
         except Exception:
             pass
+        with lock:
+            timers = state.get('live_timers')
+            if isinstance(timers, set):
+                timers.discard(timer)
+
+
+def _retarget_bridge(session, uid):
+    """Rewrite NativeCut page target UID before arm(2) (AG get_client_exchange spirit)."""
+    bridge = session.get('bridge')
+    if bridge is None or not getattr(bridge, 'page', 0):
+        return
+    header = bridge.read(bridge.page, 16)
+    state_w, tid, old_target, original = struct.unpack('<IIII', header)
+    new_target = int(uid) & 0xffffffff
+    if old_target == new_target:
+        return
+    bridge.write(
+        bridge.page,
+        struct.pack('<IIII', state_w, tid, new_target, original))
+    _log('NativeCut retarget page UID %d → %d (trước arm(2))' % (old_target, new_target))
 
 
 def _fire_native_cut(job, uid, now=None, reason='cut'):
-    """AG/GhostNativeProbe cut: session ready → bridge.arm(2) only (send_pvp_interrupt)."""
+    """AG/GhostNativeProbe cut: session ready → bridge.arm(2) only (NOT inject 7081)."""
     now = monotonic() if now is None else now
     with lock:
-        if state.get('active') is not job:
+        active = state.get('active')
+        if active is not None and active is not job:
+            _log(
+                'CUT SKIP · active is other job · phase=%s · reason=%s'
+                % (job.get('phase'), reason))
             return False
+        # Claim active so Timer/event_loop cannot race-skip arm(2).
+        state['active'] = job
         if job.get('cut_fired'):
             return True
         if job.get('phase') not in ('cut_wait', 'arm', 'cut_now'):
+            _log(
+                'CUT SKIP · bad phase=%s · reason=%s · skill=%s'
+                % (job.get('phase'), reason, job.get('skill_id')))
             return False
+        job['phase'] = 'cut_now'
     try:
+        # Refresh self UID — wrong UID ⇒ 7081 to dead target, no B074 02 00.
+        live_uid = read_self_uid() or int(uid)
+        if live_uid and live_uid != int(uid):
+            _log('CUT self UID refresh %d → %d' % (int(uid), live_uid))
+            uid = live_uid
+            job['uid'] = uid
+            job['hex'] = _hex_bytes(_pack_uid(uid))
         session = get_or_create_session(uid)
         if not session.get('verified'):
             if not _prewarm_native(job, uid, now):
+                _log('CUT SKIP · NativeCut chưa verify · reason=%s · self=%d' % (reason, uid))
+                with lock:
+                    state['last_nativcut_error'] = 'prewarm chưa xong trước arm(2)'
                 return False
             session = get_or_create_session(uid)
+        _retarget_bridge(session, uid)
         # Exact AG send_pvp_interrupt body: arm(2) on verified NativeCut bridge.
+        # This enqueues client_7081 — never inject_joymax(0x7081).
         job['observed'] = False
         job['bridge_done'] = False
         job['b074'] = ''
@@ -1197,53 +1283,75 @@ def _fire_native_cut(job, uid, now=None, reason='cut'):
             state['last_send_uid'] = uid
             state['last_send_at'] = now
             state['pending_watch_until'] = now + 3.0
+            state['last_nativcut_error'] = ''
         _log(
-            'NativeCut arm(2) CUT NOW · reason=%s · self=%d · skill=%d · '
-            'delay_cfg=%dms · since_B070=%dms · since_7074=%dms · hex=%s'
+            'NativeCut arm(2) CUT NOW · transport=client_7081 · NOT inject · '
+            'reason=%s · self=%d · skill=%d · delay_cfg=%dms · since_B070=%dms · '
+            'since_7074=%dms · hex=%s'
             % (reason, uid, int(job.get('skill_id') or 0), delay_ms, since_b070,
                since_7074, job.get('hex') or '?'))
         set_status(
-            'Ghost CUT self=%d · since_B070=%dms (cfg=%dms) · skill=%d'
+            'Ghost CUT NativeCut arm(2) self=%d · since_B070=%dms (cfg=%dms) · skill=%d'
             % (uid, since_b070 if since_b070 >= 0 else delay_ms, delay_ms,
                int(job.get('skill_id') or 0)))
         return True
     except Exception as error:
+        with lock:
+            state['last_nativcut_error'] = '%s: %s' % (type(error).__name__, error)
         _log_traceback('CUT TRACE', error)
+        set_status(
+            'GHOST FAIL arm(2) · %s — NativeCut only (Windows + GetTickCount). '
+            'Unload AutoGhost Ghost nếu conflict.'
+            % error)
         return False
 
 
 def _schedule_ag_cut_timer(job, uid, delay_ms, anchor='B070'):
-    """AutoGhost handle_joymax B070 → Timer(delay) → queue_interrupt → arm(2).
+    """After B070 (or fallback): schedule cut_at; event_loop is authoritative arm(2).
 
-    AG stores delay in seconds (pvp_delays[skill]); Farm UI uses ms → convert here.
+    Timer thread is a nudge only (AG parity). Overnight silent misses came from
+    Timer firing while active/phase gates returned without logging.
     """
     _cancel_cut_timer(job)
     delay_s = max(0, int(delay_ms)) / 1000.0
     ticket = object()
     job['cut_ticket'] = ticket
     job['cut_anchor'] = anchor
+    job['cut_uid'] = int(uid)
     job['phase'] = 'cut_wait'
     job['cut_at'] = monotonic() + delay_s
+    job['cut_deadline'] = job['cut_at'] + 2.0
 
     def _timer_fire():
-        # Mirrors AutoGhost queue_interrupt → fire_interrupt → begin_native_cut
-        # → send_pvp_interrupt → session['bridge'].arm(2).
         with lock:
-            if state.get('active') is not job:
-                return
             if job.get('cut_ticket') is not ticket:
+                _log('CUT TIMER skip · stale ticket · anchor=%s' % anchor)
                 return
-            if job.get('phase') != 'cut_wait':
+            if job.get('cut_fired'):
+                return
+            phase = job.get('phase')
+            if phase not in ('cut_wait', 'cut_now'):
+                _log(
+                    'CUT TIMER skip · phase=%s · anchor=%s · self=%d'
+                    % (phase, anchor, int(uid)))
                 return
             job['phase'] = 'cut_now'
-        _fire_native_cut(job, uid, reason='%s+%dms' % (anchor, int(delay_ms)))
+            state['active'] = job
+        _fire_native_cut(job, uid, reason='%s+%dms-timer' % (anchor, int(delay_ms)))
 
     timer = Timer(delay_s, _timer_fire)
     timer.daemon = True
     job['cut_timer'] = timer
+    with lock:
+        timers = state.get('live_timers')
+        if not isinstance(timers, set):
+            timers = set()
+            state['live_timers'] = timers
+        timers.add(timer)
     timer.start()
     _log(
-        'CUT TIMER scheduled · AG Timer(%.3fs) after %s · cfg=%dms · self=%d · skill=%d'
+        'CUT due in %.3fs after %s · cfg=%dms · self=%d · skill=%d · '
+        '(event_loop arm(2) at cut_at; Timer nudge only)'
         % (delay_s, anchor, int(delay_ms), uid, int(job.get('skill_id') or 0)))
 
 
@@ -1298,6 +1406,15 @@ def _finish_job(job, note, ok=False):
     set_status(note)
 
 
+def _record_ghost_fail(job, detail):
+    with lock:
+        state['ghost_fail_count'] = int(state.get('ghost_fail_count') or 0) + 1
+        state['last_ghost_fail'] = detail
+    set_stats()
+    _log('GHOST FAIL · %s' % detail)
+    set_status('GHOST FAIL · %s' % detail)
+
+
 def _advance_or_finish(job, ok_shot):
     if ok_shot:
         job['ok_any'] = True
@@ -1311,12 +1428,31 @@ def _advance_or_finish(job, ok_shot):
         job.get('ok_any') and job.get('observed')
         and (job.get('b074') or '').startswith('02 00'))
     if ok:
+        with lock:
+            state['ghost_ok_count'] = int(state.get('ghost_ok_count') or 0) + 1
+            state['last_ghost_fail'] = ''
+        set_stats()
         _finish_job(
             job,
-            'OK farm NativeCut %s UID=%d · observed 7081=%s · B074 %s'
-            % (job['label'], job['uid'], observed, b074),
+            'OK GHOST NativeCut self · 7081=YES · B074 02 00 · skill=%d · self=%d'
+            % (int(job.get('skill_id') or 0), int(job.get('uid') or 0)),
             ok=True)
-    elif job.get('error'):
+        return
+
+    with lock:
+        nativ_err = state.get('last_nativcut_error') or ''
+    detail = (
+        'no Ghost this cycle · cut_fired=%s · observed_7081=%s · B074=%s · '
+        'b070_seen=%s · b070_miss=%s · phase_end=%s · skill=%s · self=%s · '
+        'bridge5=%s · nativcut=%s · tip=cần arm(2)→C→S 7081→B074 02 00 '
+        '(NativeCut Windows; unload AG Ghost nếu conflict)'
+        % (bool(job.get('cut_fired')), observed, b074,
+           bool(job.get('b070_seen')), bool(job.get('b070_miss')),
+           job.get('phase'), job.get('skill_id'), job.get('uid'),
+           'done' if job.get('bridge_done') else 'no',
+           nativ_err or job.get('error') or 'ok'))
+    _record_ghost_fail(job, detail)
+    if job.get('error'):
         _finish_job(
             job,
             'LỖI farm NativeCut %s UID=%d · %s'
@@ -1325,9 +1461,8 @@ def _advance_or_finish(job, ok_shot):
     else:
         _finish_job(
             job,
-            'XONG farm NativeCut %s UID=%d · observed 7081=%s · B074 %s · bridge=%s'
-            % (job['label'], job['uid'], observed, b074,
-               'done' if job.get('bridge_done') else 'pending/timeout'),
+            'GHOST FAIL · 7081=%s · B074=%s · cut_fired=%s · self=%d'
+            % (observed, b074, bool(job.get('cut_fired')), int(job.get('uid') or 0)),
             ok=False)
 
 
@@ -1427,8 +1562,14 @@ def _drive_native_queue(now):
                 set_status(
                     'Quái #%d chết — Ghost self tại T+%dms' % (select_uid, delay_ms))
                 return
-            # Abort training/client basic swing so skill 7074 is not stuck behind it.
-            _cancel_current_action('trước 7074 skill=%d target=%d' % (skill_id, select_uid))
+            # Cancel only if Training basic was recently dropped — unconditional
+            # cancel can abort the skill we are about to cast (no B070).
+            with lock:
+                basic_drops = int(state.get('basic_drop_count') or 0)
+            if basic_drops > 0:
+                _cancel_current_action(
+                    'trước 7074 skill=%d target=%d (basic_drops=%d)'
+                    % (skill_id, select_uid, basic_drops))
             packet = struct.pack('<BBIBI', 1, 4, skill_id, 1, select_uid)
             try:
                 api = inject_joymax(0x7074, packet, False)
@@ -1469,41 +1610,47 @@ def _drive_native_queue(now):
             return
 
         if phase == 'cut_wait':
-            # AG Timer owns the cut; backup poll if timer thread missed / died early.
+            # Event-loop is authoritative: fire at cut_at (do not wait on Timer thread).
             if job.get('cut_fired'):
                 return
             cut_at = float(job.get('cut_at') or 0)
             if cut_at and now < cut_at:
                 job['next_at'] = min(now + 0.02, cut_at)
                 return
-            timer = job.get('cut_timer')
-            if timer is not None:
-                try:
-                    alive = bool(timer.is_alive())
-                except Exception:
-                    alive = False
-                if alive:
-                    job['next_at'] = now + 0.02
-                    return
-                # Timer finished without arm(2) (often active cleared by close_session).
-                job['cut_timer'] = None
-                _log(
-                    'CUT TIMER dead without cut · backup arm(2) · self=%d · skill=%d'
-                    % (uid, int(job.get('skill_id') or 0)))
             delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
             anchor = job.get('cut_anchor') or 'B070'
-            if not _fire_native_cut(job, uid, now, reason='%s+%dms-backup' % (anchor, delay_ms)):
-                job['next_at'] = now + 0.01
+            cut_uid = int(job.get('cut_uid') or uid)
+            if not _fire_native_cut(
+                    job, cut_uid, now,
+                    reason='%s+%dms-loop' % (anchor, delay_ms)):
+                if now >= float(job.get('cut_deadline') or (now + 1)):
+                    job['error'] = state.get('last_nativcut_error') or 'arm(2) không kịp'
+                    with lock:
+                        if state['queue'] and state['queue'][0] is job:
+                            state['queue'].pop(0)
+                    _advance_or_finish(job, ok_shot=False)
+                    return
+                job['next_at'] = now + 0.05
                 return
             return
 
         if phase == 'cut_now':
-            # Timer thread flipped phase; ensure arm(2) landed (idempotent).
+            # Timer nudged phase; ensure arm(2) landed (idempotent).
             if not job.get('cut_fired'):
                 delay_ms = int(job.get('ghost_delay_ms') or DEFAULT_GHOST_DELAY_MS)
                 anchor = job.get('cut_anchor') or 'B070'
-                if not _fire_native_cut(job, uid, now, reason='%s+%dms' % (anchor, delay_ms)):
-                    job['next_at'] = now + 0.01
+                cut_uid = int(job.get('cut_uid') or uid)
+                if not _fire_native_cut(
+                        job, cut_uid, now,
+                        reason='%s+%dms-now' % (anchor, delay_ms)):
+                    if now >= float(job.get('cut_deadline') or (now + 1)):
+                        job['error'] = state.get('last_nativcut_error') or 'arm(2) không kịp'
+                        with lock:
+                            if state['queue'] and state['queue'][0] is job:
+                                state['queue'].pop(0)
+                        _advance_or_finish(job, ok_shot=False)
+                        return
+                    job['next_at'] = now + 0.05
             return
 
         if phase == 'arm':
@@ -1557,15 +1704,27 @@ def _drive_native_queue(now):
                 state['queue'].pop(0)
             state['active'] = None
             state['fail_count'] = int(state.get('fail_count') or 0) + 1
+            state['ghost_fail_count'] = int(state.get('ghost_fail_count') or 0) + 1
+            state['last_nativcut_error'] = job['error']
+            state['last_ghost_fail'] = job['error']
             state['next_scan_at'] = monotonic() + backoff
         set_stats()
         tip = ''
         if _is_hook_conflict_error(error):
-            tip = ' · backoff %gs — tắt Ghost AG hoặc unload AutoGhost nếu lặp lại' % (
-                HOOK_CONFLICT_BACKOFF_SEC)
+            tip = (
+                ' · backoff %gs — GHOST BLOCKED: tắt Ghost/PvP AutoGhost hoặc '
+                'unload AutoGhost (GetTickCount). NativeCut only, không inject 7081.'
+                % HOOK_CONFLICT_BACKOFF_SEC)
+        elif sys.platform != 'win32':
+            tip = ' · NativeCut chỉ chạy trên Windows phBot host'
         set_status(
-            'LỖI NativeCut %s UID=%d · %s%s'
+            'GHOST FAIL NativeCut %s UID=%d · %s%s'
             % (_safe_text(job.get('label')), uid, job['error'], tip))
+        _log(
+            'GHOST FAIL cycle · install/drive error · %s · cut_fired=%s · '
+            'observed_7081=%s · B074=%s'
+            % (job['error'], bool(job.get('cut_fired')),
+               bool(job.get('observed')), job.get('b074') or '(none)'))
         return
 
 
@@ -1712,14 +1871,19 @@ def handle_joymax(opcode, data):
             job = state.get('active')
 
         if opcode == 0xB070 and job is not None:
-            # Byte-for-byte with AutoGhost handle_joymax B070 scheduling gate:
-            #   len(data) >= 19; skill,source @3; target @15; data[0]==1 for cast.
-            # Then Timer(delay) → queue_interrupt → begin_native_cut → arm(2).
-            if job.get('phase') != 'wait_b070':
+            # AutoGhost gate: len>=19; skill,source @3; target @15; data[0]==1.
+            # Then delay → NativeCut arm(2) self (client_7081), never inject 7081.
+            phase = job.get('phase')
+            if phase != 'wait_b070':
                 return
             if job.get('cut_timer') is not None or job.get('cut_fired'):
                 return
             if len(raw) < 19 or raw[0] != 1:
+                if len(raw) >= 3:
+                    _log(
+                        'B070 IGNORE · phase=wait_b070 nhưng frame ngắn/không cast '
+                        'len=%d b0=%s hex=%s'
+                        % (len(raw), raw[0] if raw else '?', _hex_bytes(raw[:12])))
                 return
             skill, source = struct.unpack_from('<II', raw, 3)
             target = struct.unpack_from('<I', raw, 15)[0]
@@ -1727,13 +1891,27 @@ def handle_joymax(opcode, data):
             expect_target = int(job.get('select_uid') or job.get('monster_uid') or 0)
             self_uid = int(job.get('uid') or state.get('self_uid') or 0)
             if not expect_skill or skill != expect_skill:
+                _log(
+                    'B070 REJECT skill · got=%d expect=%d · source=%s target=%d · '
+                    'hex=%s (không hẹn Ghost — chờ đúng skill hoặc fallback 800ms)'
+                    % (skill, expect_skill, source, target, _hex_bytes(raw[:19])))
                 return
             if self_uid and source and source != self_uid:
-                return
-            if expect_target and target and target != expect_target:
+                _log(
+                    'B070 REJECT source · got=%d expect_self=%d · skill=%d target=%d'
+                    % (source, self_uid, skill, target))
                 return
             if self_uid and target == self_uid:
+                _log(
+                    'B070 REJECT self-target · skill=%d source=%d (buff/self — không Ghost farm)'
+                    % (skill, source))
                 return
+            if expect_target and target and target != expect_target:
+                # Still accept: monster UID can churn; skill+source already match.
+                _log(
+                    'B070 WARN target mismatch · got=%d expect=%d · vẫn hẹn Ghost '
+                    '(skill=%d source=%d)'
+                    % (target, expect_target, skill, source))
             now = monotonic()
             cast_at = float(job.get('cast_at') or 0)
             since_7074 = int(round((now - cast_at) * 1000)) if cast_at else -1
@@ -1742,10 +1920,10 @@ def handle_joymax(opcode, data):
             job['b070_at'] = now
             _log(
                 'S→C 0xB070 CAST CONFIRM · skill=%d · source=%s · target=%d · '
-                'since_7074=%dms · hẹn AG Timer(+%dms) → arm(2)'
+                'since_7074=%dms · hẹn NativeCut arm(2) sau +%dms (client_7081)'
                 % (skill, source, target, since_7074, delay_ms))
             set_status(
-                'B070 skill %d — Ghost self sau %dms (AG)'
+                'B070 skill %d — NativeCut self sau %dms (không inject)'
                 % (skill, delay_ms))
             _schedule_ag_cut_timer(job, int(job.get('uid') or self_uid), delay_ms,
                                    anchor='B070')
@@ -1784,8 +1962,8 @@ try:
     show_client()
     set_stats()
     set_status(
-        'Nạp %s v%s — Bật + Skill IDs + Start: 7045→7074→B070→Timer→arm(2); '
-        'farm đang DROP đánh thường.'
+        'Nạp %s v%s — Ghost = NativeCut self 7081 after B070 (NOT inject). '
+        'Bật+Skill+Start; log OK: arm(2)+7081+B074 02 00.'
         % (NAME, VERSION))
 except Exception as error:
     try:
