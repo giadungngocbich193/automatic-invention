@@ -2,6 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [UI ghep-2.6 meter width] Đo ngắt F1: cột Tên + B070→hit dùng LineEdit rộng (QtBind
+  Label "—" bị cắt 2 ký tự). Chỉ layout; cut timing không đổi.
 - [UI ghep-2.6] Auto PK full tab: skill buff inline + ID số → tên ngay + 1 dòng copy ID;
   ẩn □ AutoKS (session = Bật Auto KS). Đo ngắt: bảng F1 nhiều skill (B070→hit → cut ms).
 - [FIX party B074 loop v1.8.72] prefer UID: B074 = retry next skill (giữ prefer);
@@ -8845,21 +8847,23 @@ damage_margin_field = widget('meter', 'createLineEdit', '20', 230, 56, 42, 20)
 widget('meter', 'createButton', 'load_damage_meter_f1', 'Nạp F1', 285, 56)
 widget('meter', 'createButton', 'apply_damage_meter_f1', 'Ghi vào F1', 365, 56)
 damage_status_field = widget('meter', 'createLabel', 'Nạp F1 hoặc đo tay · 3 mẫu/skill · cùng đối thủ.', 10, 82)
+# phBot QtBind Labels keep the pixel width of their create-time text ("—"),
+# so Tên/B070→hit must be LineEdits with an explicit width or names clip to ~2 chars.
 widget('meter', 'createLabel', '#', 10, 104)
-widget('meter', 'createLabel', 'ID', 30, 104)
-widget('meter', 'createLabel', 'Tên', 115, 104)
-widget('meter', 'createLabel', 'B070→hit', 340, 104)
-widget('meter', 'createLabel', 'cut ms', 430, 104)
-widget('meter', 'createLabel', 'mẫu', 500, 104)
+widget('meter', 'createLabel', 'ID', 28, 104)
+widget('meter', 'createLabel', 'Tên', 105, 104)
+widget('meter', 'createLabel', 'B070→hit', 365, 104)
+widget('meter', 'createLabel', 'cut ms', 455, 104)
+widget('meter', 'createLabel', 'mẫu', 520, 104)
 damage_meter_f1_fields = []
 for _meter_row in range(DAMAGE_METER_F1_ROWS):
     _y = 122 + _meter_row * 22
     widget('meter', 'createLabel', str(_meter_row + 1), 10, _y + 3)
-    _id = widget('meter', 'createLineEdit', '', 30, _y, 78, 20)
-    _name = widget('meter', 'createLabel', '—', 115, _y + 3)
-    _hit = widget('meter', 'createLabel', '—', 340, _y + 3)
-    _cut = widget('meter', 'createLineEdit', '', 430, _y, 55, 20)
-    _samples = widget('meter', 'createLabel', '0/3', 500, _y + 3)
+    _id = widget('meter', 'createLineEdit', '', 28, _y, 70, 20)
+    _name = widget('meter', 'createLineEdit', '—', 105, _y, 250, 20)
+    _hit = widget('meter', 'createLineEdit', '—', 365, _y, 78, 20)
+    _cut = widget('meter', 'createLineEdit', '', 455, _y, 55, 20)
+    _samples = widget('meter', 'createLineEdit', '0/3', 520, _y, 42, 20)
     damage_meter_f1_fields.append((_id, _name, _hit, _cut, _samples))
 damage_suggested_field = widget('meter', 'createLineEdit', '', 560, 56, 55, 20)
 damage_conclusion_field = widget('meter', 'createLabel', '', 560, 82)
@@ -8872,7 +8876,7 @@ def _damage_meter_skill_name(uid):
     skill = skill_table().get(int(uid)) if uid else None
     if not skill:
         return '(chưa có trên acc)' if uid else '—'
-    return str(skill.get('name') or skill.get('servername') or ('ID %s' % uid))[:36]
+    return str(skill.get('name') or skill.get('servername') or ('ID %s' % uid))[:48]
 
 
 def clear_damage_meter_f1_row(index):
