@@ -82,4 +82,4 @@ Copy `GhostFarm.py` into phBot `Plugins/`, reload.
 
 jsDelivr pin:
 
-`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@b7ccf1ee8cd767e511d417c86d98c7b60021e3b1/GhostFarm.py`
+`https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@e03913630c9a94c5fe69497367ea8b2306e2f427/GhostFarm.py`
