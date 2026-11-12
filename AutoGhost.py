@@ -2,8 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [UI AOS-59] Skill rows F1–F3 (PvP + Auto PK): compact ↑↓ beside ID
-  (between ID and ms) to swap neighbor rows; Tắt stays disable-only.
+- [UI AOS-59] Skill rows F1–F3 (PvP + Auto PK): discrete ↑ and ↓
+  createButton beside ID (no 1–10 spinner/column); Tắt stays disable-only.
 - [FIX AOS-48] Tay phép PvP: combo bị frame đè → không mở/chọn được; remount
   checkbox+combo+Quét sau frame (cùng tọa độ). Auto PK gate sau khi chọn ID.
 - [FIX AOS-44] Auto PK: chặn mọi 7074 đánh thường (01 01 01) khi đang armed —
@@ -63,9 +63,9 @@ from phBot import (get_character_data, get_config_dir, get_monsters,
 
 
 NAME = 'AutoGhost'
-VERSION = '4.4.15'
-# raw-main download stamp: 2026-11-12T18:35Z (UTF-8 no BOM/U+200B)
-# [UI AOS-59] F1–F3 skill ↑↓ beside ID (PvP + Auto PK); Tắt = disable only.
+VERSION = '4.4.16'
+# raw-main download stamp: 2026-11-12T18:45Z (UTF-8 no BOM/U+200B)
+# [UI AOS-59] F1–F3 discrete ↑ ↓ buttons beside ID; remove 1–10 column.
 # [FIX AOS-48] Tay phép: remount combo/checkbox after PvP frame so Quét→chọn được.
 # ghep-2.6: Auto PK layout + F1 cut-ms table; baseline 2600 + party prefer B074
 PARTY_PREFER_B074_BACKOFF = 1.5
@@ -8915,7 +8915,7 @@ def show_skill_rows(editor=None):
             QtBind.setText(gui, delay, row.get('ms', ''))
             QtBind.setChecked(gui, cut, row.get('cut', True))
             set_checked_silent(selected, row.get('disabled', False))
-        QtBind.setText(gui, skill_row_labels[page], '%d–%d' % (start + 1, start + len(fields)))
+        # skill_row_labels kept for editor tuple compat; no visible 1–10 column.
 
 
 def select_skill_row(page, row, checked, editor=None):
@@ -9261,7 +9261,7 @@ for column, page in enumerate(PAGES):
     editor_view = 'pvp' if column == 0 else 'pvp_' + page
     pvp_page_boxes[page] = widget(editor_view, 'createCheckBox', toggle, page + ' · Bật đánh', x, 58)
     set_checked_silent(pvp_page_boxes[page], page != 'F3')
-    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (148, 'ms'), (183, 'Ngắt')):
+    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (152, 'ms'), (187, 'Ngắt')):
         widget(editor_view, 'createLabel', label, x + offset, 77)
     fields = []
     for row in range(10):
@@ -9269,18 +9269,19 @@ for column, page in enumerate(PAGES):
         name = 'skill_select_%s_%d' % (page, row)
         globals()[name] = lambda checked, p=page, r=row: select_skill_row(p, r, checked)
         selector = widget(editor_view, 'createCheckBox', name, '', x + 4, y)
-        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 88, 16)
+        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 78, 16)
         up_name = 'skill_row_up_%s_%d' % (page, row)
         down_name = 'skill_row_down_%s_%d' % (page, row)
         globals()[up_name] = lambda p=page, r=row: move_skill_row(p, r, -1)
         globals()[down_name] = lambda p=page, r=row: move_skill_row(p, r, 1)
-        widget(editor_view, 'createButton', up_name, '↑', x + 116, y - 1)
-        widget(editor_view, 'createButton', down_name, '↓', x + 132, y - 1)
-        delay = widget(editor_view, 'createLineEdit', '', x + 148, y, 34, 16)
-        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 188, y)
+        # Two separate push buttons (not a spinbox / not a 1–10 column).
+        widget(editor_view, 'createButton', up_name, '↑', x + 106, y - 2)
+        widget(editor_view, 'createButton', down_name, '↓', x + 128, y - 2)
+        delay = widget(editor_view, 'createLineEdit', '', x + 152, y, 34, 16)
+        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 192, y)
         fields.append((skill, delay, cut, selector))
     skill_row_fields[page] = fields
-    skill_row_labels[page] = widget(editor_view, 'createLabel', '1–10', x + 96, 77)
+    skill_row_labels[page] = widget('hidden', 'createLabel', '', 0, 0)
 
 
 pk_page_boxes, pk_skill_fields, pk_skill_labels = {}, {}, {}
@@ -9303,7 +9304,7 @@ for page in PVP_EDIT_PAGES:
     globals()[toggle] = lambda checked, p=page: auto_pk_page_changed(p, checked)
     pk_page_boxes[page] = widget(editor_view, 'createCheckBox', toggle, page + ' · Bật đánh', x, 105)
     set_checked_silent(pk_page_boxes[page], page == 'F2')
-    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (154, 'ms'), (196, 'Ngắt')):
+    for offset, label in ((0, 'Tắt'), (26, 'ID skill'), (168, 'ms'), (210, 'Ngắt')):
         widget(editor_view, 'createLabel', label, x + offset, 127)
     fields = []
     for row in range(10):
@@ -9311,18 +9312,19 @@ for page in PVP_EDIT_PAGES:
         name = 'pk_skill_select_%s_%d' % (page, row)
         globals()[name] = lambda checked, p=page, r=row: select_skill_row(p, r, checked, pk_skill_editor)
         selector = widget(editor_view, 'createCheckBox', name, '', x + 4, y)
-        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 92, 16)
+        skill = widget(editor_view, 'createLineEdit', '', x + 26, y, 95, 16)
         up_name = 'pk_skill_row_up_%s_%d' % (page, row)
         down_name = 'pk_skill_row_down_%s_%d' % (page, row)
         globals()[up_name] = lambda p=page, r=row: move_skill_row(p, r, -1, pk_skill_editor)
         globals()[down_name] = lambda p=page, r=row: move_skill_row(p, r, 1, pk_skill_editor)
-        widget(editor_view, 'createButton', up_name, '↑', x + 120, y - 1)
-        widget(editor_view, 'createButton', down_name, '↓', x + 136, y - 1)
-        delay = widget(editor_view, 'createLineEdit', '', x + 154, y, 36, 16)
-        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 196, y)
+        # Two separate push buttons beside ID (not a spinbox / not a 1–10 column).
+        widget(editor_view, 'createButton', up_name, '↑', x + 123, y - 2)
+        widget(editor_view, 'createButton', down_name, '↓', x + 145, y - 2)
+        delay = widget(editor_view, 'createLineEdit', '', x + 168, y, 36, 16)
+        cut = widget(editor_view, 'createCheckBox', 'skill_cut_changed', '', x + 210, y)
         fields.append((skill, delay, cut, selector))
     pk_skill_fields[page] = fields
-    pk_skill_labels[page] = widget(editor_view, 'createLabel', '1–10', x + 105, 127)
+    pk_skill_labels[page] = widget('hidden', 'createLabel', '', 0, 0)
 
 
 def selected_auto_pk_page():

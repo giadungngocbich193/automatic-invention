@@ -12,7 +12,7 @@ import types as _types
 import time as _time
 
 pName = 'hoang hiep'
-pVersion = '2.27'
+pVersion = '2.28'
 gui = _qt.init(__name__, pName + ' v' + pVersion)
 _hh_active_page = 'caravan'
 _hh_modules = {}
@@ -1365,7 +1365,7 @@ skill_switches, skill_widgets, page_labels = [], [], []
 grid = [[], []]
 for group, x in enumerate((12, 245)):
     skill_switches.append(QtBind.createCheckBox(gui, 'skill_row_changed', 'F%d · Bật đánh' % (group + 1), x, 74))
-    for label, dx in (('Tắt', 0), ('ID skill', 26), ('ms', 149), ('Ngắt', 194)):
+    for label, dx in (('Tắt', 0), ('ID skill', 26), ('ms', 168), ('Ngắt', 210)):
         QtBind.createLabel(gui, label, x + dx, 94)
     widgets = []
     for row, y in enumerate(range(108, 108 + SKILL_PAGE_SIZE * 17, 17)):
@@ -1373,16 +1373,17 @@ for group, x in enumerate((12, 245)):
         down = 'skill_row_down_%d_%d' % (group, row)
         globals()[up] = lambda g=group, r=row: move_skill_row(g, r, -1)
         globals()[down] = lambda g=group, r=row: move_skill_row(g, r, 1)
-        QtBind.createButton(gui, up, '↑', x + 115, y - 1)
-        QtBind.createButton(gui, down, '↓', x + 131, y - 1)
+        # Two separate push buttons beside ID (not a spinbox / not a 1–10 column).
+        QtBind.createButton(gui, up, '↑', x + 123, y - 2)
+        QtBind.createButton(gui, down, '↓', x + 145, y - 2)
         widgets.append((
-            QtBind.createLineEdit(gui, '', x + 25, y, 88, 16),
-            QtBind.createLineEdit(gui, '', x + 149, y, 39, 16),
-            QtBind.createCheckBox(gui, 'skill_row_changed', '', x + 194, y),
+            QtBind.createLineEdit(gui, '', x + 25, y, 95, 16),
+            QtBind.createLineEdit(gui, '', x + 168, y, 39, 16),
+            QtBind.createCheckBox(gui, 'skill_row_changed', '', x + 210, y),
             QtBind.createCheckBox(gui, 'skill_row_changed', '', x, y),
         ))
     skill_widgets.append(widgets)
-    page_labels.append(QtBind.createLabel(gui, '1–10', x + 96, 94))
+    page_labels.append(None)  # no visible 1–10 column
 
 QtBind.createButton(gui, 'save', 'Lưu cấu hình', 480, 239)
 bow_box = QtBind.createCheckBox(gui, 'bow_changed', 'Cung · 15 m', 480, 80)
@@ -1507,7 +1508,7 @@ def draw_skill_page(group):
         QtBind.setText(gui, ms_box, str(delay) if uid else '')
         QtBind.setChecked(gui, cut, interrupt is True)
         QtBind.setChecked(gui, off, disabled is True)
-    QtBind.setText(gui, page_labels[group], '%d–%d' % (start + 1, start + SKILL_PAGE_SIZE))
+    # page_labels removed — no visible 1–10 spinner/column between ID and ms.
 
 
 def capture_skill_page(group):
