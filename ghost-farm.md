@@ -1,52 +1,43 @@
-# GhostFarm v1.0.13
+# GhostFarm v1.0.14
 
-Standalone phBot farm Ghost loop: **cast → mid-cut at 7074+cfg_ms → next skill → repeat**.
+Standalone phBot farm Ghost loop: **cast → mid-window cut at 7074+cfg_ms → next skill**.
 
-**Locked A/B cut (GhostCutProbe 1.1.0):** NativeCut `client_7081` → **monster/boss UID ×2** (+15ms).  
-Never self primary · never player neighbor · never `inject_joymax(0x7081)`.
+## Honest rule (1.0.14)
+
+**B074 `02 00` alone is NOT Ghost.**  
+v1.0.13 logged OK MID-CUT on early 7081 + natural B074 (cfg 1/7/50 → since_7074 ~14/61) while the skill still looked full cast. That was **PACKET-FAKE**.
+
+Success now requires mid-window timing; status is **CUT TIMING OK · VERIFY VISUAL** (never “OK Ghost” from packets). Failures are loud **PACKET-FAKE FAIL** / **CFG-IGNORED** / **CUT-TOO-EARLY**.
 
 ## Cut path
 
-1. **7045** select living monster/boss in radius  
-2. Pre-warm NativeCut (`arm(1)` → `completed(4)`) — also at Start  
-3. DROP training basic · **7074** skill on monster/boss  
-4. Schedule **`cut_at = 7074 + cfg_ms`** (per-skill from Skill IDs)  
-5. Event-loop **`arm(2)`** at cut_at → retarget monster UID → **7081 ×2** (~15ms)  
-6. Success = observed 7081 + B074 `02 00` → **OK MID-CUT**  
+1. **7045** select living monster/boss  
+2. Pre-warm NativeCut (7081 mode)  
+3. **7074** skill on monster/boss  
+4. Cut at **7074 + cfg_ms** (default **100**; tiny ms auto-bumped ≥80 → 100)  
+5. Transport:
+   - **Monster/Boss 7081** (default): NativeCut `client_7081` ×2 (+15ms)
+   - **Weapon 7034**: bag↔weapon swap (probe A/B)
+6. Score B074 vs cut time — not B074 alone  
 
-## Modes
+Solo monster/boss only. No self primary. No player neighbor. No `inject_joymax(0x7081)`.
 
-| Mode | Behavior |
-|------|----------|
-| **Monster/Boss 7081** (default) | Cut UID = living monster/boss (locked winner) |
-| **Self (A/B fail)** | Combo kept for layout; cut still uses **monster UID** |
-
-## Skill IDs default (prefill)
+## Skill IDs default
 
 ```
-80031=1;66007=50;54016=1;81019=50;7678=1;81016=7;7653=50
+80031=100;66007=100;54016=100;81019=100;7678=100;81016=100;7653=100
 ```
-
-`=5`→`=50` when cut too fast; `=1` / `=7` kept as user wrote.
 
 ## Loud outcomes
 
 | Result | Meaning |
 |--------|---------|
-| **OK MID-CUT** | `cut_fired` + observed 7081 + B074 `02 00` |
-| **FULL-CAST FAIL** | Natural B074 **before** `arm(2)` |
-| **GHOST FAIL** | Miss this cycle |
-
-## User must set
-
-1. **Bật** ON  
-2. Mode: Monster/Boss (default)  
-3. Skill IDs (prefilled above)  
-4. **Start farm** on **Windows** phBot + Silkroad HWND  
-5. Disable Training; unload AutoGhost Ghost if GetTickCount conflict  
+| **CUT TIMING OK · VERIFY VISUAL** | Cut near cfg · B074 soon after cut · inside cast window — still confirm animation |
+| **PACKET-FAKE FAIL** | 7081/7034 + B074 02 00 but B074 late / full-cast length |
+| **CFG-IGNORED / CUT-TOO-EARLY** | Cut did not land on mid-window cfg |
+| **FULL-CAST FAIL** | Natural B074 before cut |
+| **GHOST FAIL** | Miss action / B074 / NativeCut error |
 
 ## jsDelivr
 
-https://cdn.jsdelivr.net/gh/giadungngocbich193/automatic-invention@c75ba0ba3e7697dea0f40fcd1a5c3e80a21255aa/GhostFarm.py
-
-Raw: https://github.com/giadungngocbich193/automatic-invention/raw/c75ba0ba3e7697dea0f40fcd1a5c3e80a21255aa/GhostFarm.py
+*(pin filled after ship commit)*
