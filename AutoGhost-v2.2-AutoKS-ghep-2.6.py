@@ -2,6 +2,9 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
+- [FIX Follow/AutoKS > local Auto PK] Khi Bật Auto KS hoặc PartyLeader
+  follow/prefer/hold: local Auto PK không tự chọn địch. AutoKS Ghost nhường
+  (tắt) local camp Auto PK; giữ PartyLeader prefer UID nếu đang lock.
 - [UI ghep-2.6 meter width] Đo ngắt F1: cột Tên + B070→hit dùng LineEdit rộng (QtBind
   Label "—" bị cắt 2 ký tự). Chỉ layout; cut timing không đổi.
 - [UI ghep-2.6] Auto PK full tab: skill buff inline + ID số → tên ngay + 1 dòng copy ID;
@@ -56,6 +59,7 @@ NAME = 'AutoGhost'
 VERSION = '2.2'
 # raw-main download stamp: 2026-11-11T19:59Z (UTF-8 no BOM/U+200B)
 # ghep-2.6: Auto PK layout + F1 cut-ms table; baseline 2600 + party prefer B074
+# + Follow/AutoKS beats local Auto PK target steal
 GHEP_TAG = 'ghep-2.6'
 PARTY_PREFER_B074_BACKOFF = 1.5
 CONFIG_NAME = 'GhostControl'  # Read the same profiles saved by previous releases.
@@ -4963,6 +4967,67 @@ def auto_pk_try_native_enemy_key(runtime, client, now, reason):
     return False
 
 
+def auto_ks_session_active():
+    """True when embedded AutoKS session checkbox «Bật Auto KS» is on."""
+    aks = globals().get('_autoks')
+    if not isinstance(aks, dict):
+        return False
+    active_fn = aks.get('active')
+    try:
+        return bool(callable(active_fn) and active_fn())
+    except Exception:
+        return False
+
+
+def party_follow_or_prefer_active(runtime=None):
+    """PartyLeader follow/prefer/hold owns target selection."""
+    runtime = auto_pk_runtime if runtime is None else runtime
+    if isinstance(runtime, dict):
+        if runtime.get('party_hold_fight'):
+            return True
+        if runtime.get('party_lock') or runtime.get('party_follow_mode'):
+            return True
+        try:
+            if int(runtime.get('party_sync_uid') or 0):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return bool(_party_leader_wants_keep_pk())
+
+
+def follow_or_ks_owns_target(runtime=None):
+    """Follow Leader / AutoKS beats local Auto PK camp select."""
+    return bool(auto_ks_session_active() or party_follow_or_prefer_active(runtime))
+
+
+def yield_local_auto_pk_to_follow(reason='Follow/AutoKS ưu tiên', source='AutoKS'):
+    """Stop local camp Auto PK so Follow/AutoKS can own Ghost.
+
+    Keeps Auto PK running when PartyLeader prefer UID is already locked
+    (that path IS Follow — not local steal). Returns True when local PK
+    is gone or only prefer remains.
+    """
+    if not auto_pk_running or auto_pk_runtime is None:
+        return True
+    runtime = auto_pk_runtime
+    prefer_uid = 0
+    try:
+        prefer_uid = int(runtime.get('party_sync_uid') or 0)
+    except (TypeError, ValueError):
+        prefer_uid = 0
+    if prefer_uid and (runtime.get('party_lock') or runtime.get('party_follow_mode')
+                       or is_party_sync_prefer_uid(prefer_uid, runtime)):
+        runtime['ks_defer_local'] = True
+        QtBind.setText(gui, auto_pk_status_label,
+                       'Follow prefer UID %d · local Auto PK không tự chọn · src=%s'
+                       % (prefer_uid, source))
+        log('[%s] yield local Auto PK → giữ prefer UID %d (%s: %s)'
+            % (NAME, prefer_uid, source, reason))
+        return True
+    stop_auto_pk(reason='%s · %s' % (source, reason))
+    return not auto_pk_running
+
+
 def auto_pk_select(character, runtime, now, from_event=False):
     global pvp_selection_request, direct_select_request
     if (now < max(runtime['select_until'], runtime.get('native_probe_until', 0),
@@ -4975,25 +5040,40 @@ def auto_pk_select(character, runtime, now, from_event=False):
                        'Party hold · chờ chủ chọn/đánh lại.')
         return
     party_uid = int(runtime.get('party_sync_uid') or 0)
-    if runtime.get('party_lock') and party_uid:
+    party_follow = bool(runtime.get('party_lock') or runtime.get('party_follow_mode')
+                        or runtime.get('ks_defer_local'))
+    # Follow / AutoKS owns selection: only Prefer UID, never local camp steal.
+    if auto_ks_session_active() or party_follow or party_uid:
+        if party_uid and (runtime.get('party_lock') or runtime.get('party_follow_mode')
+                          or runtime.get('ks_defer_local') or auto_ks_session_active()):
+            runtime.pop('native_probe_until', None)
+            runtime.pop('select_in_event', None)
+            runtime['party_follow_mode'] = True
+            if pvp_target and pvp_target != party_uid:
+                release_auto_pk_target(pvp_target, 'khác UID chủ · bỏ')
+            # Already preferred/locked → ensure Ghost armed+cast (no re-log storm).
+            if pvp_target == party_uid or direct_target == party_uid:
+                if not pvp_armed or pvp_paused:
+                    party_sync_select_uid(
+                        party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+                elif direct_expected is None and direct_skills:
+                    try:
+                        rotate_direct(get_character_data() or {}, gate_checked=True)
+                    except Exception:
+                        pass
+                return
+            # Bind prefer + Ghost cast immediately (no 7045 loop).
+            party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+            return
+        # AutoKS session or party follow armed but no Prefer UID yet — do not camp-scan.
         runtime.pop('native_probe_until', None)
         runtime.pop('select_in_event', None)
-        runtime['party_follow_mode'] = True
-        if pvp_target and pvp_target != party_uid:
-            release_auto_pk_target(pvp_target, 'khác UID chủ · bỏ')
-        # Already preferred/locked → ensure Ghost armed+cast (no re-log storm).
-        if pvp_target == party_uid or direct_target == party_uid:
-            if not pvp_armed or pvp_paused:
-                party_sync_select_uid(
-                    party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
-            elif direct_expected is None and direct_skills:
-                try:
-                    rotate_direct(get_character_data() or {}, gate_checked=True)
-                except Exception:
-                    pass
-            return
-        # Bind prefer + Ghost cast immediately (no 7045 loop).
-        party_sync_select_uid(party_uid, source=runtime.get('party_sync_source') or 'PartyLeader')
+        if auto_ks_session_active():
+            QtBind.setText(gui, auto_pk_status_label,
+                           'AutoKS đang bật · local Auto PK không tự chọn địch.')
+        else:
+            QtBind.setText(gui, auto_pk_status_label,
+                           'Party follow · chờ UID chủ · không tự chọn địch.')
         return
     # Expire Target probe quietly (no Log spam); keep flag for skill-probe fallback.
     native_expired = bool(runtime.pop('native_probe_until', 0))
@@ -9980,7 +10060,13 @@ def arm_leader_pvp(ghost):
     if ghost is None or leader_arm_attempt is ghost:
         return
     if ghost_auto_pk_running(ghost):
-        return
+        # Follow/AutoKS beats local Auto PK — yield camp PK before arming Chủ PvP.
+        yield_fn = getattr(ghost, 'yield_local_auto_pk_to_follow', None)
+        if callable(yield_fn):
+            yield_fn('AutoKS Chủ arm PvP', source='AutoKS')
+        if ghost_auto_pk_running(ghost):
+            # Prefer UID still locked (PartyLeader Follow) — leave Alone.
+            return
     leader_arm_attempt = ghost
     start = getattr(ghost, 'start_clicked', None)
     pvp_box = getattr(ghost, 'pvp_box', None)
@@ -10045,11 +10131,17 @@ def start_ghost(group, role):
     if not all(callable(getattr(ghost, hook, None)) for hook in hooks):
         report('AutoGhost thiếu hàm Ghost PvP cần cho AutoKS.')
         return
-    with ghost.pvp_lock:
+    # Priority: Follow/AutoKS > local Auto PK. Yield camp select before Ghost.
+    if ghost_auto_pk_running(ghost):
+        yield_fn = getattr(ghost, 'yield_local_auto_pk_to_follow', None)
+        if callable(yield_fn):
+            yield_fn('AutoKS Follow ưu tiên Ghost', source='AutoKS')
         if ghost_auto_pk_running(ghost):
-            report('Acc %s: AutoGhost %s báo Auto PK đang chạy (%s).'
-                   % (role, getattr(ghost, 'VERSION', '?'), ghost.__name__))
+            report('Acc %s: PartyLeader prefer đang giữ Auto PK — không tranh Ghost AutoKS.'
+                   % role)
             return
+        report('Acc %s: đã nhường local Auto PK cho AutoKS Follow.' % role)
+    with ghost.pvp_lock:
         players = ghost.auto_pk_players() or {}
         player = players.get(selected) or players.get(str(selected))
         if (not allowed_target(selected) or not ghost.pvp_person_target(selected)
@@ -10367,6 +10459,9 @@ def stop_tab_auto_pk():
 def _autoks_on_enable(checked):
     # Forward always; standalone gates only on the "Bật Auto KS" checkbox.
     _autoks['on_enable'](checked)
+    # Session ON → local Auto PK must not steal; yield camp immediately.
+    if checked:
+        yield_local_auto_pk_to_follow('Bật Auto KS · nhường Follow', source='AutoKS')
 
 
 def pvp_changed(checked):
@@ -10389,4 +10484,4 @@ for _tab_box in _tab_switches.values():
 del _tab_box
 
 show_view('pvp')
-log('[%s] Đã nạp thành công v%s %s [Auto PK buff ID→tên + copy, ẩn □ AutoKS, đo ngắt bảng F1 B070→hit].' % (NAME, VERSION, GHEP_TAG))
+log('[%s] Đã nạp thành công v%s %s [Follow/AutoKS > local Auto PK · buff ID→tên · ẩn □ AutoKS · đo F1 B070→hit].' % (NAME, VERSION, GHEP_TAG))
