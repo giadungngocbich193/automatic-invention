@@ -2,8 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [UI AOS-43] Tìm Skill: danh sách cuộn (hết trang 6 dòng); lọc tên/ID sống;
-  gõ ID số → tên + ô Copy ngay. Không đụng layout Auto PK/PvP/buff.
+- [UI AOS-43] Tìm Skill: bảng ID/Tên/Lv/Copy (8 dòng + trang gọn); lọc sống
+  tên/ID; sửa hiển thị tên lỗi mã hóa. Không đụng Auto PK/PvP/buff.
 - [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); không đổi Auto PK/PvP.
 - [AOS-41 F2] Auto PK áp sát F2 = 15 m (F1 vẫn 6 m); camp/attack vẫn 40 m.
 - [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 15 m;
@@ -357,41 +357,57 @@ widget('hidden', 'createLabel', 'Dãy nháp tự gom: ID=ms; ... — sửa tại
 probe_draft_field = widget('hidden', 'createLineEdit', '', 10, 216, 580, 20)
 # The old probe widgets remain hidden compatibility storage. The visible finder
 # only reads learned skills and the clipboard; it never edits combat settings.
-# AOS-43: scrollable list (no 6-row pager) + live name/ID filter + ID→tên pick.
+# AOS-43: neat table rows (ID / Tên / Lv / Copy) + live filter + compact pages.
+FINDER_PAGE_ROWS = 8
 widget('tools', 'createLabel', 'Lọc tên / ID', 10, 36)
-finder_query_field = widget('tools', 'createLineEdit', '', 95, 32, 280, 22)
-widget('tools', 'createButton', 'search_skill_finder', 'Lọc', 385, 31)
-widget('tools', 'createButton', 'refresh_skill_finder', 'Quét lại', 440, 31)
-widget('tools', 'createButton', 'clear_skill_finder', 'Xóa', 520, 31)
+finder_query_field = widget('tools', 'createLineEdit', '', 95, 32, 300, 22)
+widget('tools', 'createButton', 'search_skill_finder', 'Lọc', 405, 31)
+widget('tools', 'createButton', 'refresh_skill_finder', 'Quét lại', 460, 31)
+widget('tools', 'createButton', 'clear_skill_finder', 'Xóa', 545, 31)
 finder_id_preview = widget(
     'tools', 'createLabel',
-    'Gõ ID số → tên ngay · gõ chữ → lọc danh sách (cuộn, không trang).', 10, 58)
-finder_status_label = widget('tools', 'createLabel', 'Chưa quét skill.', 10, 78)
-widget('tools', 'createLabel', 'ID', 10, 100)
-widget('tools', 'createLabel', 'Tên', 95, 100)
-widget('tools', 'createLabel', 'Lv', 520, 100)
-finder_list = widget('tools', 'createList', 10, 118, 655, 148)
-widget('tools', 'createLabel', 'ID chọn', 10, 276)
-finder_pick_field = widget('tools', 'createLineEdit', '', 70, 272, 100, 22)
-finder_pick_name = widget('tools', 'createLineEdit', '', 180, 272, 300, 22)
-widget('tools', 'createButton', 'copy_finder_pick_id', 'Copy ID', 490, 271)
-widget('tools', 'createButton', 'copy_finder_first_id', 'Copy đầu', 575, 271)
+    'Gõ tên hoặc ID số → lọc ngay · Copy trên từng dòng.', 10, 58)
+finder_status_label = widget('tools', 'createLabel', 'Chưa quét skill.', 10, 76)
+widget('tools', 'createLabel', '#', 10, 96)
+widget('tools', 'createLabel', 'ID', 32, 96)
+widget('tools', 'createLabel', 'Tên', 118, 96)
+widget('tools', 'createLabel', 'Lv', 500, 96)
+widget('tools', 'createLabel', 'Copy', 555, 96)
+finder_row_fields = []
+for _finder_i in range(FINDER_PAGE_ROWS):
+    _fy = 114 + _finder_i * 20
+    widget('tools', 'createLabel', str(_finder_i + 1), 10, _fy + 2)
+    _fid = widget('tools', 'createLineEdit', '', 28, _fy, 82, 18)
+    _fname = widget('tools', 'createLineEdit', '', 118, _fy, 372, 18)
+    _flv = widget('tools', 'createLineEdit', '', 500, _fy, 42, 18)
+    _fcb = 'copy_finder_id_%d' % _finder_i
+    globals()[_fcb] = (lambda index=_finder_i: copy_finder_id(index))
+    widget('tools', 'createButton', _fcb, 'Copy', 552, _fy - 1)
+    finder_row_fields.append((_fid, _fname, _flv))
+widget('tools', 'createButton', 'finder_previous', '◀', 10, 278)
+finder_page_label = widget('tools', 'createLabel', '0 kết quả', 50, 282)
+widget('tools', 'createButton', 'finder_next', '▶', 200, 278)
+widget('tools', 'createLabel', 'ID chọn', 250, 282)
+finder_pick_field = widget('tools', 'createLineEdit', '', 310, 278, 78, 20)
+finder_pick_name = widget('tools', 'createLineEdit', '', 396, 278, 160, 20)
+widget('tools', 'createButton', 'copy_finder_pick_id', 'Copy ID', 565, 277)
 finder_owner = None
 finder_skills = []
 finder_matches = []
 finder_offset = 0
 finder_visible_ids = []
-finder_row_fields = []  # legacy empty — row pager removed in AOS-43
 _finder_live_query = None
-widget('tools', 'createButton', 'start_hotbar_finder', 'Dò ô số', 10, 300)
-widget('tools', 'createButton', 'stop_hotbar_finder', 'Dừng', 95, 300)
-hotbar_slot_label = widget('tools', 'createLabel', 'Ô: —', 165, 304)
-hotbar_id_field = widget('tools', 'createLineEdit', '', 210, 300, 80, 22)
-hotbar_name_field = widget('tools', 'createLineEdit', '', 300, 300, 250, 22)
-widget('tools', 'createButton', 'copy_hotbar_id', 'Copy', 560, 299)
+_finder_list_sig = None  # unused after table redo; kept for safe reload
+finder_list = None  # list widget removed — table rows only
+widget('tools', 'createButton', 'start_hotbar_finder', 'Dò ô số', 10, 304)
+widget('tools', 'createButton', 'stop_hotbar_finder', 'Dừng', 95, 304)
+hotbar_slot_label = widget('tools', 'createLabel', 'Ô: —', 160, 308)
+hotbar_id_field = widget('tools', 'createLineEdit', '', 205, 304, 78, 20)
+hotbar_name_field = widget('tools', 'createLineEdit', '', 292, 304, 255, 20)
+widget('tools', 'createButton', 'copy_hotbar_id', 'Copy', 555, 303)
 hotbar_status_label = widget(
     'tools', 'createLabel',
-    'Dò ô số: bấm skill trong game → ID hiện ở đây.', 10, 326)
+    'Dò ô số: bấm skill trong game → ID hiện ở đây.', 10, 328)
 hotbar_found = None
 
 # Auto PK main tab: camp controls above its independent Ghost editor.
@@ -6239,38 +6255,66 @@ def normalize_finder_text(text):
                    if not unicodedata.combining(char))
 
 
+def finder_display_text(value):
+    """Fix common SRO/phBot mojibake so Vietnamese skill names stay readable."""
+    text = str(value or '')
+    if not text:
+        return text
+    # Already has Vietnamese Latin Extended Additional — keep as-is.
+    if any(0x1ea0 <= ord(c) <= 0x1ef9 for c in text):
+        return text
+    for src_enc, dst_enc in (
+            ('latin1', 'utf-8'),
+            ('cp1252', 'utf-8'),
+            ('latin1', 'cp1258'),
+            ('cp1252', 'cp1258')):
+        try:
+            fixed = text.encode(src_enc).decode(dst_enc)
+        except (LookupError, UnicodeDecodeError, UnicodeEncodeError):
+            continue
+        if not fixed or fixed == text or '\ufffd' in fixed:
+            continue
+        if any(0x1ea0 <= ord(c) <= 0x1ef9 for c in fixed):
+            return fixed
+        if any(mark in text for mark in ('¾', 'ð', 'ø', '¹', 'µ')) and not any(
+                mark in fixed for mark in ('¾', 'ð', 'ø')):
+            return fixed
+    return text
+
+
 def refresh_skill_finder():
-    global finder_owner,finder_skills,_finder_live_query
-    finder_owner=owner_of(get_character_data() or {})
-    finder_skills=[]
-    _finder_live_query=None
+    global finder_owner, finder_skills, _finder_live_query
+    finder_owner = owner_of(get_character_data() or {})
+    finder_skills = []
+    _finder_live_query = None
     if finder_owner is not None:
-        for uid,skill in (get_skills() or {}).items():
-            try:uid=int(uid)
-            except (ValueError,TypeError):continue
-            if uid<=0 or not isinstance(skill,dict):continue
-            name=str(skill.get('name') or skill.get('servername') or '(chưa có tên)')
-            finder_skills.append({'id':uid,'name':name,'level':str(skill.get('level','')),
-                                  'search':normalize_finder_text('%s %s %s'%(uid,name,skill.get('servername','')))})
-        finder_skills.sort(key=lambda row:(normalize_finder_text(row['name']),row['id']))
+        for uid, skill in (get_skills() or {}).items():
+            try:
+                uid = int(uid)
+            except (ValueError, TypeError):
+                continue
+            if uid <= 0 or not isinstance(skill, dict):
+                continue
+            raw_name = str(skill.get('name') or skill.get('servername') or '(chưa có tên)')
+            name = finder_display_text(raw_name)
+            server = finder_display_text(str(skill.get('servername') or ''))
+            finder_skills.append({
+                'id': uid,
+                'name': name,
+                'level': str(skill.get('level', '')),
+                'search': normalize_finder_text('%s %s %s %s' % (uid, name, raw_name, server)),
+            })
+        finder_skills.sort(key=lambda row: (normalize_finder_text(row['name']), row['id']))
     search_skill_finder()
-
-
-def _finder_format_row(row):
-    """One scrollable list line: ID | name | Lv."""
-    name = str(row.get('name') or '')[:42]
-    level = str(row.get('level') or '').strip() or '—'
-    return '%-8s | %-42s | Lv %s' % (row.get('id'), name, level)
 
 
 def _finder_id_preview_text(raw_query):
     """Live line: digits → resolve name on this account (buff-name pattern)."""
     text = (raw_query or '').strip()
     if not text:
-        return 'Gõ chữ để lọc · gõ ID số → tên ngay · cuộn danh sách (không trang).'
+        return 'Gõ tên hoặc ID số → lọc ngay · Copy trên từng dòng.'
     if not text.isdigit():
-        return 'Lọc tên / không dấu: «%s» · %d khớp · Copy đầu hoặc sửa ô ID chọn.' % (
-            text[:36], len(finder_matches))
+        return 'Lọc «%s» · %d khớp · dùng ◀ ▶ để xem thêm.' % (text[:36], len(finder_matches))
     try:
         uid = int(text)
     except ValueError:
@@ -6279,21 +6323,23 @@ def _finder_id_preview_text(raw_query):
         return 'ID ngoài phạm vi.'
     skill = skill_table().get(uid)
     if skill:
-        name = str(skill.get('name') or skill.get('servername') or ('ID %d' % uid))
-        return 'ID %d → %s  ·  đã điền ô Copy.' % (uid, name[:48])
+        name = finder_display_text(str(skill.get('name') or skill.get('servername') or ('ID %d' % uid)))
+        return 'ID %d → %s  ·  đã điền ô Copy ID.' % (uid, name[:42])
     if any(str(row['id']).startswith(text) for row in finder_skills):
-        return 'ID %d… · đang lọc prefix · gõ đủ số hoặc Copy đầu danh sách.' % uid
+        return 'ID %d… · đang lọc prefix · gõ đủ số hoặc Copy dòng khớp.' % uid
     return 'ID %d · (chưa có trên acc) — vẫn Copy được nếu bạn biết ID.' % uid
 
 
 def _finder_apply_pick(row):
-    """Fill the single pick LineEdits used for Copy ID."""
+    """Fill the pick LineEdits used for Copy ID (digit resolve / first match)."""
     if not row:
         QtBind.setText(gui, finder_pick_field, '')
         QtBind.setText(gui, finder_pick_name, '')
         return
     QtBind.setText(gui, finder_pick_field, str(row['id']))
-    QtBind.setText(gui, finder_pick_name, '%s · Lv %s' % (row.get('name') or '', row.get('level') or '—'))
+    QtBind.setText(
+        gui, finder_pick_name,
+        '%s · Lv %s' % (finder_display_text(row.get('name') or ''), row.get('level') or '—'))
 
 
 def search_skill_finder():
@@ -6324,7 +6370,6 @@ def search_skill_finder():
         finder_matches = list(finder_skills)
     finder_offset = 0
     show_skill_finder()
-    # Digits / filter → auto-fill pick LineEdit for one-click Copy ID.
     pick = None
     if query.isdigit():
         exact = next((row for row in finder_matches if str(row['id']) == query), None)
@@ -6337,7 +6382,8 @@ def search_skill_finder():
             if skill:
                 pick = {
                     'id': int(query),
-                    'name': str(skill.get('name') or skill.get('servername') or ''),
+                    'name': finder_display_text(
+                        str(skill.get('name') or skill.get('servername') or '')),
                     'level': str(skill.get('level') or ''),
                 }
     elif len(finder_matches) == 1:
@@ -6347,8 +6393,8 @@ def search_skill_finder():
     _finder_apply_pick(pick)
     QtBind.setText(gui, finder_id_preview, _finder_id_preview_text(raw))
     message = (
-        '%d / %d skill · cuộn danh sách · Copy ID / Copy đầu.'
-        % (len(finder_matches), len(finder_skills))
+        '%d / %d skill · bảng %d dòng/trang · Copy trên dòng hoặc ô ID chọn.'
+        % (len(finder_matches), len(finder_skills), FINDER_PAGE_ROWS)
         if finder_owner else
         'Chưa vào game — đăng nhập rồi bấm Quét lại.')
     QtBind.setText(gui, finder_status_label, message)
@@ -6369,25 +6415,27 @@ def tick_skill_finder_live():
     search_skill_finder()
 
 
-_finder_list_sig = None
-
-
 def show_skill_finder():
-    """Rebuild the scrollable list — all matches, no 6-row pager.
-
-    Skip clear/append when the visible ID set is unchanged (avoids UI hitch
-    while typing filters that still match the same rows).
-    """
-    global finder_visible_ids, _finder_list_sig
-    ids = [row['id'] for row in finder_matches]
-    sig = tuple(ids)
-    if sig == _finder_list_sig and finder_visible_ids == ids:
-        return
-    _finder_list_sig = sig
-    finder_visible_ids = ids
-    QtBind.clear(gui, finder_list)
-    for row in finder_matches:
-        QtBind.append(gui, finder_list, _finder_format_row(row))
+    """Fill aligned table rows for the current page of matches."""
+    global finder_visible_ids
+    page = FINDER_PAGE_ROWS if FINDER_PAGE_ROWS > 0 else 8
+    rows = finder_matches[finder_offset:finder_offset + page]
+    finder_visible_ids = [row['id'] for row in rows]
+    for index, fields in enumerate(finder_row_fields):
+        if index < len(rows):
+            row = rows[index]
+            values = (str(row['id']), finder_display_text(row.get('name') or ''), str(row.get('level') or ''))
+        else:
+            values = ('', '', '')
+        for field, value in zip(fields, values):
+            QtBind.setText(gui, field, value)
+    count = len(finder_matches)
+    if count:
+        first = finder_offset + 1
+        last = min(finder_offset + page, count)
+        QtBind.setText(gui, finder_page_label, '%d–%d / %d' % (first, last, count))
+    else:
+        QtBind.setText(gui, finder_page_label, '0 kết quả')
 
 
 def clear_skill_finder():
@@ -6396,17 +6444,28 @@ def clear_skill_finder():
 
 
 def finder_previous():
-    """AOS-43: pager removed; keep stub for old button refs."""
-    search_skill_finder()
+    global finder_offset
+    if finder_owner != owner_of(get_character_data() or {}):
+        refresh_skill_finder()
+        return
+    page = FINDER_PAGE_ROWS if FINDER_PAGE_ROWS > 0 else 8
+    finder_offset = max(0, finder_offset - page)
+    show_skill_finder()
 
 
 def finder_next():
-    """AOS-43: pager removed; keep stub for old button refs."""
-    search_skill_finder()
+    global finder_offset
+    if finder_owner != owner_of(get_character_data() or {}):
+        refresh_skill_finder()
+        return
+    page = FINDER_PAGE_ROWS if FINDER_PAGE_ROWS > 0 else 8
+    if finder_offset + page < len(finder_matches):
+        finder_offset += page
+        show_skill_finder()
 
 
 def copy_finder_pick_id():
-    """Copy the ID in the pick field (filled by ID digits or first/exact match)."""
+    """Copy the ID in the pick field (filled by ID digits or first match)."""
     if finder_owner != owner_of(get_character_data() or {}):
         refresh_skill_finder()
         QtBind.setText(gui, finder_status_label, 'Nhân vật đã đổi; đã quét lại.')
@@ -6414,26 +6473,13 @@ def copy_finder_pick_id():
     uid = QtBind.text(gui, finder_pick_field).strip()
     if not uid.isdigit():
         QtBind.setText(gui, finder_status_label,
-                       'Chưa có ID chọn — gõ ID/tên để lọc, hoặc bấm Copy đầu.')
+                       'Chưa có ID chọn — gõ ID/tên để lọc, hoặc Copy trên dòng.')
         return
     if put_finder_clipboard(uid):
         QtBind.setText(gui, finder_status_label, 'Đã copy ID ' + uid + '.')
     else:
         QtBind.setText(gui, finder_status_label,
                        'Chưa copy được. ID ' + uid + ': chọn ô ID chọn, Ctrl+A rồi Ctrl+C.')
-
-
-def copy_finder_first_id():
-    """Copy the first filtered list row — browse-friendly for name search."""
-    if finder_owner != owner_of(get_character_data() or {}):
-        refresh_skill_finder()
-        return
-    if not finder_matches:
-        QtBind.setText(gui, finder_status_label, 'Danh sách trống — gõ lọc hoặc Quét lại.')
-        return
-    _finder_apply_pick(finder_matches[0])
-    copy_finder_pick_id()
-
 
 def put_finder_clipboard(text):
     """Use Unicode clipboard only on the UI's explicit Copy action."""
