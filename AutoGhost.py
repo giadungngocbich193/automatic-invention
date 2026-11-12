@@ -2,8 +2,8 @@
 """Ghost PvP và Boss nền theo ID cho phBot Stable.
 
 Changelog (verify in Log / file header):
-- [UI AOS-43] Tìm Skill: gõ ID → tên ngay; Copy ID / Copy dòng; Thêm vào F1–F3
-  (Auto PK hoặc PvP). Bỏ bảng/list. Không đụng layout tab khác.
+- [UI AOS-43] Tìm Skill: bảng 1 hàng trống mặc định; gõ ID → chỉ hiện skill đó;
+  Copy / Thêm F1–F3 (Auto PK hoặc PvP). Không dump list. Tab khác nguyên.
 - [UI AOS-41] Đo ngắt: cột cân đối Tên rộng (LineEdit); không đổi Auto PK/PvP.
 - [AOS-41 F2] Auto PK áp sát F2 = 15 m (F1 vẫn 6 m); camp/attack vẫn 40 m.
 - [PORT AOS-40] Giữ layout AutoGhost v4.3 user: F1 áp sát 6 m / F2 15 m;
@@ -357,34 +357,36 @@ widget('hidden', 'createButton', 'clear_probe_draft', 'Xóa dãy nháp', 420, 17
 widget('hidden', 'createLabel', 'Dãy nháp tự gom: ID=ms; ... — sửa tại đây, Ctrl+A / Ctrl+C để copy', 10, 199)
 probe_draft_field = widget('hidden', 'createLineEdit', '', 10, 216, 580, 20)
 # The old probe widgets remain hidden compatibility storage.
-# AOS-43: simple ID → tên → Copy / Thêm (no skill table/list on this tab).
-FINDER_PAGE_ROWS = 0  # no browse table
-widget('tools', 'createLabel', 'ID skill', 10, 40)
-finder_query_field = widget('tools', 'createLineEdit', '', 80, 36, 120, 22)
-finder_pick_field = finder_query_field  # alias: same ID box for Copy/Add
-widget('tools', 'createLabel', 'Tên', 220, 40)
-finder_pick_name = widget('tools', 'createLineEdit', '', 255, 36, 300, 22)
-widget('tools', 'createLabel', 'Lv', 570, 40)
-finder_level_field = widget('tools', 'createLineEdit', '', 600, 36, 45, 22)
+# AOS-43: empty one-row table by default; typing an ID shows ONLY that skill.
+FINDER_PAGE_ROWS = 1
+widget('tools', 'createLabel', 'ID skill', 10, 36)
+finder_query_field = widget('tools', 'createLineEdit', '', 80, 32, 120, 22)
+finder_pick_field = finder_query_field
 finder_id_preview = widget(
     'tools', 'createLabel',
-    'Gõ ID số → tên hiện ngay. Copy rồi dán, hoặc Thêm vào bảng skill.', 10, 68)
-widget('tools', 'createLabel', 'Thêm vào', 10, 98)
-finder_dest_field = widget('tools', 'createCombobox', 80, 94, 160, 22)
+    'Bảng trống · gõ ID → hiện đúng 1 skill. Không dump cả list.', 220, 36)
+widget('tools', 'createLabel', 'ID', 28, 68)
+widget('tools', 'createLabel', 'Tên', 118, 68)
+widget('tools', 'createLabel', 'Lv', 500, 68)
+# Single result row — empty until an ID resolves.
+finder_result_id = widget('tools', 'createLineEdit', '', 28, 88, 82, 20)
+finder_pick_name = widget('tools', 'createLineEdit', '', 118, 88, 372, 20)
+finder_level_field = widget('tools', 'createLineEdit', '', 500, 88, 42, 20)
+widget('tools', 'createButton', 'copy_finder_pick_id', 'Copy', 552, 87)
+finder_row_fields = [(finder_result_id, finder_pick_name, finder_level_field)]
+widget('tools', 'createLabel', 'Thêm vào', 10, 124)
+finder_dest_field = widget('tools', 'createCombobox', 80, 120, 160, 22)
 for _finder_dest in (
         'Auto PK · F1', 'Auto PK · F2', 'Auto PK · F3',
         'PvP · F1', 'PvP · F2', 'PvP · F3'):
     QtBind.append(gui, finder_dest_field, _finder_dest)
 QtBind.setText(gui, finder_dest_field, 'Auto PK · F2')
-widget('tools', 'createButton', 'copy_finder_pick_id', 'Copy ID', 260, 93)
-widget('tools', 'createButton', 'copy_finder_line', 'Copy dòng', 350, 93)
-widget('tools', 'createButton', 'add_finder_skill', 'Thêm', 460, 93)
-widget('tools', 'createButton', 'clear_skill_finder', 'Xóa', 545, 93)
+widget('tools', 'createButton', 'copy_finder_line', 'Copy dòng', 260, 119)
+widget('tools', 'createButton', 'add_finder_skill', 'Thêm', 370, 119)
+widget('tools', 'createButton', 'clear_skill_finder', 'Xóa', 450, 119)
 finder_status_label = widget(
     'tools', 'createLabel',
-    'Chỉ cần ID · không duyệt danh sách 170 skill tại đây.', 10, 128)
-# Compatibility shims for older callbacks / live tick.
-finder_row_fields = []
+    'Chưa có ID · hàng kết quả đang trống.', 10, 152)
 finder_owner = None
 finder_skills = []
 finder_matches = []
@@ -394,15 +396,15 @@ _finder_live_query = None
 _finder_list_sig = None
 finder_list = None
 finder_page_label = finder_status_label
-widget('tools', 'createButton', 'start_hotbar_finder', 'Dò ô số', 10, 160)
-widget('tools', 'createButton', 'stop_hotbar_finder', 'Dừng', 105, 160)
-hotbar_slot_label = widget('tools', 'createLabel', 'Ô: —', 175, 164)
-hotbar_id_field = widget('tools', 'createLineEdit', '', 220, 160, 90, 22)
-hotbar_name_field = widget('tools', 'createLineEdit', '', 320, 160, 235, 22)
-widget('tools', 'createButton', 'copy_hotbar_id', 'Copy', 565, 159)
+widget('tools', 'createButton', 'start_hotbar_finder', 'Dò ô số', 10, 184)
+widget('tools', 'createButton', 'stop_hotbar_finder', 'Dừng', 105, 184)
+hotbar_slot_label = widget('tools', 'createLabel', 'Ô: —', 175, 188)
+hotbar_id_field = widget('tools', 'createLineEdit', '', 220, 184, 90, 22)
+hotbar_name_field = widget('tools', 'createLineEdit', '', 320, 184, 235, 22)
+widget('tools', 'createButton', 'copy_hotbar_id', 'Copy', 565, 183)
 hotbar_status_label = widget(
     'tools', 'createLabel',
-    'Dò ô số (tuỳ chọn): bấm skill trong game → hiện ID · có thể Copy vào ô trên.', 10, 192)
+    'Dò ô số (tuỳ chọn): bấm skill trong game → điền ID vào ô trên.', 10, 216)
 hotbar_found = None
 
 # Auto PK main tab: camp controls above its independent Ghost editor.
@@ -6295,46 +6297,57 @@ def _finder_sync_dest_default():
         QtBind.setText(gui, finder_dest_field, 'Auto PK · %s' % page)
 
 
+def _finder_clear_result_row():
+    """Empty the single result row (default / clear / invalid ID)."""
+    QtBind.setText(gui, finder_result_id, '')
+    QtBind.setText(gui, finder_pick_name, '')
+    QtBind.setText(gui, finder_level_field, '')
+    finder_visible_ids[:] = []
+
+
 def resolve_finder_id(force=False):
-    """Live: digits in ID box → name + level (no skill list)."""
+    """Live: digits in ID box → fill ONLY the one result row (never dump list)."""
     global _finder_live_query
     raw = QtBind.text(gui, finder_query_field).strip()
     if not force and raw == _finder_live_query:
         return
     _finder_live_query = raw
     if not raw:
-        QtBind.setText(gui, finder_pick_name, '')
-        QtBind.setText(gui, finder_level_field, '')
+        _finder_clear_result_row()
         QtBind.setText(gui, finder_id_preview,
-                       'Gõ ID số → tên hiện ngay. Copy rồi dán, hoặc Thêm vào bảng skill.')
+                       'Bảng trống · gõ ID → hiện đúng 1 skill. Không dump cả list.')
+        QtBind.setText(gui, finder_status_label, 'Chưa có ID · hàng kết quả đang trống.')
         return
     if not raw.isdigit():
-        QtBind.setText(gui, finder_pick_name, '')
-        QtBind.setText(gui, finder_level_field, '')
+        _finder_clear_result_row()
         QtBind.setText(gui, finder_id_preview, 'Chỉ nhập số ID skill.')
-        QtBind.setText(gui, finder_status_label, 'ID phải là số.')
+        QtBind.setText(gui, finder_status_label, 'ID phải là số · hàng vẫn trống.')
         return
     try:
         uid = int(raw)
     except ValueError:
+        _finder_clear_result_row()
         QtBind.setText(gui, finder_id_preview, 'ID không hợp lệ.')
         return
     if not (0 < uid <= 0xffffffff):
+        _finder_clear_result_row()
         QtBind.setText(gui, finder_id_preview, 'ID ngoài phạm vi.')
         return
+    QtBind.setText(gui, finder_result_id, str(uid))
+    finder_visible_ids[:] = [uid]
     skill = skill_table().get(uid)
     if not skill:
         QtBind.setText(gui, finder_pick_name, '(chưa có trên acc)')
         QtBind.setText(gui, finder_level_field, '')
         QtBind.setText(gui, finder_id_preview,
-                       'ID %d chưa thấy trên acc — vẫn Copy / Thêm được.' % uid)
-        QtBind.setText(gui, finder_status_label, 'ID %d · chưa có trên acc.' % uid)
+                       'ID %d · 1 hàng · chưa có trên acc — vẫn Copy / Thêm.' % uid)
+        QtBind.setText(gui, finder_status_label, '1 skill (chưa có trên acc).')
         return
     name = finder_display_text(str(skill.get('name') or skill.get('servername') or ('ID %d' % uid)))
     level = str(skill.get('level') or '')
     QtBind.setText(gui, finder_pick_name, name)
     QtBind.setText(gui, finder_level_field, level)
-    QtBind.setText(gui, finder_id_preview, 'ID %d → %s' % (uid, name[:48]))
+    QtBind.setText(gui, finder_id_preview, '1 skill · ID %d → %s' % (uid, name[:40]))
     QtBind.setText(gui, finder_status_label, 'Sẵn sàng Copy hoặc Thêm.')
 
 
@@ -6359,10 +6372,9 @@ def show_skill_finder():
 
 def clear_skill_finder():
     QtBind.setText(gui, finder_query_field, '')
-    QtBind.setText(gui, finder_pick_name, '')
-    QtBind.setText(gui, finder_level_field, '')
+    _finder_clear_result_row()
     resolve_finder_id(force=True)
-    QtBind.setText(gui, finder_status_label, 'Đã xóa ô ID.')
+    QtBind.setText(gui, finder_status_label, 'Đã xóa · bảng trống lại.')
 
 
 def finder_previous():
@@ -6455,6 +6467,8 @@ def add_finder_skill():
                    'Đã Thêm ID %s (%s) vào %s · %s. Lưu cấu hình nếu cần giữ.'
                    % (uid, name[:28], label, page))
     report('Tìm Skill: thêm ID %s vào %s %s.' % (uid, label, page))
+
+
 def put_finder_clipboard(text):
     """Use Unicode clipboard only on the UI's explicit Copy action."""
     if sys.platform!='win32':return False
