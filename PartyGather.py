@@ -5,6 +5,8 @@ KHÔNG dùng party teleport / group warp / 705A nhóm.
 Chỉ: move_to + use_return_scroll (cá nhân) rồi đi bộ tới chỗ chủ.
 
 Changelog:
+- v1.0.1: Vào PT → phụ tự theo chủ (đi bộ); toi/dung vẫn dùng;
+  tên Chủ lưu 1 lần (auto-load); trống thì tự lấy chủ PT khi vào nhóm.
 - v1.0.0: Chủ phát gather#region#x#y#z; phụ đi bộ nếu gần cùng region,
   xa/khác region → bùa về thành cá nhân rồi move_to. Hủy: gatheroff.
 """
@@ -51,7 +53,7 @@ except ImportError:
     phBotChat = None
 
 NAME = 'PartyGather'
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 CONFIG_NAME = 'PartyGather'
 
 # Party chat protocol (ASCII, ổn định)
@@ -75,11 +77,11 @@ ROLE_LEADER = 1
 DEFAULT_WALK_ONLY_M = 120.0
 # Coi là đã tới khi còn trong bán kính này
 DEFAULT_ARRIVE_M = 8.0
-# Xa hơn ngưỡng → dùng bùa cá nhân trước
 DEFAULT_MOVE_NUDGE_S = 1.2
 RETURN_WAIT_S = 45.0
-# Sau bùa: nếu vẫn khác region lâu → báo rõ (không party TP)
 DIFF_REGION_GRACE_S = 25.0
+PARTY_CHECK_S = 1.0
+FOLLOW_STATUS_S = 8.0
 
 gui = QtBind.init(__name__, '%s v%s' % (NAME, VERSION))
 lock = RLock()
@@ -90,26 +92,32 @@ state = {
     'enabled': False,
     'role': ROLE_FOLLOWER,
     'leader_name': '',
+    'auto_follow': True,
     'walk_only_m': DEFAULT_WALK_ONLY_M,
     'arrive_m': DEFAULT_ARRIVE_M,
     'phase': 'idle',  # idle | returning | walking
-    'target': None,  # dict region/x/y/z
+    'target': None,
     'return_used': False,
     'return_at': 0.0,
     'walk_started_at': 0.0,
     'last_nudge_at': 0.0,
     'last_status_at': 0.0,
     'diff_region_since': 0.0,
+    'follow_paused': False,  # dung → tạm dừng theo; toi / vào PT lại → mở
+    'in_party': False,
+    'last_party_check': 0.0,
 }
 
 QtBind.createLabel(gui, '%s v%s — Tụ họp PT (đi bộ / bùa cá nhân)' % (NAME, VERSION), 10, 8)
 enabled_box = QtBind.createCheckBox(gui, 'ui_enabled', 'Bật plugin', 10, 32)
+auto_follow_box = QtBind.createCheckBox(
+    gui, 'ui_auto_follow', 'Phụ: vào PT → tự theo chủ (đi bộ)', 140, 32)
 
 QtBind.createLabel(gui, 'Vai trò', 10, 60)
 role_leader_box = QtBind.createCheckBox(gui, 'ui_role_leader', 'Chủ', 10, 78)
 role_follower_box = QtBind.createCheckBox(gui, 'ui_role_phu', 'Phụ', 70, 78)
 
-QtBind.createLabel(gui, 'Tên leader (phụ theo tên này)', 150, 60)
+QtBind.createLabel(gui, 'Tên Chủ (lưu 1 lần / nhân vật)', 150, 60)
 leader_field = QtBind.createLineEdit(gui, '', 150, 78, 180, 22)
 QtBind.createButton(gui, 'btn_self', 'Lấy tên mình', 340, 76)
 QtBind.createButton(gui, 'btn_party_master', 'Lấy tên chủ PT', 460, 76)
@@ -119,7 +127,7 @@ walk_field = QtBind.createLineEdit(gui, str(int(DEFAULT_WALK_ONLY_M)), 160, 110,
 QtBind.createLabel(gui, 'Đã tới khi ≤ (m)', 240, 112)
 arrive_field = QtBind.createLineEdit(gui, str(int(DEFAULT_ARRIVE_M)), 360, 110, 60, 22)
 
-QtBind.createButton(gui, 'btn_gather', 'Tới chỗ tao (gather)', 10, 148)
+QtBind.createButton(gui, 'btn_gather', 'Tới chỗ tao (toi)', 10, 148)
 QtBind.createButton(gui, 'btn_cancel', 'Hủy tụ (dung)', 200, 148)
 QtBind.createButton(gui, 'btn_save', 'Lưu cấu hình', 360, 148)
 QtBind.createButton(gui, 'btn_load', 'Tải cấu hình', 490, 148)
@@ -127,14 +135,15 @@ QtBind.createButton(gui, 'btn_load', 'Tải cấu hình', 490, 148)
 status_label = QtBind.createLabel(gui, 'Trạng thái: Phụ · chờ bật plugin', 10, 188)
 help_label = QtBind.createLabel(
     gui,
-    'Chủ: bấm «Tới chỗ tao» hoặc party chat: toi / gather\n'
-    'Phụ: tự đi bộ; xa hoặc khác map → bùa cá nhân rồi đi bộ. KHÔNG party TP.\n'
-    'Hủy: dung / huy / gatheroff',
+    'Lưu tên Chủ 1 lần → vào game tự nạp. Trống + vào PT → tự lấy chủ PT.\n'
+    'Phụ vào PT → tự theo chủ (đi bộ). toi = tụ (bùa cá nhân nếu xa). dung = dừng.\n'
+    'KHÔNG party TP / group warp.',
     10, 218,
 )
 
 QtBind.setChecked(gui, role_follower_box, True)
 QtBind.setChecked(gui, role_leader_box, False)
+QtBind.setChecked(gui, auto_follow_box, True)
 
 
 def _log(msg):
@@ -157,7 +166,6 @@ def _strip_job_star(text):
 def _fold(text):
     """Chuẩn hóa lệnh: lower, bỏ dấu tiếng Việt cơ bản, gom khoảng trắng."""
     raw = str(text or '').strip().casefold()
-    # Bỏ dấu thường gặp trong lệnh chat
     table = str.maketrans({
         'à': 'a', 'á': 'a', 'ả': 'a', 'ã': 'a', 'ạ': 'a',
         'ă': 'a', 'ằ': 'a', 'ắ': 'a', 'ẳ': 'a', 'ẵ': 'a', 'ặ': 'a',
@@ -242,6 +250,10 @@ def i_am_leader():
     return QtBind.isChecked(gui, enabled_box) and role_index() == ROLE_LEADER
 
 
+def auto_follow_enabled():
+    return QtBind.isChecked(gui, auto_follow_box)
+
+
 def configured_leader():
     return (QtBind.text(gui, leader_field) or '').strip()
 
@@ -253,9 +265,9 @@ def leader_tokens():
         t = _strip_job_star(part).casefold()
         if t:
             tokens.add(t)
-    me = self_name().casefold()
-    job = self_job_name().casefold()
     if role_index() == ROLE_LEADER:
+        me = self_name().casefold()
+        job = self_job_name().casefold()
         if me:
             tokens.add(me)
         if job:
@@ -270,47 +282,100 @@ def name_is_leader(player):
     tokens = leader_tokens()
     if needle in tokens:
         return True
-    # Khớp một phần token (job nick)
     for tok in tokens:
         if tok and (tok in needle or needle in tok):
             return True
     return False
 
 
+def _member_is_party_master(member):
+    if not isinstance(member, dict):
+        return False
+    if member.get('master') or member.get('leader') or member.get('isMaster'):
+        return True
+    if member.get('masterLevel'):
+        return True
+    try:
+        pid = int(member.get('player_id') or 0)
+        mid = int(member.get('master_id') or 0)
+        if pid and mid and pid == mid:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _is_self_member(member):
+    if not isinstance(member, dict):
+        return False
+    name = _strip_job_star(member.get('name') or '').casefold()
+    me = self_name().casefold()
+    job = self_job_name().casefold()
+    if name and me and name == me:
+        return True
+    if name and job and name == job:
+        return True
+    try:
+        my_id = int((get_character_data() or {}).get('player_id') or 0)
+        pid = int(member.get('player_id') or 0)
+        if my_id and pid and my_id == pid:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def party_master_name():
     party = get_party()
-    if not isinstance(party, dict):
+    if not isinstance(party, dict) or not party:
         raise ValueError('Chưa vào party.')
-    for member in party.values():
-        if not isinstance(member, dict):
-            continue
-        if member.get('player_id') == member.get('master_id') or member.get('masterLevel') or member.get('isMaster'):
-            name = str(member.get('name') or '').strip()
-            if name:
-                return name
-        # phBot thường đánh dấu master bằng level âm hoặc key riêng
-        if member.get('master') or member.get('leader'):
-            name = str(member.get('name') or '').strip()
-            if name:
-                return name
-    # Fallback: member có partyNumber/order 0
-    best = None
-    for member in party.values():
-        if not isinstance(member, dict):
-            continue
-        name = str(member.get('name') or '').strip()
-        if not name:
-            continue
-        order = member.get('memberNumber', member.get('number', member.get('order')))
+    members = [m for m in party.values() if isinstance(m, dict)]
+    if not members:
+        raise ValueError('Party trống.')
+    master = None
+    for member in members:
+        if _member_is_party_master(member):
+            master = member
+            break
+    if master is None:
         try:
-            order = int(order)
-        except (TypeError, ValueError):
-            order = 99
-        if best is None or order < best[0]:
-            best = (order, name)
-    if best:
-        return best[1]
-    raise ValueError('Không đọc được chủ PT từ get_party().')
+            ordered = sorted(
+                ((int(k) if str(k).isdigit() else 999, v) for k, v in party.items()
+                 if isinstance(v, dict)),
+                key=lambda item: item[0])
+            for _k, member in ordered:
+                if not _is_self_member(member):
+                    master = member
+                    break
+            if master is None and ordered:
+                master = ordered[0][1]
+        except Exception:
+            for member in members:
+                if not _is_self_member(member):
+                    master = member
+                    break
+            if master is None:
+                master = members[0]
+    if master is None:
+        raise ValueError('Không đọc được chủ PT từ get_party().')
+    if _is_self_member(master) and len(members) > 1:
+        for member in members:
+            if not _is_self_member(member):
+                master = member
+                break
+    name = str(master.get('name') or '').strip()
+    if not name:
+        raise ValueError('Chủ PT thiếu name.')
+    if _is_self_member(master) and role_index() == ROLE_FOLLOWER:
+        raise ValueError('Lấy chủ PT ra chính mình — mở PT / đứng gần chủ rồi thử lại.')
+    return name
+
+
+def party_member_count():
+    party = get_party()
+    if not isinstance(party, dict):
+        return 0
+    return sum(1 for m in party.values() if isinstance(m, dict))
 
 
 def read_float_field(widget, default, lo, hi):
@@ -353,7 +418,7 @@ def same_region(a, b):
     except (TypeError, ValueError):
         return False
     if ra == 0 or rb == 0:
-        return True  # thiếu region → không chặn đi bộ
+        return True
     return ra == rb
 
 
@@ -392,7 +457,6 @@ def personal_return_scroll():
 
 
 def nearest_teleporter_npc(me, max_range=80.0):
-    """NPC teleporter gần nhất (đi bộ tới điểm portal) — không inject party TP."""
     if _get_npcs is None or not me:
         return None
     try:
@@ -404,11 +468,9 @@ def nearest_teleporter_npc(me, max_range=80.0):
         if not isinstance(npc, dict):
             continue
         name = str(npc.get('name') or npc.get('servername') or '').casefold()
-        # Heuristic: teleporter / cổng / portal
-        if not any(k in name for k in ('teleport', 'portal', 'gate', 'cong', 'cổng', 'thuyen', 'ferry')):
-            # Một số server chỉ có model type; bỏ qua nếu không có tên khớp
-            if 'tele' not in name and 'warp' not in name:
-                continue
+        if not any(k in name for k in (
+                'teleport', 'portal', 'gate', 'cong', 'cổng', 'thuyen', 'ferry', 'tele', 'warp')):
+            continue
         try:
             dist = math.hypot(float(npc['x']) - float(me['x']), float(npc['y']) - float(me['y']))
         except (KeyError, TypeError, ValueError):
@@ -425,7 +487,57 @@ def nearest_teleporter_npc(me, max_range=80.0):
     return best[1] if best else None
 
 
-def clear_gather(reason=''):
+def silent_save_leader(name):
+    """Ghi tên Chủ vào field + file (nếu đã có owner) — không hỏi lại mỗi session."""
+    name = str(name or '').strip()
+    if not name:
+        return False
+    QtBind.setText(gui, leader_field, name)
+    with lock:
+        state['leader_name'] = name
+    try:
+        owner = config_owner()
+        if owner is None:
+            return True
+        path = config_path(owner)
+        data = read_settings()
+        data['leader_name'] = name
+        data['plugin_version'] = VERSION
+        data['config_owner'] = list(owner)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as stream:
+            staged = Path(stream.name)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+        try:
+            os.replace(staged, path)
+        finally:
+            if staged.exists():
+                staged.unlink()
+        return True
+    except (OSError, ValueError, TypeError):
+        return True  # field đã điền; lưu file có thể chờ Lưu tay
+
+
+def ensure_leader_name(source='auto'):
+    """Nếu ô Chủ trống → lấy chủ PT và lưu. Đã có tên thì giữ nguyên."""
+    if configured_leader():
+        return configured_leader()
+    if role_index() == ROLE_LEADER:
+        me = self_display() or self_name()
+        if me:
+            silent_save_leader(me)
+            set_status('[%s] Tự điền tên mình %r (Chủ).' % (source, me), 'Chủ = mình')
+            return me
+        return ''
+    try:
+        name = party_master_name()
+    except ValueError:
+        return ''
+    silent_save_leader(name)
+    set_status('[%s] Tự lấy chủ PT %r · đã lưu.' % (source, name), 'Chủ PT')
+    return name
+
+
+def clear_gather(reason='', pause_follow=False):
     with lock:
         state['phase'] = 'idle'
         state['target'] = None
@@ -433,18 +545,22 @@ def clear_gather(reason=''):
         state['return_at'] = 0.0
         state['walk_started_at'] = 0.0
         state['diff_region_since'] = 0.0
+        if pause_follow:
+            state['follow_paused'] = True
     if reason:
-        set_status('Đã hủy tụ · %s' % reason, 'Đã hủy')
-    else:
-        set_status('Đã hủy tụ.', 'Đã hủy')
+        set_status('Đã hủy tụ · %s' % reason, 'Đã hủy' if pause_follow else reason)
+    elif pause_follow:
+        set_status('Đã dừng theo chủ (dung). toi / vào PT lại để theo tiếp.', 'Đã dừng')
 
 
 def begin_gather(target, source='cmd'):
-    """Phụ bắt đầu tụ về target {region,x,y,z}."""
+    """Phụ tụ về target — có thể bùa cá nhân nếu xa/khác map."""
     if not target:
         set_status('[%s] Thiếu tọa độ chủ.' % source)
         return
     soft_stop_trace()
+    with lock:
+        state['follow_paused'] = False
     me = current_pos()
     walk_only = read_float_field(walk_field, DEFAULT_WALK_ONLY_M, 20.0, 2000.0)
     dist = distance_xy(me, target)
@@ -468,7 +584,6 @@ def begin_gather(target, source='cmd'):
         nudge_move(target, force=True)
         return
 
-    # Xa hoặc khác region → bùa cá nhân (không party TP)
     with lock:
         state['phase'] = 'returning'
         state['return_used'] = True
@@ -479,7 +594,6 @@ def begin_gather(target, source='cmd'):
         % (source, reason),
         'Đang bùa cá nhân')
     if not personal_return_scroll():
-        # Không bùa được: thử đi bộ tới portal gần nhất rồi vẫn walk
         portal = nearest_teleporter_npc(me) if me else None
         if portal:
             with lock:
@@ -529,29 +643,26 @@ def leader_broadcast_gather():
         set_status(
             'Đã phát tụ → region=%d (%.0f, %.0f, %.0f)'
             % (me['region'], me['x'], me['y'], me['z']),
-            'Đã phát gather')
+            'Đã phát toi')
         return True
     return False
 
 
 def leader_broadcast_cancel():
     if not i_am_leader():
-        # Phụ vẫn được hủy local
-        clear_gather('local')
+        clear_gather('local', pause_follow=True)
         return True
     ok = party_chat(PROTO_CANCEL)
-    clear_gather('chủ hủy')
+    clear_gather('chủ hủy', pause_follow=True)
     if ok:
-        set_status('Đã phát hủy tụ (gatheroff).', 'Đã hủy')
+        set_status('Đã phát dung (gatheroff).', 'Đã hủy')
     return ok
 
 
 def parse_gather_msg(text):
-    """Trả về ('gather', target_dict) | ('cancel', None) | None."""
     raw = str(text or '').strip()
     if not raw:
         return None
-    # Protocol có tọa độ
     if '#' in raw:
         parts = raw.split('#')
         head = parts[0].strip().casefold()
@@ -569,7 +680,7 @@ def parse_gather_msg(text):
                     return 'gather', target
                 except (TypeError, ValueError):
                     return None
-            return 'gather', None  # thiếu tọa độ — phụ lấy từ party
+            return 'gather', None
     norm = _fold(raw)
     if norm in CMD_CANCEL:
         return 'cancel', None
@@ -579,18 +690,33 @@ def parse_gather_msg(text):
 
 
 def leader_xy_from_party():
-    """Fallback: tọa độ chủ từ get_party theo tên đã lưu."""
+    """Tọa độ chủ từ get_party theo tên đã lưu (hoặc master nếu khớp)."""
     tokens = leader_tokens()
-    if not tokens:
-        return None
     party = get_party()
     if not isinstance(party, dict):
         return None
+    # Ưu tiên tên đã cấu hình
+    if tokens:
+        for member in party.values():
+            if not isinstance(member, dict):
+                continue
+            name = _strip_job_star(member.get('name') or '').casefold()
+            if not name or name not in tokens:
+                continue
+            try:
+                return {
+                    'region': int(member.get('region') or 0),
+                    'x': float(member['x']),
+                    'y': float(member['y']),
+                    'z': float(member.get('z') or 0),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+    # Fallback: party master coords
     for member in party.values():
-        if not isinstance(member, dict):
+        if not isinstance(member, dict) or not _member_is_party_master(member):
             continue
-        name = _strip_job_star(member.get('name') or '').casefold()
-        if not name or name not in tokens:
+        if _is_self_member(member):
             continue
         try:
             return {
@@ -606,22 +732,79 @@ def leader_xy_from_party():
 
 def handle_gather_command(kind, target, source):
     if kind == 'cancel':
-        clear_gather(source)
+        clear_gather(source, pause_follow=True)
         return
     if kind != 'gather':
         return
     if i_am_leader():
-        # Chủ gõ toi/gather → broadcast vị trí hiện tại
         leader_broadcast_gather()
         return
-    # Phụ
+    with lock:
+        state['follow_paused'] = False
     if target is None:
+        ensure_leader_name(source)
         target = leader_xy_from_party()
         if not target:
-            set_status('[%s] Phụ chưa có tọa độ chủ — nhập tên leader / chờ gather#region#x#y#z.'
+            set_status('[%s] Phụ chưa có tọa độ chủ — lưu tên Chủ / chờ gather#region#x#y#z.'
                        % source)
             return
     begin_gather(target, source=source)
+
+
+def on_party_joined():
+    """Vào PT: điền Chủ nếu trống + bật theo chủ (đi bộ, không đốt bùa)."""
+    if role_index() == ROLE_LEADER:
+        ensure_leader_name('vào PT')
+        set_status('Chủ · đã vào PT · chờ bấm toi / Tới chỗ tao.', 'Trong PT')
+        return
+    ensure_leader_name('vào PT')
+    with lock:
+        state['follow_paused'] = False
+    if not auto_follow_enabled():
+        set_status('Đã vào PT · auto-theo tắt · chờ toi.', 'Trong PT')
+        return
+    set_status('Đã vào PT · tự theo chủ (đi bộ). toi = tụ/bùa nếu xa. dung = dừng.', 'Theo chủ')
+
+
+def tick_soft_follow():
+    """Theo chủ bằng đi bộ khi idle — không use_return_scroll (chỉ toi mới bùa)."""
+    if role_index() == ROLE_LEADER or not auto_follow_enabled():
+        return
+    with lock:
+        if state['follow_paused'] or state['phase'] != 'idle':
+            return
+    ensure_leader_name('theo')
+    target = leader_xy_from_party()
+    if not target:
+        return
+    me = current_pos()
+    if not me:
+        return
+    arrive_m = read_float_field(arrive_field, DEFAULT_ARRIVE_M, 3.0, 50.0)
+    dist = distance_xy(me, target)
+    if not same_region(me, target):
+        now = monotonic()
+        with lock:
+            spam = (now - state['last_status_at']) > FOLLOW_STATUS_S
+            if spam:
+                state['last_status_at'] = now
+        if spam:
+            set_status(
+                'Theo chủ: khác map — chờ toi (bùa cá nhân) hoặc về cùng map. '
+                'Không party TP.',
+                'Khác map')
+        return
+    if dist is not None and dist <= arrive_m:
+        return  # đã sát chủ — sẵn sàng
+    soft_stop_trace()
+    nudge_move(target)
+    now = monotonic()
+    with lock:
+        spam = (now - state['last_status_at']) > FOLLOW_STATUS_S
+        if spam:
+            state['last_status_at'] = now
+    if spam and dist is not None:
+        set_status('Đang theo chủ · %.0fm (đi bộ).' % dist, 'Theo chủ')
 
 
 # --- UI ---
@@ -634,8 +817,24 @@ def ui_enabled(checked):
     with lock:
         state['enabled'] = bool(checked)
     if not checked:
-        clear_gather('tắt plugin')
-    set_status('Đã bật.' if checked else 'Đã tắt.')
+        clear_gather('tắt plugin', pause_follow=True)
+        set_status('Đã tắt.')
+    else:
+        with lock:
+            state['follow_paused'] = False
+        set_status('Đã bật · vào PT sẽ tự theo (nếu Phụ).')
+
+
+def ui_auto_follow(checked):
+    if _ui_applying:
+        with lock:
+            state['auto_follow'] = bool(checked)
+        return
+    with lock:
+        state['auto_follow'] = bool(checked)
+        if checked:
+            state['follow_paused'] = False
+    set_status('Tự theo chủ: %s' % ('BẬT' if checked else 'TẮT'))
 
 
 def ui_role_leader(checked):
@@ -645,8 +844,8 @@ def ui_role_leader(checked):
         set_role(ROLE_LEADER)
         me = self_display() or self_name()
         if me and not configured_leader():
-            QtBind.setText(gui, leader_field, me)
-        set_status('Vai trò Chủ.')
+            silent_save_leader(me)
+        set_status('Vai trò Chủ · Lưu 1 lần là đủ.')
     elif not QtBind.isChecked(gui, role_follower_box):
         set_role(ROLE_FOLLOWER)
 
@@ -656,7 +855,7 @@ def ui_role_phu(checked):
         return
     if checked:
         set_role(ROLE_FOLLOWER)
-        set_status('Vai trò Phụ.')
+        set_status('Vai trò Phụ · tên Chủ lưu 1 lần / tự lấy khi vào PT.')
     elif not QtBind.isChecked(gui, role_leader_box):
         set_role(ROLE_LEADER)
 
@@ -666,9 +865,9 @@ def btn_self():
     if not me:
         set_status('Chưa đọc được tên. Vào game rồi bấm lại.')
         return
-    QtBind.setText(gui, leader_field, me)
     set_role(ROLE_LEADER)
-    set_status('Đã điền tên mình %r · Chủ. Bấm Lưu.' % me)
+    silent_save_leader(me)
+    set_status('Đã lưu tên mình %r · Chủ (lần sau tự nạp).' % me, 'Đã lưu Chủ')
 
 
 def btn_party_master():
@@ -677,9 +876,9 @@ def btn_party_master():
     except ValueError as error:
         set_status(str(error))
         return
-    QtBind.setText(gui, leader_field, name)
     set_role(ROLE_FOLLOWER)
-    set_status('Đã điền chủ PT %r · Phụ. Bấm Lưu.' % name)
+    silent_save_leader(name)
+    set_status('Đã lưu chủ PT %r · Phụ (lần sau tự nạp).' % name, 'Đã lưu Chủ')
 
 
 def btn_gather():
@@ -689,7 +888,7 @@ def btn_gather():
     if i_am_leader():
         leader_broadcast_gather()
     else:
-        # Phụ tự tụ về vị trí chủ party (không cần chat)
+        ensure_leader_name('UI')
         target = leader_xy_from_party()
         if not target:
             set_status('Phụ: chưa thấy tọa độ chủ trong party.')
@@ -701,7 +900,7 @@ def btn_cancel():
     if i_am_leader():
         leader_broadcast_cancel()
     else:
-        clear_gather('UI')
+        clear_gather('UI', pause_follow=True)
 
 
 def read_settings():
@@ -710,6 +909,7 @@ def read_settings():
         'enabled': QtBind.isChecked(gui, enabled_box),
         'role': role_index(),
         'leader_name': configured_leader(),
+        'auto_follow': QtBind.isChecked(gui, auto_follow_box),
         'walk_only_m': read_float_field(walk_field, DEFAULT_WALK_ONLY_M, 20.0, 2000.0),
         'arrive_m': read_float_field(arrive_field, DEFAULT_ARRIVE_M, 3.0, 50.0),
     }
@@ -721,11 +921,13 @@ def apply_settings(data):
     enabled = bool(data.get('enabled'))
     role = ROLE_LEADER if int(data.get('role', 0) or 0) == ROLE_LEADER else ROLE_FOLLOWER
     leader_name = str(data.get('leader_name') or '').strip()
+    auto_follow = True if 'auto_follow' not in data else bool(data.get('auto_follow'))
     walk_only = float(data.get('walk_only_m') or DEFAULT_WALK_ONLY_M)
     arrive = float(data.get('arrive_m') or DEFAULT_ARRIVE_M)
     _ui_applying = True
     try:
         QtBind.setChecked(gui, enabled_box, enabled)
+        QtBind.setChecked(gui, auto_follow_box, auto_follow)
         QtBind.setChecked(gui, role_leader_box, role == ROLE_LEADER)
         QtBind.setChecked(gui, role_follower_box, role == ROLE_FOLLOWER)
         QtBind.setText(gui, leader_field, leader_name)
@@ -737,6 +939,7 @@ def apply_settings(data):
         state['enabled'] = enabled
         state['role'] = role
         state['leader_name'] = leader_name
+        state['auto_follow'] = auto_follow
         state['walk_only_m'] = walk_only
         state['arrive_m'] = arrive
 
@@ -753,6 +956,13 @@ def btn_save():
                 data['leader_name'] = me
                 QtBind.setText(gui, leader_field, me)
                 data = read_settings()
+        if data['role'] == ROLE_FOLLOWER and not data['leader_name']:
+            try:
+                data['leader_name'] = party_master_name()
+                QtBind.setText(gui, leader_field, data['leader_name'])
+                data = read_settings()
+            except ValueError:
+                pass
         data['plugin_version'] = VERSION
         data['config_owner'] = list(owner)
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as stream:
@@ -765,7 +975,10 @@ def btn_save():
                 staged.unlink()
         loaded_config_owner = owner
         apply_settings(data)
-        set_status('Đã lưu %s' % path.name, 'Đã lưu')
+        set_status(
+            'Đã lưu %s · tên Chủ=%r (lần sau tự nạp)'
+            % (path.name, data.get('leader_name') or ''),
+            'Đã lưu')
     except (OSError, ValueError, TypeError) as error:
         set_status('Chưa lưu: %s' % error)
 
@@ -787,12 +1000,16 @@ def load_settings(quiet=False):
             raise ValueError('Cấu hình không thuộc nhân vật hiện tại.')
         apply_settings(data)
         if not quiet:
-            set_status('Đã tải %s' % path.name, 'Đã tải')
+            leader = data.get('leader_name') or ''
+            set_status(
+                'Đã tải %s · Chủ=%r · auto-theo=%s'
+                % (path.name, leader, 'ON' if data.get('auto_follow', True) else 'OFF'),
+                'Đã tải')
         return data
     except FileNotFoundError:
         apply_settings({})
         if not quiet:
-            set_status('Chưa có bản lưu. Chọn Chủ/Phụ rồi Lưu.')
+            set_status('Chưa có bản lưu. Chọn Chủ/Phụ → Lưu 1 lần (lần sau tự nạp).')
         return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
         apply_settings({})
@@ -819,13 +1036,9 @@ def handle_chat(chat_type, player, msg):
     if not parsed:
         return
     kind, target = parsed
-    # Chỉ nhận lệnh từ leader (hoặc chính chủ gõ)
     from_leader = name_is_leader(player) or i_am_leader() or int(chat_type or 0) == 100
-    # Party chat type thường = 4; vẫn yêu cầu tên khớp trừ khi là protocol gather# từ party
-    if not from_leader:
-        # Cho phép protocol gather#... nếu người gửi khớp token leader
-        if not name_is_leader(player):
-            return
+    if not from_leader and not name_is_leader(player):
+        return
     handle_gather_command(kind, target, source='chat')
 
 
@@ -836,20 +1049,40 @@ def event_loop():
         load_settings(quiet=False)
     if not QtBind.isChecked(gui, enabled_box):
         return
+
+    now = monotonic()
+    with lock:
+        due_party = (now - state['last_party_check']) >= PARTY_CHECK_S
+        if due_party:
+            state['last_party_check'] = now
+    if due_party:
+        count = party_member_count()
+        in_party = count >= 2
+        with lock:
+            was = state['in_party']
+            state['in_party'] = in_party
+        if in_party and not was:
+            on_party_joined()
+        elif not in_party and was:
+            clear_gather('rời PT', pause_follow=True)
+
     with lock:
         phase = state['phase']
         target = dict(state['target']) if state['target'] else None
         return_at = state['return_at']
         return_used = state['return_used']
-    if phase == 'idle' or not target:
+
+    # Soft follow khi không đang tụ
+    if phase == 'idle':
+        tick_soft_follow()
+        return
+    if not target:
         return
 
     me = current_pos()
     arrive_m = read_float_field(arrive_field, DEFAULT_ARRIVE_M, 3.0, 50.0)
-    now = monotonic()
 
     if phase == 'returning':
-        # Chờ teleported(); nếu quá hạn vẫn chuyển sang đi bộ
         if now - return_at >= RETURN_WAIT_S:
             with lock:
                 state['phase'] = 'walking'
@@ -858,11 +1091,11 @@ def event_loop():
             nudge_move(target, force=True)
         return
 
-    # walking
     if not me:
         return
     dist = distance_xy(me, target)
     if dist is not None and same_region(me, target) and dist <= arrive_m:
+        # Xong tụ → về idle; auto-follow tiếp tục nếu không bị dung
         clear_gather()
         set_status('Đã tới chỗ chủ (%.1fm).' % dist, 'Đã tới')
         return
@@ -873,7 +1106,6 @@ def event_loop():
                 state['diff_region_since'] = now
             since = state['diff_region_since']
         if return_used and (now - since) >= DIFF_REGION_GRACE_S:
-            # Sau bùa cá nhân vẫn khác region lâu — không party TP
             with lock:
                 last_st = state['last_status_at']
                 spam = (now - last_st) > 5
@@ -884,7 +1116,6 @@ def event_loop():
                     'khác map — không dịch chuyển nhóm (chỉ bùa cá nhân + đi bộ). '
                     'region mình=%s chủ=%s' % (me.get('region'), target.get('region')),
                     'Khác map')
-            # Thử đi tới portal gần (đi bộ), không inject group warp
             portal = nearest_teleporter_npc(me)
             if portal:
                 nudge_move(portal)
@@ -897,7 +1128,6 @@ def event_loop():
 
 
 def teleported():
-    """Sau bùa cá nhân → chuyển sang đi bộ tới chỗ chủ."""
     with lock:
         if state['phase'] != 'returning' or not state['target']:
             return
@@ -915,17 +1145,26 @@ def joined_game():
     if role_index() == ROLE_LEADER and not configured_leader():
         me = self_display() or self_name()
         if me:
-            QtBind.setText(gui, leader_field, me)
-    if data and data.get('enabled'):
-        _log('joined_game: auto-bật từ cấu hình.')
+            silent_save_leader(me)
+    # Đã trong PT khi vào game → coi như vừa join
+    if data and data.get('enabled') and party_member_count() >= 2:
+        with lock:
+            state['in_party'] = True
+            state['follow_paused'] = False
+        on_party_joined()
+    elif data and data.get('enabled'):
+        _log('joined_game: đã auto-bật · chờ vào PT để tự theo.')
 
 
 try:
     _boot = load_settings(quiet=True)
     if _boot is not None:
-        set_status('Nạp v%s · đã restore cấu hình' % VERSION, 'Đã tải')
+        leader = (_boot or {}).get('leader_name') or ''
+        set_status(
+            'Nạp v%s · restore Chủ=%r' % (VERSION, leader),
+            'Đã tải')
 except Exception as _boot_error:
     _log('Nạp v%s · restore lỗi: %s' % (VERSION, _boot_error))
 
-log('[%s] Đã nạp v%s. Chủ: toi/gather · Phụ: đi bộ hoặc bùa cá nhân · Hủy: dung/gatheroff. KHÔNG party TP.'
+log('[%s] Đã nạp v%s. Vào PT → tự theo · toi/dung · tên Chủ lưu 1 lần. KHÔNG party TP.'
     % (NAME, VERSION))
